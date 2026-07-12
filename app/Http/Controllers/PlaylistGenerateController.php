@@ -759,6 +759,14 @@ class PlaylistGenerateController extends Controller
                 ->orderByRaw('COALESCE(channel_custom_playlist.sort, channels.sort)')
                 ->orderByRaw('COALESCE(channel_custom_playlist.channel_number, channels.channel)')
                 ->orderBy('channels.title');
+
+            // Eager load all group tags for this playlist (for multi-group output).
+            // Uses a separate query (not a JOIN) so there is no cartesian explosion;
+            // Laravel issues one batch SELECT for all tags across all channels.
+            $query->with(['tags' => function ($q) use ($playlistUuid): void {
+                $q->where('type', $playlistUuid)
+                  ->orderBy('order_column');
+            }]);
         } else {
             // Per-alias custom live group ordering (optional). When enabled, the
             // selected live groups are ranked by the alias's saved order; any group

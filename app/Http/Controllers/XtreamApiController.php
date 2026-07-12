@@ -550,6 +550,14 @@ class XtreamApiController extends Controller
                         '(SELECT ccp.channel_number FROM channel_custom_playlist ccp WHERE ccp.channel_id = channels.id AND ccp.custom_playlist_id = ?) as ccp_channel_number',
                         [$customPlaylistId]
                     );
+
+                // Eager load all group tags for this playlist (for multi-group output).
+                // Uses a separate query (not a JOIN) so there is no cartesian explosion;
+                // Laravel issues one batch SELECT for all tags across all channels.
+                $channelsQuery->with(['tags' => function ($q) use ($tagUuid): void {
+                    $q->where('type', $tagUuid)
+                      ->orderBy('order_column');
+                }]);
             }
 
             // Apply category filtering when requested.
