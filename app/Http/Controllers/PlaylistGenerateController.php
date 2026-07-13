@@ -139,17 +139,32 @@ class PlaylistGenerateController extends Controller
                     $timeshift = $channel->shift ?? 0;
                     $stationId = $channel->station_id ?? '';
                     $epgShift = $channel->tvg_shift ?? 0;
-                    $group = $channel->group ?? '';
+                    // Determine the list of group names to emit (multi-group support).
+                    $groupNames = [];
+                    if ($type === 'custom' || ($type === 'alias' && ! empty($channel->custom_group_name))) {
+                        // Custom context: use all tags for this playlist.
+                        $tagNames = $channel->tags?->pluck('name') ?? collect();
+                        foreach ($tagNames as $tagName) {
+                            $decoded = json_decode($tagName, true);
+                            $groupNames[] = $decoded['en'] ?? ($decoded[array_key_first($decoded)] ?? '');
+                        }
+                        // If no tags found, fall back to source group.
+                        if (empty($groupNames) && ! empty($channel->custom_group_name)) {
+                            $groupName = json_decode($channel->custom_group_name, true);
+                            $groupNames[] = $groupName['en'] ?? $groupName[array_key_first($groupName)] ?? '';
+                        }
+                    }
+
+                    if (empty($groupNames)) {
+                        $groupNames = [$channel->group ?? ''];
+                    }
+
+                    // Channel number is shared across all group instances for this channel.
+                    $channelNo = ($isCustomContext && ! empty($channel->pivot?->channel_number))
+                        ? (int) $channel->pivot->channel_number
+                        : $channel->channel;
                     if (! $channelNo && ($playlist->auto_channel_increment || $idChannelBy === PlaylistChannelId::Number)) {
                         $channelNo = ++$channelNumber;
-                    }
-                    if ($type === 'custom') {
-                        // We selected the custom tag name as `custom_group_name` when building the query
-                        // It's a JSON field with translations, so decode and extract the 'en' locale
-                        if (! empty($channel->custom_group_name)) {
-                            $groupName = json_decode($channel->custom_group_name, true);
-                            $group = $groupName['en'] ?? $groupName[array_key_first($groupName)] ?? '';
-                        }
                     }
 
                     // Get the TVG ID
@@ -226,69 +241,29 @@ class PlaylistGenerateController extends Controller
                     // Make sure TVG ID only contains characters and numbers
                     $tvgId = preg_replace(config('dev.tvgid.regex'), '', $tvgId);
 
-                    // Output the channel
-                    $extInf = '#EXTINF:-1';
-                    if (! $playlist->disable_catchup) {
-                        if ($channel->catchup) {
-                            $extInf .= " catchup=\"$channel->catchup\"";
-                        }
-
-                        // Determine the catchup-source to output.
-                        // When the proxy is enabled, or when the channel URL is served via the
-                        // internal Xtream format (default), we generate a catchup-source that
-                        // points to our own timeshift endpoint so catchup requests flow through
-                        // m3u-editor rather than going directly to the provider.
-                        // This also ensures catchup works for Xtream-imported channels that have
-                        // tv_archive=1 but no catchup_source URL template stored.
-                        if (($proxyEnabled || $useInternalXtreamFormat) && $channel->catchup) {
-                            $catchupExt = $extension ?: 'ts';
-                            $catchupSource = "{$baseUrl}/timeshift/{$username}/{$password}/{duration}/{start}/{$channel->id}.{$catchupExt}";
-                            $extInf .= " catchup-source=\"{$catchupSource}\"";
-                        } elseif ($channel->catchup_source) {
-                            $extInf .= " catchup-source=\"$channel->catchup_source\"";
-                        }
-
-                        if ($timeshift) {
-                            $extInf .= " timeshift=\"$timeshift\"";
-                        }
+                    // Emit one EXTINF + URL per group (multi-group support).
+                    foreach ($groupNames as $group) {
+                        $this->emitChannelOutput(
+                            playlist: $playlist,
+                            channel: $channel,
+                            title: $title,
+                            name: $name,
+                            url: $url,
+                            group: $group,
+                            channelNo: $channelNo,
+                            tvgId: $tvgId,
+                            icon: $icon,
+                            timeshift: $timeshift,
+                            stationId: $stationId,
+                            epgShift: $epgShift,
+                            proxyEnabled: $proxyEnabled,
+                            useInternalXtreamFormat: $useInternalXtreamFormat,
+                            tvgTypeoutputEnabled: $tvgTypeoutputEnabled,
+                            baseUrl: $baseUrl,
+                            username: $username,
+                            password: $password,
+                        );
                     }
-                    if ($stationId) {
-                        $extInf .= " tvc-guide-stationid=\"$stationId\"";
-                    }
-                    if ($epgShift) {
-                        $extInf .= " tvg-shift=\"$epgShift\"";
-                    }
-
-                    // Output TVG type if enabled
-                    if ($tvgTypeoutputEnabled) {
-                        $channelType = 'live'; // default for Live content
-
-                        // Channel specific tvg-type takes precedence, otherwise fallback to basic live/vod categorization
-                        if ($channel->tvg_type) {
-                            $channelType = $channel->tvg_type;
-                        } elseif ($channel->is_vod) {
-                            $channelType = 'movies'; // default for VOD
-                        }
-
-                        $extInf .= " tvg-type=\"{$channelType}\"";
-                    }
-                    $tmdbId = $channel->tmdb_id ?: ($channel->info['tmdb_id'] ?? $channel->movie_data['tmdb_id'] ?? null);
-                    if ($tmdbId) {
-                        $extInf .= " tmdb-id=\"{$tmdbId}\"";
-                    }
-                    $extInf .= " tvg-chno=\"$channelNo\" tvg-id=\"$tvgId\" tvg-name=\"$name\" tvg-logo=\"$icon\" group-title=\"$group\"";
-                    echo "$extInf,".$title."\n";
-                    if ($channel->extvlcopt) {
-                        foreach ($channel->extvlcopt as $extvlcopt) {
-                            echo "#EXTVLCOPT:{$extvlcopt['key']}={$extvlcopt['value']}\n";
-                        }
-                    }
-                    if ($channel->kodidrop) {
-                        foreach ($channel->kodidrop as $kodidrop) {
-                            echo "#KODIPROP:{$kodidrop['key']}={$kodidrop['value']}\n";
-                        }
-                    }
-                    echo $url."\n";
                 }
 
                 // If the playlist includes series in M3U, include the series episodes
@@ -844,6 +819,114 @@ class PlaylistGenerateController extends Controller
             'Content-Disposition' => 'inline; filename="'.$playlist->name.'.m3u"',
             'Cache-Control' => 'no-cache, no-store, must-revalidate',
         ]);
+    }
+
+    /**
+     * Streams a single channel as an EXTINF + URL pair to the output stream.
+     *
+     * Extracted from __invoke() so that multi-group channels can emit one entry
+     * per group without duplicating the EXTINF / catchup / TVG logic.
+     */
+    private function emitChannelOutput(
+        Playlist $playlist,
+        Channel $channel,
+        string $title,
+        string $name,
+        string $url,
+        string $group,
+        int|string $channelNo,
+        int|string $tvgId,
+        string $icon,
+        ?int $timeshift,
+        string $stationId,
+        int $epgShift,
+        bool $proxyEnabled,
+        bool $useInternalXtreamFormat,
+        bool $tvgTypeoutputEnabled,
+        string $baseUrl,
+        string $username,
+        string $password,
+    ): void {
+        // Normalize the group: empty groups become 'Uncategorized'.
+        if (empty($group)) {
+            $group = 'Uncategorized';
+        }
+
+        $extInf = '#EXTINF:-1';
+
+        // Catchup / timeshift attributes.
+        if (! $playlist->disable_catchup) {
+            if ($channel->catchup) {
+                $extInf .= " catchup=\"$channel->catchup\"";
+            }
+
+            // Determine the catchup-source to output.
+            // When the proxy is enabled, or when the channel URL is served via the
+            // internal Xtream format (default), we generate a catchup-source that
+            // points to our own timeshift endpoint so catchup requests flow through
+            // m3u-editor rather than going directly to the provider.
+            // This also ensures catchup works for Xtream-imported channels that have
+            // tv_archive=1 but no catchup_source URL template stored.
+            if (($proxyEnabled || $useInternalXtreamFormat) && $channel->catchup) {
+                $catchupExt = pathinfo(parse_url($url, PHP_URL_PATH), PATHINFO_EXTENSION) ?: 'ts';
+                $catchupSource = "{$baseUrl}/timeshift/{$username}/{$password}/{duration}/{start}/{$channel->id}.{$catchupExt}";
+                $extInf .= " catchup-source=\"{$catchupSource}\"";
+            } elseif ($channel->catchup_source) {
+                $extInf .= " catchup-source=\"$channel->catchup_source\"";
+            }
+
+            if ($timeshift) {
+                $extInf .= " timeshift=\"$timeshift\"";
+            }
+        }
+
+        // Station / EPG shift attributes.
+        if ($stationId) {
+            $extInf .= " tvc-guide-stationid=\"$stationId\"";
+        }
+        if ($epgShift) {
+            $extInf .= " tvg-shift=\"$epgShift\"";
+        }
+
+        // Output TVG type if enabled.
+        if ($tvgTypeoutputEnabled) {
+            $channelType = 'live'; // default for Live content
+
+            // Channel specific tvg-type takes precedence, otherwise fallback to basic live/vod categorization
+            if ($channel->tvg_type) {
+                $channelType = $channel->tvg_type;
+            } elseif ($channel->is_vod) {
+                $channelType = 'movies'; // default for VOD
+            }
+
+            $extInf .= " tvg-type=\"{$channelType}\"";
+        }
+
+        // TMDB ID attribute.
+        $tmdbId = $channel->tmdb_id ?: ($channel->info['tmdb_id'] ?? $channel->movie_data['tmdb_id'] ?? null);
+        if ($tmdbId) {
+            $extInf .= " tmdb-id=\"{$tmdbId}\"";
+        }
+
+        // Final EXTINF line with core attributes.
+        $extInf .= " tvg-chno=\"$channelNo\" tvg-id=\"$tvgId\" tvg-name=\"$name\" tvg-logo=\"$icon\" group-title=\"" . e($group) . "\"";
+        echo "$extInf," . $title . "\n";
+
+        // Optional EXTVLCOPT lines.
+        if ($channel->extvlcopt) {
+            foreach ($channel->extvlcopt as $extvlcopt) {
+                echo "#EXTVLCOPT:{$extvlcopt['key']}={$extvlcopt['value']}\n";
+            }
+        }
+
+        // Optional KODIPROP lines.
+        if ($channel->kodidrop) {
+            foreach ($channel->kodidrop as $kodidrop) {
+                echo "#KODIPROP:{$kodidrop['key']}={$kodidrop['value']}\n";
+            }
+        }
+
+        echo $url . "\n";
     }
 
     /**
