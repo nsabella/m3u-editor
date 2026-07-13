@@ -536,20 +536,15 @@ class XtreamApiController extends Controller
             // Use the optimised query: JOINs instead of eager loads, SQL-level ordering, cursor-compatible.
             $channelsQuery = PlaylistGenerateController::getChannelQuery($playlist, isVod: false);
 
-            // For custom playlists, pull the tag ID and pivot channel number via correlated subqueries
-            // so category_id and channel numbering are resolved without N+1 tag queries or relying
-            // on the BelongsToMany pivot hydration (which cursor() does not trigger).
+            // For custom playlists, eager-load all group tags so the output loop can emit one
+            // stream per category (multi-group). Keep the pivot channel_number subquery since it
+            // is a single-value column used directly for numbering.
             if ($isCustomPlaylist) {
                 $customPlaylistId = ($playlist instanceof PlaylistAlias) ? $playlist->custom_playlist_id : $playlist->id;
-                $channelsQuery
-                    ->selectRaw(
-                        '(SELECT t.id FROM taggables tb INNER JOIN tags t ON t.id = tb.tag_id WHERE tb.taggable_id = channels.id AND tb.taggable_type = ? AND t.type = ? ORDER BY t.order_column ASC LIMIT 1) as custom_group_id',
-                        [Channel::class, $tagUuid]
-                    )
-                    ->selectRaw(
-                        '(SELECT ccp.channel_number FROM channel_custom_playlist ccp WHERE ccp.channel_id = channels.id AND ccp.custom_playlist_id = ?) as ccp_channel_number',
-                        [$customPlaylistId]
-                    );
+                $channelsQuery->selectRaw(
+                    '(SELECT ccp.channel_number FROM channel_custom_playlist ccp WHERE ccp.channel_id = channels.id AND ccp.custom_playlist_id = ?) as ccp_channel_number',
+                    [$customPlaylistId]
+                );
 
                 // Eager load all group tags for this playlist (for multi-group output).
                 // Uses a separate query (not a JOIN) so there is no cartesian explosion;
@@ -591,6 +586,8 @@ class XtreamApiController extends Controller
                         echo ',';
                     }
 
+                    // Pre-compute values that are identical across all category instances of this channel.
+                    $name = $channel->title_custom ?? $channel->title;
                     $streamIcon = $baseUrl.'/placeholder.png';
                     if ($channel->logo) {
                         $streamIcon = $channel->logo;
@@ -604,16 +601,19 @@ class XtreamApiController extends Controller
                         $streamIcon = LogoProxyController::generateProxyUrl($streamIcon);
                     }
 
-                    $channelCategoryId = 'all';
-                    if ($isCustomPlaylist) {
-                        if (! empty($channel->custom_group_id)) {
-                            $channelCategoryId = (string) $channel->custom_group_id;
-                        } elseif ($channel->group_id) {
-                            $channelCategoryId = (string) $channel->group_id;
+                    // Collect all tag IDs for this channel (deduplicated, preserving order).
+                    $allTagIds = [];
+                    if ($isCustomPlaylist && $channel->tags) {
+                        foreach ($channel->tags as $tag) {
+                            $tagId = (int) $tag->id;
+                            if (! in_array($tagId, $allTagIds)) {
+                                $allTagIds[] = $tagId;
+                            }
                         }
-                    } elseif ($channel->group_id) {
-                        $channelCategoryId = (string) $channel->group_id;
                     }
+
+                    // Emit one stream entry per tag, or one with 'all' if the channel has no tags.
+                    $categoriesToEmit = empty($allTagIds) ? ['all' => null] : array_combine($allTagIds, $allTagIds);
 
                     $channelNo = ($isCustomPlaylist && ! empty($channel->ccp_channel_number))
                         ? (int) $channel->ccp_channel_number
@@ -649,29 +649,34 @@ class XtreamApiController extends Controller
                     // Make sure TVG ID only contains characters and numbers
                     $tvgId = preg_replace(config('dev.tvgid.regex'), '', $tvgId);
 
-                    $liveStream = [
-                        'num' => $channelNo,
-                        'name' => $channel->title_custom ?? $channel->title,
-                        'stream_type' => 'live',
-                        'stream_id' => $channel->id,
-                        'stream_icon' => $streamIcon,
-                        'epg_channel_id' => $tvgId,
-                        'added' => (string) $channel->created_at->timestamp,
-                        'category_id' => $channelCategoryId,
-                        'category_ids' => [(int) $channelCategoryId],
-                        'tv_archive' => (! $disableCatchup && ($channel->catchup || $channel->shift)) ? 1 : 0,
-                        'tv_archive_duration' => $disableCatchup ? 0 : ($channel->shift ?? 0),
-                        'custom_sid' => $channel->stream_id_custom ?? '',
-                        'thumbnail' => $streamIcon,
-                        'direct_source' => '',
-                    ];
+                    foreach ($categoriesToEmit as $categoryId => $_) {
+                        $channelCategoryId = $categoryId === 'all' ? 'all' : (string) $categoryId;
 
-                    $embyStats = $channel->getEmbyStreamStats();
-                    if (! empty($embyStats)) {
-                        $liveStream['stream_stats'] = $embyStats;
+                        $liveStream = [
+                            'num' => $channelNo,
+                            'name' => $name,
+                            'stream_type' => 'live',
+                            'stream_id' => $channel->id,
+                            'stream_icon' => $streamIcon,
+                            'epg_channel_id' => $tvgId,
+                            'added' => (string) $channel->created_at->timestamp,
+                            'category_id' => $channelCategoryId,
+                            'category_ids' => $allTagIds,
+                            'tv_archive' => (! $disableCatchup && ($channel->catchup || $channel->shift)) ? 1 : 0,
+                            'tv_archive_duration' => $disableCatchup ? 0 : ($channel->shift ?? 0),
+                            'custom_sid' => $channel->stream_id_custom ?? '',
+                            'thumbnail' => $streamIcon,
+                            'direct_source' => '',
+                        ];
+
+                        $embyStats = $channel->getEmbyStreamStats();
+                        if (! empty($embyStats)) {
+                            $liveStream['stream_stats'] = $embyStats;
+                        }
+
+                        echo json_encode($liveStream);
                     }
 
-                    echo json_encode($liveStream);
                     $first = false;
                     if (ob_get_level() > 0) {
                         ob_flush();
@@ -695,15 +700,18 @@ class XtreamApiController extends Controller
 
             if ($isCustomPlaylist) {
                 $customPlaylistId = ($playlist instanceof PlaylistAlias) ? $playlist->custom_playlist_id : $playlist->id;
-                $channelsQuery
-                    ->selectRaw(
-                        '(SELECT t.id FROM taggables tb INNER JOIN tags t ON t.id = tb.tag_id WHERE tb.taggable_id = channels.id AND tb.taggable_type = ? AND t.type = ? ORDER BY t.order_column ASC LIMIT 1) as custom_group_id',
-                        [Channel::class, $tagUuid]
-                    )
-                    ->selectRaw(
-                        '(SELECT ccp.channel_number FROM channel_custom_playlist ccp WHERE ccp.channel_id = channels.id AND ccp.custom_playlist_id = ?) as ccp_channel_number',
-                        [$customPlaylistId]
-                    );
+                $channelsQuery->selectRaw(
+                    '(SELECT ccp.channel_number FROM channel_custom_playlist ccp WHERE ccp.channel_id = channels.id AND ccp.custom_playlist_id = ?) as ccp_channel_number',
+                    [$customPlaylistId]
+                );
+
+                // Eager load all group tags for this playlist (for multi-group output).
+                // Uses a separate query (not a JOIN) so there is no cartesian explosion;
+                // Laravel issues one batch SELECT for all tags across all channels.
+                $channelsQuery->with(['tags' => function ($q) use ($tagUuid): void {
+                    $q->where('type', $tagUuid)
+                      ->orderBy('order_column');
+                }]);
             }
 
             if ($categoryId && $categoryId !== 'all') {
@@ -736,6 +744,10 @@ class XtreamApiController extends Controller
                     }
                     $num++;
 
+                    // Pre-compute values that are identical across all category instances of this channel.
+                    $name = $channel->title_custom ?? $channel->title;
+                    $tmdb = $channel->info['tmdb_id'] ?? $channel->movie_data['tmdb_id'] ?? 0;
+
                     $streamIcon = $baseUrl.'/placeholder.png';
                     if ($channel->logo) {
                         $streamIcon = $channel->logo;
@@ -749,44 +761,54 @@ class XtreamApiController extends Controller
                         $streamIcon = LogoProxyController::generateProxyUrl($streamIcon);
                     }
 
-                    $channelCategoryId = 'all';
-                    if ($isCustomPlaylist) {
-                        if (! empty($channel->custom_group_id)) {
-                            $channelCategoryId = (string) $channel->custom_group_id;
-                        } elseif ($channel->group_id) {
-                            $channelCategoryId = (string) $channel->group_id;
+                    // Collect all tag IDs for this channel (deduplicated, preserving order).
+                    $allTagIds = [];
+                    if ($isCustomPlaylist && $channel->tags) {
+                        foreach ($channel->tags as $tag) {
+                            $tagId = (int) $tag->id;
+                            if (! in_array($tagId, $allTagIds)) {
+                                $allTagIds[] = $tagId;
+                            }
                         }
-                    } elseif ($channel->group_id) {
-                        $channelCategoryId = (string) $channel->group_id;
                     }
 
-                    $tmdb = $channel->info['tmdb_id'] ?? $channel->movie_data['tmdb_id'] ?? 0;
+                    // Emit one stream entry per tag, or one with 'all' if the channel has no tags.
+                    $categoriesToEmit = empty($allTagIds) ? ['all' => null] : array_combine($allTagIds, $allTagIds);
+
                     $vodChannelNo = ($isCustomPlaylist && ! empty($channel->ccp_channel_number))
                         ? (int) $channel->ccp_channel_number
-                        : ($channel->channel ?: $num);
+                        : ($channel->channel ?: ++$num);
                     if ($playlist->auto_channel_increment) {
                         $vodChannelNo = ++$channelNumber;
                     }
 
-                    echo json_encode([
-                        'num' => $vodChannelNo,
-                        'name' => $channel->title_custom ?? $channel->title,
-                        'title' => $channel->title_custom ?? $channel->title,
-                        'year' => $channel->year ?? '',
-                        'stream_type' => 'movie',
-                        'stream_id' => $channel->id,
-                        'stream_icon' => $streamIcon,
-                        'rating' => $channel->rating ?? '',
-                        'rating_5based' => $channel->rating_5based ?? 0,
-                        'added' => (string) $channel->created_at->timestamp,
-                        'category_id' => $channelCategoryId,
-                        'category_ids' => [(int) $channelCategoryId],
-                        'tmdb' => (string) $tmdb,
-                        'tmdb_id' => (int) $tmdb,
-                        'container_extension' => $channel->container_extension ?? 'mkv',
-                        'custom_sid' => $channel->stream_id_custom ?? '',
-                        'direct_source' => '',
-                    ]);
+                    foreach ($categoriesToEmit as $categoryId => $_) {
+                        $channelCategoryId = $categoryId === 'all' ? 'all' : (string) $categoryId;
+
+                        echo json_encode([
+                            'num' => $vodChannelNo,
+                            'name' => $name,
+                            'title' => $name,
+                            'year' => $channel->year ?? '',
+                            'stream_type' => 'movie',
+                            'stream_id' => $channel->id,
+                            'stream_icon' => $streamIcon,
+                            'rating' => $channel->rating ?? '',
+                            'rating_5based' => $channel->rating_5based ?? 0,
+                            'added' => (string) $channel->created_at->timestamp,
+                            'category_id' => $channelCategoryId,
+                            'category_ids' => $allTagIds,
+                            'tmdb' => (string) $tmdb,
+                            'tmdb_id' => (int) $tmdb,
+                            'container_extension' => $channel->container_extension ?? 'mkv',
+                            'custom_sid' => $channel->stream_id_custom ?? '',
+                            'direct_source' => '',
+                        ]);
+                    }
+
+                    if (! $first) {
+                        echo ',';
+                    }
                     $first = false;
                     if (ob_get_level() > 0) {
                         ob_flush();
