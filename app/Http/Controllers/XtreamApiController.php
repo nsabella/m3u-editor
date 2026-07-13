@@ -582,9 +582,7 @@ class XtreamApiController extends Controller
                 echo '[';
                 $first = true;
                 foreach ($cursor as $channel) {
-                    if (! $first) {
-                        echo ',';
-                    }
+                    $num++;
 
                     // Pre-compute values that are identical across all category instances of this channel.
                     $name = $channel->title_custom ?? $channel->title;
@@ -612,6 +610,10 @@ class XtreamApiController extends Controller
                         }
                     }
 
+                    // Fall back to source group_id when no tags (applies to ALL playlist types).
+                    if (empty($allTagIds) && $channel->group_id) {
+                        $allTagIds = [(int) $channel->group_id];
+                    }
                     // Emit one stream entry per tag, or one with 'all' if the channel has no tags.
                     $categoriesToEmit = empty($allTagIds) ? ['all' => null] : array_combine($allTagIds, $allTagIds);
 
@@ -652,6 +654,11 @@ class XtreamApiController extends Controller
                     foreach ($categoriesToEmit as $categoryId => $_) {
                         $channelCategoryId = $categoryId === 'all' ? 'all' : (string) $categoryId;
 
+                        if (! $first) {
+                            echo ',';
+                        }
+                        $first = false;
+
                         $liveStream = [
                             'num' => $channelNo,
                             'name' => $name,
@@ -676,8 +683,7 @@ class XtreamApiController extends Controller
 
                         echo json_encode($liveStream);
                     }
-
-                    $first = false;
+                    
                     if (ob_get_level() > 0) {
                         ob_flush();
                     }
@@ -739,9 +745,6 @@ class XtreamApiController extends Controller
                 echo '[';
                 $first = true;
                 foreach ($cursor as $channel) {
-                    if (! $first) {
-                        echo ',';
-                    }
                     $num++;
 
                     // Pre-compute values that are identical across all category instances of this channel.
@@ -771,19 +774,27 @@ class XtreamApiController extends Controller
                             }
                         }
                     }
-
+                    // Fall back to source group_id when no tags (applies to ALL playlist types).
+                    if (empty($allTagIds) && $channel->group_id) {
+                        $allTagIds = [(int) $channel->group_id];
+                    }
                     // Emit one stream entry per tag, or one with 'all' if the channel has no tags.
                     $categoriesToEmit = empty($allTagIds) ? ['all' => null] : array_combine($allTagIds, $allTagIds);
 
                     $vodChannelNo = ($isCustomPlaylist && ! empty($channel->ccp_channel_number))
                         ? (int) $channel->ccp_channel_number
-                        : ($channel->channel ?: ++$num);
+                        : ($channel->channel ?: $num);
                     if ($playlist->auto_channel_increment) {
                         $vodChannelNo = ++$channelNumber;
                     }
 
                     foreach ($categoriesToEmit as $categoryId => $_) {
                         $channelCategoryId = $categoryId === 'all' ? 'all' : (string) $categoryId;
+
+                        if (! $first) {
+                            echo ',';
+                        }
+                        $first = false;
 
                         echo json_encode([
                             'num' => $vodChannelNo,
@@ -806,10 +817,6 @@ class XtreamApiController extends Controller
                         ]);
                     }
 
-                    if (! $first) {
-                        echo ',';
-                    }
-                    $first = false;
                     if (ob_get_level() > 0) {
                         ob_flush();
                     }
