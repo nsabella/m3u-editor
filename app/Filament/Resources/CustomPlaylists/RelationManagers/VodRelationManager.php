@@ -7,6 +7,7 @@ use App\Filament\Resources\CustomPlaylists\RelationManagers\Concerns\ReordersCus
 use App\Filament\Resources\Vods\VodResource;
 use App\Jobs\SyncPlexDvrJob;
 use App\Models\Channel;
+use App\Services\EpgCacheService;
 use App\Traits\AppliesTmdbSelection;
 use Filament\Actions\AttachAction;
 use Filament\Actions\BulkAction;
@@ -393,32 +394,34 @@ class VodRelationManager extends RelationManager
                 BulkAction::make('add_to_group')
                     ->label(__('Add to custom group'))
                     ->schema([
-                        Select::make('group')
-                            ->label(__('Select group'))
+                        Select::make('groups')
+                            ->label(__('Select groups'))
+                            ->multiple()
                             ->native(false)
                             ->options(
                                 $ownerRecord->groupTags()->get()
-                                    ->map(fn ($name) => [
-                                        'id' => $name->getAttributeValue('name'),
-                                        'name' => $name->getAttributeValue('name'),
-                                    ])->pluck('id', 'name')
+                                    ->map(fn ($t) => [
+                                        'id' => $t->id,
+                                        'name' => $t->getAttributeValue('name'),
+                                    ])
+                                    ->pluck('name', 'id')
                             )
                             ->searchable()
                             ->required(),
                     ])
                     ->action(function (Collection $records, $data) use ($ownerRecord): void {
-                        $tags = $ownerRecord->groupTags()->get();
-                        $tag = $ownerRecord->groupTags()->where('name->en', $data['group'])->first();
+                        $tagIds = $data['groups'] ?? [];
+                        $tags = $ownerRecord->groupTags()->whereIn('id', $tagIds)->get();
                         foreach ($records as $record) {
-                            // Need to detach any existing tags from this playlist first
-                            $record->detachTags($tags);
-                            $record->attachTag($tag);
+                            $record->attachTags($tags); // Append, not replace
                         }
+                        // Clear EPG cache for this custom playlist
+                        EpgCacheService::clearForCustomPlaylistId($ownerRecord->id);
                     })->after(function () {
                         Notification::make()
                             ->success()
                             ->title(__('Added to group'))
-                            ->body(__('The selected VOD have been added to the custom group.'))
+                            ->body(__('The selected VOD have been added to the custom groups.'))
                             ->send();
                     })
                     ->deselectRecordsAfterCompletion()
@@ -427,6 +430,46 @@ class VodRelationManager extends RelationManager
                     ->modalIcon('heroicon-o-squares-plus')
                     ->modalDescription(__('Add to group'))
                     ->modalSubmitActionLabel(__('Yes, add to group')),
+                BulkAction::make('remove_from_group')
+                    ->label(__('Remove from custom group'))
+                    ->schema([
+                        Select::make('groups')
+                            ->label(__('Select groups to remove'))
+                            ->multiple()
+                            ->native(false)
+                            ->options(
+                                $ownerRecord->groupTags()->get()
+                                    ->map(fn ($t) => [
+                                        'id' => $t->id,
+                                        'name' => $t->getAttributeValue('name'),
+                                    ])
+                                    ->pluck('name', 'id')
+                            )
+                            ->searchable()
+                            ->required(),
+                    ])
+                    ->action(function (Collection $records, $data) use ($ownerRecord): void {
+                        $tagIds = $data['groups'] ?? [];
+                        $tags = $ownerRecord->groupTags()->whereIn('id', $tagIds)->get();
+                        foreach ($records as $record) {
+                            $record->detachTags($tags); // Remove only selected tags
+                        }
+                        // Clear EPG cache for this custom playlist
+                        EpgCacheService::clearForCustomPlaylistId($ownerRecord->id);
+                    })->after(function () {
+                        Notification::make()
+                            ->success()
+                            ->title(__('Removed from group'))
+                            ->body(__('The selected VOD have been removed from the chosen groups.'))
+                            ->send();
+                    })
+                    ->deselectRecordsAfterCompletion()
+                    ->requiresConfirmation()
+                    ->icon('heroicon-o-minus-circle')
+                    ->modalIcon('heroicon-o-minus-circle')
+                    ->color('warning')
+                    ->modalDescription(__('Remove VOD from selected custom groups'))
+                    ->modalSubmitActionLabel(__('Yes, remove')),
             ]);
     }
 
