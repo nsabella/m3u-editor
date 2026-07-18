@@ -5,6 +5,7 @@ namespace App\Filament\Resources\CustomPlaylists\RelationManagers;
 use App\Filament\Resources\CustomPlaylists\RelationManagers\Concerns\ReordersCustomPlaylistPivotSort;
 use App\Filament\Resources\Series\SeriesResource;
 use App\Models\Series;
+use App\Services\EpgCacheService;
 use App\Traits\AppliesTmdbSelection;
 use Filament\Actions\AttachAction;
 use Filament\Actions\BulkAction;
@@ -272,27 +273,33 @@ class SeriesRelationManager extends RelationManager
                 BulkAction::make('add_to_category')
                     ->label(__('Add to custom category'))
                     ->schema([
-                        Select::make('category')
-                            ->label(__('Select category'))
+                        Select::make('categories')
+                            ->label(__('Select categories'))
+                            ->multiple()
                             ->native(false)
                             ->options(
                                 $ownerRecord->categoryTags()->get()
-                                    ->map(fn ($name) => [
-                                        'id' => $name->getAttributeValue('name'),
-                                        'name' => $name->getAttributeValue('name'),
-                                    ])->pluck('id', 'name')
+                                    ->map(fn ($tag) => [
+                                        'id' => $tag->id,
+                                        'name' => $tag->getAttributeValue('name'),
+                                    ])->pluck('name', 'id')
                             )
                             ->searchable()
                             ->required(),
                     ])
                     ->action(function (Collection $records, $data) use ($ownerRecord): void {
-                        $tags = $ownerRecord->categoryTags()->get();
-                        $tag = $ownerRecord->categoryTags()->where('name->en', $data['category'])->first();
-                        foreach ($records as $record) {
-                            // Need to detach any existing tags from this playlist first
-                            $record->detachTags($tags);
-                            $record->attachTag($tag);
+                        $tagIds = $data['categories'] ?? [];
+                        if (empty($tagIds)) {
+                            return;
                         }
+
+                        $tags = $ownerRecord->categoryTags()->whereIn('id', $tagIds)->get();
+
+                        foreach ($records as $record) {
+                            $record->attachTags($tags); // Append, not replace
+                        }
+                        // Clear EPG cache for this custom playlist
+                        EpgCacheService::clearForCustomPlaylistId($ownerRecord->id);
                     })->after(function () {
                         Notification::make()
                             ->success()
@@ -306,6 +313,52 @@ class SeriesRelationManager extends RelationManager
                     ->modalIcon('heroicon-o-squares-plus')
                     ->modalDescription(__('Add to category'))
                     ->modalSubmitActionLabel(__('Yes, add to category')),
+
+                BulkAction::make('remove_from_category')
+                    ->label(__('Remove from custom category'))
+                    ->schema([
+                        Select::make('categories')
+                            ->label(__('Select categories to remove'))
+                            ->multiple()
+                            ->native(false)
+                            ->options(
+                                $ownerRecord->categoryTags()->get()
+                                    ->map(fn ($t) => [
+                                        'id' => $t->id,
+                                        'name' => $t->getAttributeValue('name'),
+                                    ])
+                                    ->pluck('name', 'id')
+                            )
+                            ->searchable()
+                            ->required(),
+                    ])
+                    ->action(function (Collection $records, $data) use ($ownerRecord): void {
+                        $tagIds = $data['categories'] ?? [];
+                        if (empty($tagIds)) {
+                            return;
+                        }
+
+                        $tags = $ownerRecord->categoryTags()->whereIn('id', $tagIds)->get();
+
+                        foreach ($records as $record) {
+                            $record->detachTags($tags); // Remove, not replace
+                        }
+                        // Clear EPG cache for this custom playlist
+                        EpgCacheService::clearForCustomPlaylistId($ownerRecord->id);
+                    })->after(function () {
+                        Notification::make()
+                            ->success()
+                            ->title(__('Removed from category'))
+                            ->body(__('The selected series have been removed from the chosen categories.'))
+                            ->send();
+                    })
+                    ->deselectRecordsAfterCompletion()
+                    ->requiresConfirmation()
+                    ->icon('heroicon-o-minus-circle')
+                    ->modalIcon('heroicon-o-minus-circle')
+                    ->color('warning')
+                    ->modalDescription(__('Remove from category'))
+                    ->modalSubmitActionLabel(__('Yes, remove')),
             ]);
     }
 

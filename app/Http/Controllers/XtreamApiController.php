@@ -894,22 +894,26 @@ class XtreamApiController extends Controller
                 echo '[';
                 $first = true;
                 foreach ($seriesIterable as $seriesItem) {
-                    if (! $first) {
-                        echo ',';
-                    }
                     $num++;
 
-                    $seriesCategoryId = 'all';
-                    if ($isCustomPlaylist) {
-                        $customCat = $seriesItem->tags->where('type', $tagUuid.'-category')->first();
-                        if ($customCat) {
-                            $seriesCategoryId = (string) $customCat->id;
-                        } elseif ($seriesItem->category_id) {
-                            $seriesCategoryId = (string) $seriesItem->category_id;
+                    // Collect all custom category tag IDs for this series (deduplicated).
+                    $allCategoryIds = [];
+                    if ($isCustomPlaylist && $seriesItem->tags) {
+                        foreach ($seriesItem->tags as $tag) {
+                            if ($tag->type === $tagUuid.'-category') {
+                                $tagId = (int) $tag->id;
+                                if (! in_array($tagId, $allCategoryIds)) {
+                                    $allCategoryIds[] = $tagId;
+                                }
+                            }
                         }
-                    } elseif ($seriesItem->category_id) {
-                        $seriesCategoryId = (string) $seriesItem->category_id;
                     }
+                    // Fall back to source category_id when no custom tags (applies to ALL playlist types).
+                    if (empty($allCategoryIds) && $seriesItem->category_id) {
+                        $allCategoryIds = [(int) $seriesItem->category_id];
+                    }
+                    // Emit one entry per tag, or one with 'all' if the series has no tags.
+                    $categoriesToEmit = empty($allCategoryIds) ? ['all' => null] : array_combine($allCategoryIds, $allCategoryIds);
 
                     $tmdb = $seriesItem->metadata['tmdb_id'] ?? $seriesItem->metadata['tmdb'] ?? $seriesItem->tmdb_id ?? '';
                     $lastModified = $seriesItem->last_modified?->timestamp
@@ -928,27 +932,36 @@ class XtreamApiController extends Controller
                         $backdropPaths = array_map(fn ($path) => LogoProxyController::generateProxyUrl($path), $backdropPaths);
                     }
 
-                    echo json_encode([
-                        'num' => $num,
-                        'name' => $seriesItem->name,
-                        'series_id' => (int) $seriesItem->id,
-                        'cover' => $cover,
-                        'plot' => $seriesItem->plot ?? '',
-                        'cast' => $seriesItem->cast ?? '',
-                        'director' => $seriesItem->director ?? '',
-                        'genre' => $seriesItem->genre ?? '',
-                        'releaseDate' => $seriesItem->release_date ?? '',
-                        'last_modified' => (string) ($lastModified),
-                        'rating' => (string) ($seriesItem->rating ?? 0),
-                        'rating_5based' => round((floatval($seriesItem->rating ?? 0)) / 2, 1),
-                        'backdrop_path' => $backdropPaths,
-                        'tmdb' => (string) $tmdb,
-                        'tmdb_id' => (int) ($tmdb ?: 0),
-                        'youtube_trailer' => $seriesItem->youtube_trailer ?? '',
-                        'episode_run_time' => (string) ($seriesItem->episode_run_time ?? 0),
-                        'category_id' => $seriesCategoryId,
-                    ]);
-                    $first = false;
+                    foreach ($categoriesToEmit as $categoryId => $_) {
+                        $seriesCategoryId = $categoryId === 'all' ? 'all' : (string) $categoryId;
+
+                        if (! $first) {
+                            echo ',';
+                        }
+                        $first = false;
+
+                        echo json_encode([
+                            'num' => $num,
+                            'name' => $seriesItem->name,
+                            'series_id' => (int) $seriesItem->id,
+                            'cover' => $cover,
+                            'plot' => $seriesItem->plot ?? '',
+                            'cast' => $seriesItem->cast ?? '',
+                            'director' => $seriesItem->director ?? '',
+                            'genre' => $seriesItem->genre ?? '',
+                            'releaseDate' => $seriesItem->release_date ?? '',
+                            'last_modified' => (string) ($lastModified),
+                            'rating' => (string) ($seriesItem->rating ?? 0),
+                            'rating_5based' => round((floatval($seriesItem->rating ?? 0)) / 2, 1),
+                            'backdrop_path' => $backdropPaths,
+                            'tmdb' => (string) $tmdb,
+                            'tmdb_id' => (int) ($tmdb ?: 0),
+                            'youtube_trailer' => $seriesItem->youtube_trailer ?? '',
+                            'episode_run_time' => (string) ($seriesItem->episode_run_time ?? 0),
+                            'category_id' => $seriesCategoryId,
+                            'category_ids' => $allCategoryIds,
+                        ]);
+                    }
                     if (ob_get_level() > 0) {
                         ob_flush();
                     }
@@ -1342,9 +1355,25 @@ class XtreamApiController extends Controller
                 $sortedTags = $tags->sortBy('order_column')->values();
 
                 foreach ($sortedTags as $tag) {
+                    // Spatie tag `name` values may be plain strings or JSON.
+                    // Treat the column as opaque so we never crash on decode.
+                    $tagName = $tag->getAttributeValue('name');
+
+                    if (is_array($tagName)) {
+                        $categoryName = $tagName['en'] ?? ($tagName[array_key_first($tagName)] ?? '');
+                    } else {
+                        $decoded = json_decode($tagName, true);
+                        if (! is_array($decoded)) {
+                            // Plain string tag name — use it directly.
+                            $categoryName = $tagName;
+                        } else {
+                            $categoryName = $decoded['en'] ?? ($decoded[array_key_first($decoded)] ?? '');
+                        }
+                    }
+
                     $seriesCategories[] = [
                         'category_id' => (string) $tag->id, // Use tag ID instead of name
-                        'category_name' => $tag->name,
+                        'category_name' => $categoryName,
                         'parent_id' => 0,
                         'sort_order' => $tag->order_column ?? 999999,
                     ];
