@@ -145,13 +145,27 @@ class PlaylistGenerateController extends Controller
                         // Custom context: use all tags for this playlist.
                         $tagNames = $channel->tags?->pluck('name') ?? collect();
                         foreach ($tagNames as $tagName) {
+                            if (empty($tagName)) {
+                                continue;
+                            }
+
                             $decoded = json_decode($tagName, true);
+                            if (! is_array($decoded)) {
+                                // Plain string tag name — use it directly.
+                                $groupNames[] = $tagName;
+                                continue;
+                            }
+
                             $groupNames[] = $decoded['en'] ?? ($decoded[array_key_first($decoded)] ?? '');
                         }
                         // If no tags found, fall back to source group.
                         if (empty($groupNames) && ! empty($channel->custom_group_name)) {
                             $groupName = json_decode($channel->custom_group_name, true);
-                            $groupNames[] = $groupName['en'] ?? $groupName[array_key_first($groupName)] ?? '';
+                            if (! is_array($groupName)) {
+                                $groupNames[] = $channel->custom_group_name;
+                            } else {
+                                $groupNames[] = $groupName['en'] ?? ($groupName[array_key_first($groupName)] ?? '');
+                            }
                         }
                     }
 
