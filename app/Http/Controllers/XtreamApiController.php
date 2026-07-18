@@ -551,7 +551,7 @@ class XtreamApiController extends Controller
                 // Laravel issues one batch SELECT for all tags across all channels.
                 $channelsQuery->with(['tags' => function ($q) use ($tagUuid): void {
                     $q->where('type', $tagUuid)
-                      ->orderBy('order_column');
+                        ->orderBy('order_column');
                 }]);
             }
 
@@ -582,8 +582,6 @@ class XtreamApiController extends Controller
                 echo '[';
                 $first = true;
                 foreach ($cursor as $channel) {
-                    $num++;
-
                     // Pre-compute values that are identical across all category instances of this channel.
                     $name = $channel->title_custom ?? $channel->title;
                     $streamIcon = $baseUrl.'/placeholder.png';
@@ -683,7 +681,7 @@ class XtreamApiController extends Controller
 
                         echo json_encode($liveStream);
                     }
-                    
+
                     if (ob_get_level() > 0) {
                         ob_flush();
                     }
@@ -716,7 +714,7 @@ class XtreamApiController extends Controller
                 // Laravel issues one batch SELECT for all tags across all channels.
                 $channelsQuery->with(['tags' => function ($q) use ($tagUuid): void {
                     $q->where('type', $tagUuid)
-                      ->orderBy('order_column');
+                        ->orderBy('order_column');
                 }]);
             }
 

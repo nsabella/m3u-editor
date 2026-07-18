@@ -8,6 +8,7 @@ use App\Facades\PlaylistFacade;
 use App\Facades\ProxyFacade;
 use App\Models\Channel;
 use App\Models\CustomPlaylist;
+use App\Models\MergedPlaylist;
 use App\Models\Network;
 use App\Models\Playlist;
 use App\Models\PlaylistAlias;
@@ -153,6 +154,7 @@ class PlaylistGenerateController extends Controller
                             if (! is_array($decoded)) {
                                 // Plain string tag name — use it directly.
                                 $groupNames[] = $tagName;
+
                                 continue;
                             }
 
@@ -754,7 +756,7 @@ class PlaylistGenerateController extends Controller
             // Laravel issues one batch SELECT for all tags across all channels.
             $query->with(['tags' => function ($q) use ($playlistUuid): void {
                 $q->where('type', $playlistUuid)
-                  ->orderBy('order_column');
+                    ->orderBy('order_column');
             }]);
         } else {
             // Per-alias custom live group ordering (optional). When enabled, the
@@ -842,7 +844,7 @@ class PlaylistGenerateController extends Controller
      * per group without duplicating the EXTINF / catchup / TVG logic.
      */
     private function emitChannelOutput(
-        Playlist $playlist,
+        Playlist|MergedPlaylist|CustomPlaylist|PlaylistAlias $playlist,
         Channel $channel,
         string $title,
         string $name,
@@ -923,8 +925,8 @@ class PlaylistGenerateController extends Controller
         }
 
         // Final EXTINF line with core attributes.
-        $extInf .= " tvg-chno=\"$channelNo\" tvg-id=\"$tvgId\" tvg-name=\"$name\" tvg-logo=\"$icon\" group-title=\"" . e($group) . "\"";
-        echo "$extInf," . $title . "\n";
+        $extInf .= " tvg-chno=\"$channelNo\" tvg-id=\"$tvgId\" tvg-name=\"$name\" tvg-logo=\"$icon\" group-title=\"".e($group).'"';
+        echo "$extInf,".$title."\n";
 
         // Optional EXTVLCOPT lines.
         if ($channel->extvlcopt) {
@@ -940,7 +942,7 @@ class PlaylistGenerateController extends Controller
             }
         }
 
-        echo $url . "\n";
+        echo $url."\n";
     }
 
     /**
