@@ -10,6 +10,7 @@ use App\Models\Group;
 use App\Models\Playlist;
 use App\Models\Series;
 use App\Models\User;
+use App\Services\EpgCacheService;
 use Filament\Notifications\Notification;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
@@ -111,7 +112,13 @@ class AutoSyncGroupsToCustomPlaylist implements ShouldQueue
 
                 if ($tag) {
                     foreach ($items as $item) {
-                        $item->detachTags($playlistTags);
+                        // Original mode mirrors the source playlist — replace tags so a
+                        // channel that moved groups shows only its new group. Select/create
+                        // modes append a tag on top of existing ones, preserving user
+                        // assignments.
+                        if ($mode === 'original') {
+                            $item->detachTags($playlistTags);
+                        }
                         $item->attachTag($tag);
                     }
                 }
@@ -200,6 +207,9 @@ class AutoSyncGroupsToCustomPlaylist implements ShouldQueue
                 }
             }
         }
+
+        // Clear EPG cache so downstream services pick up the new tag assignments.
+        EpgCacheService::clearForCustomPlaylistId($playlist->id);
 
         $notification = Notification::make()
             ->success()

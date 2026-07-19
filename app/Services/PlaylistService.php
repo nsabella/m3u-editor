@@ -941,19 +941,25 @@ class PlaylistService
                     $tag = Tag::findOrCreate($originalName, $tagType);
                     $playlist->attachTag($tag);
 
+                    // Original mode mirrors the source playlist — replace tags so a
+                    // channel that moved groups shows only its new group.
                     $item->detachTags($playlistTags);
                     $item->attachTag($tag);
                 }
             }
         } elseif ($tagName) {
+            // 'select' or 'create' mode: append the chosen tag on top of existing ones,
+            // preserving any groups the user has already assigned to these items.
             $tag = Tag::findOrCreate($tagName, $tagType);
             $playlist->attachTag($tag);
 
             foreach ($cursor as $item) {
-                $item->detachTags($playlistTags);
                 $item->attachTag($tag);
             }
         }
+
+        // Clear EPG cache so downstream services pick up the new tag assignments.
+        EpgCacheService::clearForCustomPlaylistId($playlist->id);
     }
 
     /**
