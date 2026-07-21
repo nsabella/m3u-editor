@@ -262,6 +262,7 @@ it('alias of standard playlist shows source group names unchanged', function () 
         'is_vod' => false,
         'title' => 'Standard Test Channel',
         'group_id' => $groupA->id,
+        'group' => 'SourceGroup',
     ]);
 
     // Create an alias of the standard playlist (no custom_playlist_id).
@@ -308,6 +309,7 @@ it('merged playlist retains source group for multi-group channels', function () 
         'is_vod' => false,
         'title' => 'Merged Source Channel',
         'group_id' => $groupA->id,
+        'group' => 'SourceGroup',
     ]);
 
     // Create a MergedPlaylist and attach the source playlist to it.
