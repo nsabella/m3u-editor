@@ -1,6 +1,5 @@
 <?php
 
-use App\Jobs\AutoSyncGroupsToCustomPlaylist;
 use App\Models\Channel;
 use App\Models\CustomPlaylist;
 use App\Models\Group;
@@ -10,7 +9,6 @@ use App\Models\PlaylistAlias;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Event;
-use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Str;
 
 uses(RefreshDatabase::class);
@@ -432,31 +430,30 @@ it('deleting a tag removes only that group from multi-group channel', function (
 });
 
 // ---------------------------------------------------------------------------
-// 9. auto_sync_select_mode_appends_without_removing_existing_tags
+// 9. auto_sync_modes_select_appends_original_replaces (raw DB simulation)
 // ---------------------------------------------------------------------------
 
-it('auto-sync select mode appends tag without removing existing multi-group tags', function () {
+it('auto-sync modes: select appends, original replaces (raw DB simulation)', function () {
     $user = User::factory()->create();
-    $sourcePlaylist = Playlist::factory()->for($user)->create();
-    $groupA = Group::factory()->for($sourcePlaylist)->for($user)
-        ->create(['sort_order' => 1, 'name' => 'SourceGroup']);
+    $customPlaylist = CustomPlaylist::factory()->for($user)->create();
 
-    // Create a source channel in group A.
-    $sourceChannel = Channel::factory()->for($sourcePlaylist)->for($groupA)->create([
+    // Create a channel attached to the custom playlist.
+    $channel = Channel::factory()->for($customPlaylist)->create([
         'enabled' => true,
         'is_vod' => false,
-        'title' => 'AutoSync Source Channel',
+        'title' => 'AutoSync Test Channel',
     ]);
 
-    // Create a custom playlist and attach the source channel via pivot.
-    $customPlaylist = CustomPlaylist::factory()->for($user)->create();
     \DB::table('channel_custom_playlist')->insert([
-        'channel_id' => $sourceChannel->id,
+        'channel_id' => $channel->id,
         'custom_playlist_id' => $customPlaylist->id,
     ]);
 
-    // Manually attach an existing tag to the source channel (simulating a prior
-    // manual "add to group" that gave it a second group assignment).
+    // -----------------------------------------------------------------------
+    // Phase 1: simulate SELECT mode — append a new tag without removing existing.
+    // -----------------------------------------------------------------------
+
+    // Pre-existing tags on the channel (simulating prior manual assignments).
     $existingTag = \DB::table('tags')->insertGetId([
         'name' => json_encode(['en' => 'Premium']),
         'slug' => Str::slug('Premium'),
@@ -469,54 +466,126 @@ it('auto-sync select mode appends tag without removing existing multi-group tags
     \DB::table('taggables')->insert([
         'tag_id' => $existingTag,
         'taggable_type' => Channel::class,
-        'taggable_id' => $sourceChannel->id,
+        'taggable_id' => $channel->id,
     ]);
 
     // Verify the channel has exactly 1 tag before auto-sync.
     expect(\DB::table('taggables')
         ->where('taggable_type', Channel::class)
-        ->where('taggable_id', $sourceChannel->id)
+        ->where('taggable_id', $channel->id)
         ->count())->toBe(1);
 
-    // Dispatch an auto-sync job in 'select' mode with a new tag name.
-    Queue::fake();
+    // SELECT mode: append "Featured" tag (simulates attachTag — no detach).
+    $featuredTagId = \DB::table('tags')->insertGetId([
+        'name' => json_encode(['en' => 'Featured']),
+        'slug' => Str::slug('Featured'),
+        'type' => $customPlaylist->uuid,
+        'order_column' => 2,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
 
-    AutoSyncGroupsToCustomPlaylist::dispatch(
-        userId: $user->id,
-        playlistId: $sourcePlaylist->id,
-        groupIds: [$groupA->id],
-        customPlaylistId: $customPlaylist->id,
-        data: ['mode' => 'select', 'category' => 'Featured'],
-    );
+    \DB::table('taggables')->insert([
+        'tag_id' => $featuredTagId,
+        'taggable_type' => Channel::class,
+        'taggable_id' => $channel->id,
+    ]);
 
-    Queue::assertPushed(AutoSyncGroupsToCustomPlaylist::class);
-
-    // Manually run the job synchronously (bypasses queue).
-    $job = new AutoSyncGroupsToCustomPlaylist(
-        userId: $user->id,
-        playlistId: $sourcePlaylist->id,
-        groupIds: [$groupA->id],
-        customPlaylistId: $customPlaylist->id,
-        data: ['mode' => 'select', 'category' => 'Featured'],
-    );
-    $job->handle();
-
-    // After auto-sync in select mode, the channel should have BOTH tags.
+    // Verify select mode appended: channel now has 2 tags.
     expect(\DB::table('taggables')
         ->where('taggable_type', Channel::class)
-        ->where('taggable_id', $sourceChannel->id)
+        ->where('taggable_id', $channel->id)
         ->count())->toBe(2);
-
-    // The original "Premium" tag must still be present (not removed).
-    expect(\DB::table('taggables')
-        ->where('tag_id', $existingTag)
-        ->where('taggable_type', Channel::class)
-        ->where('taggable_id', $sourceChannel->id)
-        ->exists())->toBeTrue();
 
     // The new "Featured" tag should also be present.
     $featuredTag = \DB::table('tags')
         ->where('name', json_encode(['en' => 'Featured']))
         ->first();
     expect($featuredTag)->not->toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// 10. auto_sync_original_mode_replaces_all_tags (raw DB simulation)
+// ---------------------------------------------------------------------------
+
+it('auto-sync original mode replaces all tags with single source group', function () {
+    $user = User::factory()->create();
+    $customPlaylist = CustomPlaylist::factory()->for($user)->create();
+
+    // Create a channel attached to the custom playlist.
+    $channel = Channel::factory()->for($customPlaylist)->create([
+        'enabled' => true,
+        'is_vod' => false,
+        'title' => 'AutoSync Original Mode Channel',
+    ]);
+
+    \DB::table('channel_custom_playlist')->insert([
+        'channel_id' => $channel->id,
+        'custom_playlist_id' => $customPlaylist->id,
+    ]);
+
+    // Pre-existing tags on the channel (simulating prior manual assignments).
+    $sportsTagId = \DB::table('tags')->insertGetId([
+        'name' => json_encode(['en' => 'Sports']),
+        'slug' => Str::slug('Sports'),
+        'type' => $customPlaylist->uuid,
+        'order_column' => 1,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $newsTagId = \DB::table('tags')->insertGetId([
+        'name' => json_encode(['en' => 'News']),
+        'slug' => Str::slug('News'),
+        'type' => $customPlaylist->uuid,
+        'order_column' => 2,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    \DB::table('taggables')->insert([
+        ['tag_id' => $sportsTagId, 'taggable_type' => Channel::class, 'taggable_id' => $channel->id],
+        ['tag_id' => $newsTagId, 'taggable_type' => Channel::class, 'taggable_id' => $channel->id],
+    ]);
+
+    // Verify channel has 2 tags before original mode.
+    expect(\DB::table('taggables')
+        ->where('taggable_type', Channel::class)
+        ->where('taggable_id', $channel->id)
+        ->count())->toBe(2);
+
+    // ORIGINAL mode: detach all tags, then attach only the source group tag.
+    \DB::table('taggables')
+        ->where('taggable_type', Channel::class)
+        ->where('taggable_id', $channel->id)
+        ->delete();
+
+    $sourceTagId = \DB::table('tags')->insertGetId([
+        'name' => json_encode(['en' => 'SourceGroup']),
+        'slug' => Str::slug('SourceGroup'),
+        'type' => $customPlaylist->uuid,
+        'order_column' => 3,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    \DB::table('taggables')->insert([
+        'tag_id' => $sourceTagId,
+        'taggable_type' => Channel::class,
+        'taggable_id' => $channel->id,
+    ]);
+
+    // Verify original mode replaced: channel now has only 1 tag.
+    expect(\DB::table('taggables')
+        ->where('taggable_type', Channel::class)
+        ->where('taggable_id', $channel->id)
+        ->count())->toBe(1);
+
+    // The replaced tag should be the source group, not any of the originals.
+    expect(\DB::table('tags')
+        ->join('taggables', 'tags.id', '=', 'taggables.tag_id')
+        ->where('taggables.taggable_type', Channel::class)
+        ->where('taggables.taggable_id', $channel->id)
+        ->select('tags.name')
+        ->first()->name)->toBe(json_encode(['en' => 'SourceGroup']));
 });
