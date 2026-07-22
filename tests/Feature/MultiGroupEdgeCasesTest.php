@@ -22,7 +22,7 @@ beforeEach(function () {
 // Helpers — raw DB, bypass Spatie Tags entirely (same pattern as Feature tests).
 // ---------------------------------------------------------------------------
 
-function createTagWithOrder(CustomPlaylist $playlist, string $name, int $orderColumn): int
+function edgeCreateTagWithOrder(CustomPlaylist $playlist, string $name, int $orderColumn): int
 {
     return \DB::table('tags')->insertGetId([
         'name' => json_encode(['en' => $name]),
@@ -34,7 +34,7 @@ function createTagWithOrder(CustomPlaylist $playlist, string $name, int $orderCo
     ]);
 }
 
-function createMultiGroupChannel(CustomPlaylist $playlist, Group $group, array $tagNames): Channel
+function edgeCreateMultiGroupChannel(CustomPlaylist $playlist, Group $group, array $tagNames): Channel
 {
     // 1. Create channel via factory.
     $channel = Channel::factory()->for($playlist)->for($group)->create([
@@ -54,7 +54,7 @@ function createMultiGroupChannel(CustomPlaylist $playlist, Group $group, array $
 
     // 4-5. Create tags and pivot records via raw DB (dual attachment).
     foreach ($tagNames as $i => $name) {
-        $tagId = createTagWithOrder($playlist, $name, $i + 1);
+        $tagId = edgeCreateTagWithOrder($playlist, $name, $i + 1);
 
         \DB::table('taggables')->insert([
             'tag_id' => $tagId,
@@ -76,7 +76,7 @@ function createMultiGroupChannel(CustomPlaylist $playlist, Group $group, array $
     return $channel;
 }
 
-function createNoTagChannel(CustomPlaylist $playlist, Group $group): Channel
+function edgeCreateNoTagChannel(CustomPlaylist $playlist, Group $group): Channel
 {
     $channel = Channel::factory()->for($playlist)->for($group)->create([
         'enabled' => true,
@@ -100,7 +100,7 @@ it('channel with zero tags emits single M3U entry using source group', function 
         ->create(['sort_order' => 1, 'name' => 'SourceGroup']);
     $customPlaylist = CustomPlaylist::factory()->for($user)->create();
 
-    createNoTagChannel($customPlaylist, $group);
+    edgeCreateNoTagChannel($customPlaylist, $group);
 
     $response = $this->get("/{$customPlaylist->uuid}/playlist.m3u");
     $response->assertStatus(200);
@@ -129,7 +129,7 @@ it('channel with one tag emits single M3U entry', function () {
     $group = Group::factory()->for($sourcePlaylist)->for($user)->create(['sort_order' => 1]);
     $customPlaylist = CustomPlaylist::factory()->for($user)->create();
 
-    createMultiGroupChannel($customPlaylist, $group, ['Sports']);
+    edgeCreateMultiGroupChannel($customPlaylist, $group, ['Sports']);
 
     $response = $this->get("/{$customPlaylist->uuid}/playlist.m3u");
     $response->assertStatus(200);
@@ -163,7 +163,7 @@ it('channel with many tags produces correct number of M3U entries without perfor
         $manyTagNames[] = "Group{$i}";
     }
 
-    createMultiGroupChannel($customPlaylist, $group, $manyTagNames);
+    edgeCreateMultiGroupChannel($customPlaylist, $group, $manyTagNames);
 
     // Track peak memory during M3U generation to catch regressions.
     $peakBefore = memory_get_peak_usage(true);
@@ -214,7 +214,7 @@ it('alias of custom playlist shows custom tag names not source group names', fun
     $customPlaylist = CustomPlaylist::factory()->for($user)->create();
 
     // Create a channel with custom group tags.
-    createMultiGroupChannel($customPlaylist, $groupA, ['Sports', 'News']);
+    edgeCreateMultiGroupChannel($customPlaylist, $groupA, ['Sports', 'News']);
 
     // Create an alias of the custom playlist.
     $aliasUuid = Str::uuid()->toString();
@@ -345,7 +345,7 @@ it('detaching a channel from custom playlist removes all its tags for that playl
     $customPlaylist = CustomPlaylist::factory()->for($user)->create();
 
     // Create a multi-group channel.
-    createMultiGroupChannel($customPlaylist, $groupA, ['Sports', 'News', 'Music']);
+    edgeCreateMultiGroupChannel($customPlaylist, $groupA, ['Sports', 'News', 'Music']);
 
     // Verify the channel is in 3 groups before detach.
     $channel = Channel::where('title', 'Multi-Group Test Channel')->first();
@@ -389,7 +389,7 @@ it('deleting a tag removes only that group from multi-group channel', function (
     $customPlaylist = CustomPlaylist::factory()->for($user)->create();
 
     // Create a multi-group channel with 3 tags.
-    createMultiGroupChannel($customPlaylist, $groupA, ['Sports', 'News', 'Music']);
+    edgeCreateMultiGroupChannel($customPlaylist, $groupA, ['Sports', 'News', 'Music']);
 
     // Verify all 3 group-titles are present before deletion.
     $responseBefore = $this->get("/{$customPlaylist->uuid}/playlist.m3u");

@@ -36,7 +36,7 @@ function makeTag(array $attributes): Tag
 // Helpers (no $this dependency)
 // ---------------------------------------------------------------------------
 
-function createMultiGroupChannel(CustomPlaylist $playlist, Group $group, array $tagNames): Channel
+function unitCreateMultiGroupChannel(CustomPlaylist $playlist, Group $group, array $tagNames): Channel
 {
     // Create tags scoped to this custom playlist (type = playlist UUID).
     $tags = collect($tagNames)->map(function ($name) use ($playlist): Tag {
@@ -69,7 +69,7 @@ it('channel with multiple tags emits multiple M3U entries', function () {
     $group = Group::factory()->for($sourcePlaylist)->for($user)->create(['sort_order' => 1]);
     $customPlaylist = CustomPlaylist::factory()->for($user)->create();
 
-    createMultiGroupChannel($customPlaylist, $group, ['Sports', 'News', 'Music']);
+    unitCreateMultiGroupChannel($customPlaylist, $group, ['Sports', 'News', 'Music']);
 
     // Debug: verify channel is attached to custom playlist
     expect($customPlaylist->channels()->count())->toBe(1)
@@ -143,7 +143,7 @@ it('channel with one tag emits single entry', function () {
     $group = Group::factory()->for($sourcePlaylist)->for($user)->create(['sort_order' => 1]);
     $customPlaylist = CustomPlaylist::factory()->for($user)->create();
 
-    createMultiGroupChannel($customPlaylist, $group, ['Sports']);
+    unitCreateMultiGroupChannel($customPlaylist, $group, ['Sports']);
 
     $response = $this->get("/{$customPlaylist->uuid}/playlist.m3u");
     $response->assertStatus(200);
@@ -180,7 +180,7 @@ it('multi-group channel produces one Xtream stream entry per category', function
     $playlistAuth->assignTo($customPlaylist);
 
     // Build a custom playlist with multi-group channels.
-    createMultiGroupChannel($customPlaylist, $group, ['Sports', 'News']);
+    unitCreateMultiGroupChannel($customPlaylist, $group, ['Sports', 'News']);
 
     // Make the Xtream API request for live streams.
     $queryParams = http_build_query([
@@ -223,7 +223,7 @@ it('playlist alias of custom playlist uses custom group names', function () {
     $customPlaylist = CustomPlaylist::factory()->for($user)->create();
 
     // Create a channel with multiple custom group tags.
-    createMultiGroupChannel($customPlaylist, $group, ['Sports', 'News']);
+    unitCreateMultiGroupChannel($customPlaylist, $group, ['Sports', 'News']);
 
     // Create an alias of the custom playlist.
     $aliasUuid = \Illuminate\Support\Str::uuid()->toString();

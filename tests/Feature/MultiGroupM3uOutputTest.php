@@ -21,7 +21,7 @@ beforeEach(function () {
 // Helpers — raw DB, bypass Spatie Tags entirely
 // ---------------------------------------------------------------------------
 
-function createTagWithOrder(CustomPlaylist $playlist, string $name, int $orderColumn): int
+function outputCreateTagWithOrder(CustomPlaylist $playlist, string $name, int $orderColumn): int
 {
     return \DB::table('tags')->insertGetId([
         'name' => json_encode(['en' => $name]),
@@ -33,7 +33,7 @@ function createTagWithOrder(CustomPlaylist $playlist, string $name, int $orderCo
     ]);
 }
 
-function createMultiGroupChannel(CustomPlaylist $playlist, Group $group, array $tagNames): Channel
+function outputCreateMultiGroupChannel(CustomPlaylist $playlist, Group $group, array $tagNames): Channel
 {
     // 1. Create channel via factory.
     $channel = Channel::factory()->for($playlist)->for($group)->create([
@@ -53,7 +53,7 @@ function createMultiGroupChannel(CustomPlaylist $playlist, Group $group, array $
 
     // 4-5. Create tags and pivot records via raw DB.
     foreach ($tagNames as $i => $name) {
-        $tagId = createTagWithOrder($playlist, $name, $i + 1);
+        $tagId = outputCreateTagWithOrder($playlist, $name, $i + 1);
 
         // Attach to Channel
         \DB::table('taggables')->insert([
@@ -76,7 +76,7 @@ function createMultiGroupChannel(CustomPlaylist $playlist, Group $group, array $
     return $channel;
 }
 
-function createSingleGroupChannel(CustomPlaylist $playlist, Group $group): Channel
+function outputCreateSingleGroupChannel(CustomPlaylist $playlist, Group $group): Channel
 {
     $channel = Channel::factory()->for($playlist)->for($group)->create([
         'enabled' => true,
@@ -91,7 +91,7 @@ function createSingleGroupChannel(CustomPlaylist $playlist, Group $group): Chann
         ->where('taggable_id', $channel->id)
         ->delete();
 
-    $tagId = createTagWithOrder($playlist, 'Sports', 1);
+    $tagId = outputCreateTagWithOrder($playlist, 'Sports', 1);
 
     // Attach to Channel
     \DB::table('taggables')->insert([
@@ -112,7 +112,7 @@ function createSingleGroupChannel(CustomPlaylist $playlist, Group $group): Chann
     return $channel;
 }
 
-function createNoTagChannel(CustomPlaylist $playlist, Group $group): Channel
+function outputCreateNoTagChannel(CustomPlaylist $playlist, Group $group): Channel
 {
     $channel = Channel::factory()->for($playlist)->for($group)->create([
         'enabled' => true,
@@ -138,13 +138,13 @@ it('M3U output with multi-group channels', function () {
     $customPlaylist = CustomPlaylist::factory()->for($user)->create();
 
     // Add a multi-group channel (3 tags).
-    createMultiGroupChannel($customPlaylist, $groupA, ['Sports', 'News', 'Music']);
+    outputCreateMultiGroupChannel($customPlaylist, $groupA, ['Sports', 'News', 'Music']);
 
     // Add a single-group channel.
-    createSingleGroupChannel($customPlaylist, $groupB);
+    outputCreateSingleGroupChannel($customPlaylist, $groupB);
 
     // Add a no-tag channel (should fall back to source group).
-    createNoTagChannel($customPlaylist, $groupA);
+    outputCreateNoTagChannel($customPlaylist, $groupA);
 
     $response = $this->get("/{$customPlaylist->uuid}/playlist.m3u");
     $response->assertStatus(200);
@@ -182,7 +182,7 @@ it('M3U output ordering respects tag order column', function () {
     $customPlaylist = CustomPlaylist::factory()->for($user)->create();
 
     // Create a multi-group channel with tags ordered News(1) → Sports(2) → Music(3).
-    createMultiGroupChannel($customPlaylist, $groupA, ['News', 'Sports', 'Music']);
+    outputCreateMultiGroupChannel($customPlaylist, $groupA, ['News', 'Sports', 'Music']);
 
     $response = $this->get("/{$customPlaylist->uuid}/playlist.m3u");
     $response->assertStatus(200);
@@ -223,7 +223,7 @@ it('M3U output channel number per group', function () {
     $customPlaylist = CustomPlaylist::factory()->for($user)->create();
 
     // Create a multi-group channel.
-    createMultiGroupChannel($customPlaylist, $groupA, ['Sports', 'News']);
+    outputCreateMultiGroupChannel($customPlaylist, $groupA, ['Sports', 'News']);
 
     // Manually set channel_number on the pivot (simulating auto-increment).
     $channel = Channel::where('title', 'Multi-Group Test Channel')->first();
@@ -273,13 +273,13 @@ it('Xtream mixed playlist with multi-group, single-tag, and no-tag channels', fu
     $playlistAuth->assignTo($customPlaylist);
 
     // 1. Multi-group channel (3 tags).
-    createMultiGroupChannel($customPlaylist, $groupA, ['Sports', 'News', 'Music']);
+    outputCreateMultiGroupChannel($customPlaylist, $groupA, ['Sports', 'News', 'Music']);
 
     // 2. Single-tag channel.
-    createSingleGroupChannel($customPlaylist, $groupA);
+    outputCreateSingleGroupChannel($customPlaylist, $groupA);
 
     // 3. No-tag channel (falls back to source group).
-    createNoTagChannel($customPlaylist, $groupA);
+    outputCreateNoTagChannel($customPlaylist, $groupA);
 
     // Make the Xtream API request for live streams.
     $queryParams = http_build_query([
@@ -340,7 +340,7 @@ it('Xtream get live categories includes all groups', function () {
     $playlistAuth->assignTo($customPlaylist);
 
     // Create a multi-group channel (3 tags).
-    createMultiGroupChannel($customPlaylist, $groupA, ['Sports', 'News', 'Music']);
+    outputCreateMultiGroupChannel($customPlaylist, $groupA, ['Sports', 'News', 'Music']);
 
     // Make the Xtream API request for live categories.
     $queryParams = http_build_query([
@@ -397,7 +397,7 @@ it('Removing one tag preserves other group entries in M3U', function () {
     $customPlaylist = CustomPlaylist::factory()->for($user)->create();
 
     // Create a channel with 3 tags.
-    createMultiGroupChannel($customPlaylist, $groupA, ['Sports', 'News', 'Music']);
+    outputCreateMultiGroupChannel($customPlaylist, $groupA, ['Sports', 'News', 'Music']);
 
     // Verify all 3 group-titles are present before deletion.
     $responseBefore = $this->get("/{$customPlaylist->uuid}/playlist.m3u");
