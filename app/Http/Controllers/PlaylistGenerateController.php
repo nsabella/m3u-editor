@@ -846,8 +846,8 @@ class PlaylistGenerateController extends Controller
     private function emitChannelOutput(
         Playlist|MergedPlaylist|CustomPlaylist|PlaylistAlias $playlist,
         Channel $channel,
-        string $title,
-        string $name,
+        ?string $title = '',
+        ?string $name = '',
         string $url,
         string $group,
         int|string $channelNo,
@@ -863,6 +863,10 @@ class PlaylistGenerateController extends Controller
         string $username,
         string $password,
     ): void {
+        // Handle null title/name from channels with no title_custom or title set.
+        $title ??= '';
+        $name ??= '';
+
         // Normalize the group: empty groups become 'Uncategorized'.
         if (empty($group)) {
             $group = 'Uncategorized';

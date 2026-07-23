@@ -82,7 +82,7 @@ class AddGroupsToCustomPlaylist implements ShouldQueue
             }
 
             // Chunk through the group's items to avoid memory exhaustion on large groups
-            $group->$relation()->chunkById(1000, function ($items) use ($playlist, $syncRelation, $playlistTags, $tag): void {
+            $group->$relation()->chunkById(1000, function ($items) use ($mode, $playlist, $syncRelation, $playlistTags, $tag): void {
                 $ids = $items->pluck('id')->all();
                 $playlist->$syncRelation()->syncWithoutDetaching($ids);
 

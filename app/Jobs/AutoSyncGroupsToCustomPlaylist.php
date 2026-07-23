@@ -102,7 +102,7 @@ class AutoSyncGroupsToCustomPlaylist implements ShouldQueue
             // Use insertOrIgnore instead of syncWithoutDetaching so we never load the
             // entire pivot table into PHP memory on each iteration, and existing pivot
             // values (channel_number, sort) are preserved by the conflict-ignore path.
-            $group->$syncRelation()->chunkById(1000, function ($items) use ($pivotTable, $pivotForeignKey, $pivotRelatedKey, $playlistTags, $tag): void {
+            $group->$syncRelation()->chunkById(1000, function ($items) use ($mode, $pivotTable, $pivotForeignKey, $pivotRelatedKey, $playlistTags, $tag): void {
                 DB::table($pivotTable)->insertOrIgnore(
                     $items->map(fn ($item): array => [
                         $pivotForeignKey => $this->customPlaylistId,
