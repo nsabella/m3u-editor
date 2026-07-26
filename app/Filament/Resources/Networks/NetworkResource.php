@@ -16,6 +16,7 @@ use App\Models\Playlist;
 use App\Services\LogoCacheService;
 use App\Services\NetworkBroadcastService;
 use App\Services\NetworkScheduleService;
+use App\Support\Iso639Languages;
 use App\Traits\HasUserFiltering;
 use Carbon\Carbon;
 use EslamRedaDiv\FilamentCopilot\Contracts\CopilotResource;
@@ -808,6 +809,28 @@ class NetworkResource extends Resource implements CopilotResource
                                             ->placeholder(__('veryfast'))
                                             ->nullable(),
                                     ])->visible(fn (Get $get): bool => $get('transcode_mode') === TranscodeMode::Local->value),
+
+                                    Grid::make(2)->schema([
+                                        Select::make('preferred_audio_track')
+                                            ->label(__('Preferred Audio Language'))
+                                            ->helperText(__(
+                                                'The preferred audio language for this broadcast. Applies to every item in the schedule.'
+                                            ))
+                                            ->options(Iso639Languages::options())
+                                            ->searchable()
+                                            ->placeholder(__('None (default track)'))
+                                            ->nullable(),
+
+                                        Select::make('preferred_subtitle_track')
+                                            ->label(__('Preferred Subtitle Language'))
+                                            ->helperText(__(
+                                                'Enables subtitles in this language for the broadcast. Leaving this empty disables subtitles.'
+                                            ))
+                                            ->options(Iso639Languages::options())
+                                            ->searchable()
+                                            ->placeholder(__('None (subtitles disabled)'))
+                                            ->nullable(),
+                                    ]),
 
                                     Select::make('hwaccel')
                                         ->label(__('Hardware Acceleration'))

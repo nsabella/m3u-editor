@@ -2,9 +2,12 @@
 
 namespace App\Listeners;
 
+use App\Notifications\TelegramAlert;
 use App\Services\AlertService;
 use App\Settings\GeneralSettings;
 use Illuminate\Queue\Events\JobFailed;
+use Spatie\DiscordAlerts\Jobs\SendToDiscordChannelJob;
+use Spatie\SlackAlerts\Jobs\SendToSlackChannelJob;
 
 class AlertOnJobFailed
 {
@@ -24,6 +27,16 @@ class AlertOnJobFailed
         }
 
         $jobName = $event->job->resolveName();
+
+        // A failed alert delivery must never generate another alert,
+        // otherwise a misconfigured channel would loop forever.
+        if (str_contains($jobName, TelegramAlert::class)
+            || str_contains($jobName, SendToDiscordChannelJob::class)
+            || str_contains($jobName, SendToSlackChannelJob::class)
+        ) {
+            return;
+        }
+
         $exception = $event->exception;
 
         $context = [

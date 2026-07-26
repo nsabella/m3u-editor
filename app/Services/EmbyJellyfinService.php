@@ -27,6 +27,16 @@ class EmbyJellyfinService implements MediaServer
     protected string $apiKey;
 
     /**
+     * Cache of stream byte-size lookups, keyed by itemId:baseUrl. Static because
+     * the same item may be looked up repeatedly across the lifetime of a long-running
+     * broadcast worker tick — a per-instance cache would re-fetch on every new
+     * MediaServerService::make() call.
+     *
+     * @var array<string, array{bytes: int, runtime_ticks: int|null, runtime_seconds: float|null}>
+     */
+    protected static array $streamByteSizeCache = [];
+
+    /**
      * Create a new EmbyJellyfinService instance.
      */
     public function __construct(MediaServerIntegration $integration)
@@ -415,6 +425,49 @@ class EmbyJellyfinService implements MediaServer
     }
 
     /**
+     * Resolve an Emby/Jellyfin audio or subtitle stream index from a user preference.
+     *
+     * @param  array<string, mixed>  $mediaSources
+     */
+    protected function resolvePreferredStreamIndex(array $mediaSources, string $type, string $preference): ?int
+    {
+        $preference = trim($preference);
+
+        if ($preference === '') {
+            return null;
+        }
+
+        if (is_numeric($preference)) {
+            return (int) $preference;
+        }
+
+        $normalizedPreference = strtolower($preference);
+        $streams = $mediaSources[0]['MediaStreams'] ?? [];
+
+        $typed = array_filter($streams, fn ($s) => strtolower((string) ($s['Type'] ?? '')) === strtolower($type));
+
+        // First pass: exact match
+        foreach ($typed as $stream) {
+            foreach (['Language', 'DisplayLanguage', 'Title', 'DisplayTitle'] as $key) {
+                if (strtolower((string) ($stream[$key] ?? '')) === $normalizedPreference) {
+                    return isset($stream['Index']) ? (int) $stream['Index'] : null;
+                }
+            }
+        }
+
+        // Second pass: substring fallback
+        foreach ($typed as $stream) {
+            foreach (['Language', 'DisplayLanguage', 'Title', 'DisplayTitle'] as $key) {
+                if (str_contains(strtolower((string) ($stream[$key] ?? '')), $normalizedPreference)) {
+                    return isset($stream['Index']) ? (int) $stream['Index'] : null;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
      * Get the direct stream URL for an item (internal use only - contains API key).
      *
      * @param  string  $itemId  The media server's item ID
@@ -437,16 +490,76 @@ class EmbyJellyfinService implements MediaServer
             'session_id' => true,
         ]);
 
-        if (empty($effectiveTranscodeOptions)) {
-            $params['static'] = 'true';
+        // When an AudioStreamIndex is active we cannot use static=true — the server
+        // ignores AudioStreamIndex on a raw-file pass-through. Instead use VideoCodec=copy
+        // so the server remuxes with the selected audio track while leaving the video
+        // bitstream untouched (no video transcoding overhead).
+        //
+        // This must account for PreferredAudioTrack resolving to an index below, not just
+        // a literal AudioStreamIndex on the incoming request — the network broadcast flow
+        // only ever sends PreferredAudioTrack, so checking the raw request alone left this
+        // permanently false and silently defeated audio-track selection.
+        $audioStreamIndexRequested = $request->has('AudioStreamIndex');
+
+        // Resolve preferred track preferences to concrete stream indexes
+        $hasTrackPreference = $request->has('PreferredAudioTrack') || $request->has('PreferredSubtitleTrack');
+        if ($hasTrackPreference) {
+            try {
+                $response = $this->client()->get("/Items/{$itemId}", ['Fields' => 'MediaSources']);
+
+                if ($response->successful()) {
+                    $mediaSources = $response->json('MediaSources') ?? [];
+
+                    if ($request->has('PreferredAudioTrack')) {
+                        $index = $this->resolvePreferredStreamIndex(
+                            $mediaSources,
+                            'Audio',
+                            (string) $request->input('PreferredAudioTrack')
+                        );
+
+                        if ($index !== null) {
+                            $params['AudioStreamIndex'] = $index;
+                            $audioStreamIndexRequested = true;
+                        }
+                    }
+
+                    if ($request->has('PreferredSubtitleTrack')) {
+                        $index = $this->resolvePreferredStreamIndex(
+                            $mediaSources,
+                            'Subtitle',
+                            (string) $request->input('PreferredSubtitleTrack')
+                        );
+
+                        if ($index !== null) {
+                            $params['SubtitleStreamIndex'] = $index;
+                        }
+                    }
+                }
+            } catch (Exception $e) {
+                Log::warning('EmbyJellyfinService: failed to resolve preferred track', [
+                    'item_id' => $itemId,
+                    'error' => $e->getMessage(),
+                ]);
+            }
         }
 
-        // Forward relevant parameters from the incoming request
+        // Forward relevant parameters from the incoming request (explicit indexes take precedence)
         $forwardParams = ['StartTimeTicks', 'AudioStreamIndex', 'SubtitleStreamIndex'];
         foreach ($forwardParams as $param) {
             if ($request->has($param)) {
                 $params[$param] = $request->input($param);
             }
+        }
+
+        if (empty($effectiveTranscodeOptions) && ! $audioStreamIndexRequested) {
+            $params['static'] = 'true';
+        }
+
+        // Copy video stream when audio selection is active without a full Server transcode.
+        // This avoids re-encoding the video while still letting Emby/Jellyfin pick the
+        // right audio track.
+        if ($audioStreamIndexRequested && empty($effectiveTranscodeOptions)) {
+            $params['VideoCodec'] = 'copy';
         }
 
         // Include transcode options (VideoBitrate, AudioBitrate, MaxWidth, MaxHeight) if requested
@@ -607,6 +720,302 @@ class EmbyJellyfinService implements MediaServer
                 'success' => false,
                 'message' => 'Failed to trigger refresh: '.$e->getMessage(),
             ];
+        }
+    }
+
+    /**
+     * Fetch an item's MediaStreams, retrying briefly on an empty/incomplete result.
+     *
+     * Emby/Jellyfin's /Items endpoint has been observed to momentarily return a
+     * successful response with no MediaStreams for a perfectly valid item —
+     * apparently under concurrent API load (e.g. while the same server is also
+     * serving a live transcode). Http::retry() on the client only covers
+     * connection failures and 4xx/5xx responses; it does nothing for a "200 OK
+     * but empty" response, which is what this guards against. This matters
+     * most for the proxy auto-transition path, where subtitle/audio-language
+     * resolution for the next programme runs exactly once, far ahead of when
+     * it's used — a single silent miss here loses subtitles/audio-language for
+     * an entire programme with nothing to catch it.
+     *
+     * Returns null (and logs a warning) if no usable item could be fetched.
+     */
+    protected function fetchItemWithMediaStreams(string $itemId, int $attempts = 3): ?array
+    {
+        for ($attempt = 1; $attempt <= $attempts; $attempt++) {
+            // Emby/Jellyfin requires /Items?Ids={id} — the /Items/{id} form 404s on some versions.
+            $response = $this->client()->get('/Items', [
+                'Ids' => $itemId,
+                // RunTimeTicks lets getStreamByteSize() return runtime alongside the byte
+                // size in a single backend round-trip. Other callers (subtitles, audio
+                // stream lookup) ignore this field.
+                'fields' => 'MediaStreams,RunTimeTicks',
+            ]);
+
+            if ($response->successful()) {
+                $item = ($response->json('Items') ?? [])[0] ?? null;
+
+                if ($item && ! empty($item['MediaStreams'])) {
+                    return $item;
+                }
+            }
+
+            if ($attempt < $attempts) {
+                usleep(300_000);
+            }
+        }
+
+        Log::warning('EmbyJellyfinService: /Items returned no usable MediaStreams after retries', [
+            'item_id' => $itemId,
+            'attempts' => $attempts,
+        ]);
+
+        return null;
+    }
+
+    /**
+     * Return the first available text-based subtitle stream for the item, or null if none
+     * exists. Covers both embedded and external (sidecar file) subtitle streams — this is
+     * Emby/Jellyfin's own metadata, which knows about external subtitles that a raw ffprobe
+     * of the video file itself can never see.
+     *
+     * When $seekSeconds > 0 the URL is built with a startPositionTicks path segment
+     * (/Subtitles/{index}/{ticks}/Stream.{format}) so Emby/Jellyfin rebases the cue timestamps
+     * to zero at that content-time. This mirrors the video stream's own StartTimeTicks seek so
+     * both share a single timeline origin — the subtitle then needs no further seeking in the
+     * proxy (server_seeked = true), which is what keeps subtitles locked to the video on a
+     * resumed/mid-programme broadcast.
+     *
+     * @return array{url: string, language: ?string, server_seeked: bool}|null
+     */
+    public function getSubtitleUrl(string $itemId, int $seekSeconds = 0, ?string $preferredLanguage = null): ?array
+    {
+        try {
+            $item = $this->fetchItemWithMediaStreams($itemId);
+
+            if (! $item) {
+                return null;
+            }
+
+            $mediaSourceId = $item['MediaSources'][0]['Id'] ?? null;
+
+            if (! $mediaSourceId) {
+                Log::warning('EmbyJellyfinService: item has MediaStreams but no MediaSources, cannot build subtitle URL', [
+                    'item_id' => $itemId,
+                ]);
+
+                return null;
+            }
+
+            $streams = $item['MediaStreams'] ?? [];
+
+            // Bitmap subtitle formats (PGS, VobSub) can't be converted to WebVTT —
+            // ffmpeg's webvtt encoder only supports text-to-text conversion.
+            $textStreams = array_values(array_filter(
+                $streams,
+                fn (array $s): bool => ($s['Type'] ?? '') === 'Subtitle' && ($s['IsTextSubtitleStream'] ?? false)
+            ));
+
+            // A per-item override resolves (see NetworkBroadcastService::resolveTrackPreference)
+            // to a numeric type-relative position — the same "Nth embedded subtitle stream,
+            // counting bitmap ones too" position getAvailableTracks() reports — not a language
+            // code, even though this parameter carries the network-level default's language when
+            // no per-item override exists. Resolve that position the same way getAvailableTracks()
+            // does before falling back to language matching, otherwise a numeric position like
+            // "1" never matches any Language field and silently falls through to the first
+            // stream regardless of what was actually picked.
+            $stream = null;
+            if ($preferredLanguage !== null && trim($preferredLanguage) !== '' && ctype_digit(trim($preferredLanguage))) {
+                $targetPosition = (int) trim($preferredLanguage);
+                $position = 0;
+                foreach ($streams as $candidate) {
+                    if (($candidate['Type'] ?? '') !== 'Subtitle' || ($candidate['IsExternal'] ?? false)) {
+                        continue;
+                    }
+                    if ($position === $targetPosition && ($candidate['IsTextSubtitleStream'] ?? false)) {
+                        $stream = $candidate;
+                        break;
+                    }
+                    $position++;
+                }
+            }
+
+            // Prefer the stream matching the requested language; fall back to the first
+            // text stream when nothing matches (or no preference was given) so subtitles
+            // are still offered instead of silently disabled.
+            if ($stream === null && $preferredLanguage !== null && trim($preferredLanguage) !== '') {
+                $normalized = strtolower(trim($preferredLanguage));
+                foreach ($textStreams as $candidate) {
+                    if (strtolower((string) ($candidate['Language'] ?? '')) === $normalized) {
+                        $stream = $candidate;
+                        break;
+                    }
+                }
+            }
+            $stream ??= $textStreams[0] ?? null;
+
+            if ($stream) {
+                $index = $stream['Index'];
+                $format = $stream['Codec'] ?? 'srt';
+
+                // Insert the startPositionTicks path segment so Emby/Jellyfin rebases the
+                // subtitle cues to zero at the seek point, exactly like StartTimeTicks does
+                // for the video. Ticks are 100-nanosecond intervals.
+                $seekPath = $seekSeconds > 0 ? ($seekSeconds * 10_000_000).'/' : '';
+
+                return [
+                    'url' => "{$this->baseUrl}/Videos/{$itemId}/{$mediaSourceId}/Subtitles/{$index}/{$seekPath}Stream.{$format}?api_key={$this->apiKey}",
+                    'language' => $stream['Language'] ?? null,
+                    'server_seeked' => $seekSeconds > 0,
+                ];
+            }
+        } catch (Exception $e) {
+            Log::warning('EmbyJellyfinService: Failed to look up subtitle URL', [
+                'item_id' => $itemId,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        return null;
+    }
+
+    /**
+     * @return array{
+     *     audio: list<array{index: int, label: string, language: ?string}>,
+     *     subtitle: list<array{index: int, label: string, language: ?string}>,
+     * }
+     */
+    public function getAvailableTracks(string $itemId): array
+    {
+        $empty = ['audio' => [], 'subtitle' => []];
+
+        try {
+            $item = $this->fetchItemWithMediaStreams($itemId);
+
+            if (! $item) {
+                return $empty;
+            }
+
+            $streams = $item['MediaStreams'] ?? [];
+            $tracks = ['audio' => [], 'subtitle' => []];
+            // Tracks the type-relative position FFmpeg itself would assign via
+            // `0:a:N`/`0:s:N` — incremented for every embedded stream of that type,
+            // including ones we don't offer as a pick (e.g. a bitmap subtitle). FFmpeg
+            // addresses raw container stream slots regardless of codec, so a bitmap
+            // stream sitting between two text subtitle streams still occupies a slot;
+            // skipping it from this counter (as an earlier version did) desynced every
+            // later text stream's stored position from what FFmpeg actually sees,
+            // silently selecting the wrong subtitle track.
+            $positionByType = ['audio' => 0, 'subtitle' => 0];
+
+            foreach ($streams as $stream) {
+                $type = strtolower((string) ($stream['Type'] ?? ''));
+                if ($type !== 'audio' && $type !== 'subtitle') {
+                    continue;
+                }
+
+                // External streams (a sidecar subtitle/audio file sitting next to the
+                // video, not muxed into it) can never be reached via FFmpeg's
+                // `-map 0:s:{N}?`/`-map 0:a:{N}?` type-relative addressing when opening
+                // the raw file directly — that only sees streams actually embedded in
+                // the container, so these never occupy one of its position slots either.
+                if ($stream['IsExternal'] ?? false) {
+                    continue;
+                }
+
+                $position = $positionByType[$type]++;
+
+                // Bitmap subtitle formats (PGS/VobSub — common on Blu-ray rips) can't
+                // be converted to WebVTT, FFmpeg's default HLS subtitle codec (text-to-text
+                // or bitmap-to-bitmap only). Mapping one for Direct/Local's embedded
+                // subtitle output crashes FFmpeg outright ("Subtitle encoding currently
+                // only possible from text to text or bitmap to bitmap") rather than
+                // degrading gracefully — confirmed against a real broadcast. Same
+                // IsTextSubtitleStream check getSubtitleUrl() already uses. Excluded from
+                // the offered list (after claiming its position slot above), not from
+                // the counting itself.
+                if ($type === 'subtitle' && ! ($stream['IsTextSubtitleStream'] ?? false)) {
+                    continue;
+                }
+
+                $language = $stream['Language'] ?? null;
+                $label = $stream['DisplayTitle'] ?? $stream['Title'] ?? ($language ?? 'Unknown');
+
+                $tracks[$type][] = [
+                    'index' => "{$position}:{$stream['Index']}",
+                    'label' => $label,
+                    'language' => $language,
+                ];
+            }
+
+            return $tracks;
+        } catch (Exception $e) {
+            Log::warning('EmbyJellyfinService: Failed to list available tracks', [
+                'item_id' => $itemId,
+                'error' => $e->getMessage(),
+            ]);
+
+            return $empty;
+        }
+    }
+
+    /**
+     * Return the byte size of the item's static stream and its runtime, or null if
+     * either is unavailable. Cached per item+server — the static stream URL is
+     * content-addressed by item ID, so the size is stable for the lifetime of the item.
+     *
+     * The byte size comes from a HEAD against /Videos/{id}/stream.ts with the same
+     * query string shape getDirectStreamUrl() uses for a static raw pass-through
+     * (static=true, no StartTimeTicks/VideoCodec=copy). The runtime comes from
+     * RunTimeTicks on the item. Together they let callers compute an HTTP Range
+     * offset that aligns ffmpeg's input -ss with the server-side-seeked static URL.
+     */
+    public function getStreamByteSize(string $itemId): ?array
+    {
+        $cacheKey = $itemId.':'.$this->baseUrl;
+        if (isset(self::$streamByteSizeCache[$cacheKey])) {
+            return self::$streamByteSizeCache[$cacheKey];
+        }
+
+        try {
+            $response = Http::baseUrl($this->baseUrl)
+                ->timeout(10)
+                ->withHeaders(['X-Emby-Token' => $this->apiKey])
+                ->head('/Videos/'.$itemId.'/stream.ts', [
+                    'static' => 'true',
+                    'api_key' => $this->apiKey,
+                ]);
+
+            if (! $response->successful()) {
+                return null;
+            }
+
+            $bytes = $response->header('Content-Length');
+            if ($bytes === null || $bytes === '' || ! is_numeric($bytes)) {
+                return null;
+            }
+
+            $bytes = (int) $bytes;
+
+            $item = $this->fetchItemWithMediaStreams($itemId);
+            $runtimeTicks = isset($item['RunTimeTicks']) ? (int) $item['RunTimeTicks'] : null;
+            $runtimeSeconds = $runtimeTicks !== null ? $runtimeTicks / 10_000_000.0 : null;
+
+            $meta = [
+                'bytes' => $bytes,
+                'runtime_ticks' => $runtimeTicks,
+                'runtime_seconds' => $runtimeSeconds,
+            ];
+
+            self::$streamByteSizeCache[$cacheKey] = $meta;
+
+            return $meta;
+        } catch (Exception $e) {
+            Log::warning('EmbyJellyfinService: Failed to read stream byte size', [
+                'item_id' => $itemId,
+                'error' => $e->getMessage(),
+            ]);
+
+            return null;
         }
     }
 }

@@ -18,7 +18,9 @@ use App\Models\PlaylistAlias;
 use App\Models\PlaylistAuth;
 use App\Models\PlaylistViewer;
 use App\Models\Series;
+use App\Models\StreamProfile;
 use App\Models\ViewerWatchProgress;
+use App\Providers\VersionServiceProvider;
 use App\Services\EpgCacheService;
 use App\Services\LogoCacheService;
 use App\Services\M3uProxyService;
@@ -442,15 +444,16 @@ class XtreamApiController extends Controller
                 $streams = $playlist->streams ?? 1;
                 $activeConnections = 0;
             }
+            // Resolve the PlaylistAuth once — used for the per-auth connection limit
+            // override and for feature advertisement (proxy access).
+            $playlistAuth = $authMethod === 'playlist_auth'
+                ? PlaylistAuth::where('username', $username)->where('password', $password)->first()
+                : null;
+
             // Override max_connections when the request is authenticated via a PlaylistAuth
             // that has a specific per-auth limit configured.
-            if ($authMethod === 'playlist_auth') {
-                $authMaxConnections = PlaylistAuth::where('username', $username)
-                    ->where('password', $password)
-                    ->value('max_connections');
-                if ($authMaxConnections) {
-                    $streams = $authMaxConnections;
-                }
+            if ($playlistAuth?->max_connections) {
+                $streams = $playlistAuth->max_connections;
             }
 
             $outputFormats = ['m3u8', 'ts'];
@@ -479,6 +482,7 @@ class XtreamApiController extends Controller
 
             $settings = app(GeneralSettings::class);
             $message = $settings->xtream_api_message ?? '';
+            $enhancedOutputEnabled = $settings->app_output_enabled ?? false;
 
             $userInfo = [
                 'username' => $username,
@@ -517,14 +521,30 @@ class XtreamApiController extends Controller
                 'process' => true, // Always true
             ];
 
-            return response()->json([
+            $payload = [
                 'user_info' => $userInfo,
                 'server_info' => $serverInfo,
-                'm3u_editor' => [
-                    'version' => config('dev.version'),
-                    'features' => ['viewers', 'progress'],
-                ],
-            ]);
+            ];
+
+            // If enhanced output is enabled, include the m3u_editor payload with version and features
+            // This is required for the M3U TV app to connect via the Xtream API and resolve the features available for the playlist.
+            if ($enhancedOutputEnabled) {
+                $features = $this->resolveM3uEditorFeatures($playlist, $authMethod, $playlistAuth);
+
+                $m3uEditorPayload = [
+                    'version' => VersionServiceProvider::getVersion(),
+                    'features' => $features,
+                ];
+
+                $proxyData = $this->resolveProxyData($playlist, $features, $authMethod, $playlistAuth);
+                if (! empty($proxyData)) {
+                    $m3uEditorPayload['proxy'] = $proxyData;
+                }
+
+                $payload['m3u_editor'] = $m3uEditorPayload;
+            }
+
+            return response()->json($payload);
         } elseif ($action === 'get_live_streams') {
             // Handle network playlists - return networks as live streams
             if ($isNetworkPlaylist) {
@@ -593,7 +613,7 @@ class XtreamApiController extends Controller
                         $logo = $channel->logo ?? $channel->logo_internal ?? '';
                         $streamIcon = filter_var($logo, FILTER_VALIDATE_URL) ? $logo : $baseUrl."/$logo";
                     }
-                    if ($playlist->enable_logo_proxy) {
+                    if ($playlist->enable_logo_proxy && filter_var($streamIcon, FILTER_VALIDATE_URL) && ! str_starts_with($streamIcon, url('/'))) {
                         $streamIcon = LogoProxyController::generateProxyUrl($streamIcon);
                     }
 
@@ -618,9 +638,7 @@ class XtreamApiController extends Controller
                     $channelNo = ($isCustomPlaylist && ! empty($channel->ccp_channel_number))
                         ? (int) $channel->ccp_channel_number
                         : $channel->channel;
-                    if ($playlist->auto_channel_increment) {
-                        $channelNo = ++$channelNumber;
-                    } elseif (! $channelNo && $idChannelBy === PlaylistChannelId::Number) {
+                    if (! $channelNo && ($playlist->auto_channel_increment || $idChannelBy === PlaylistChannelId::Number)) {
                         $channelNo = ++$channelNumber;
                     }
 
@@ -739,6 +757,7 @@ class XtreamApiController extends Controller
 
             return response()->stream(function () use ($cursor, $playlist, $baseUrl, $isCustomPlaylist) {
                 $num = 0;
+                $idChannelBy = $playlist->id_channel_by;
                 $channelNumber = $playlist->auto_channel_increment ? $playlist->channel_start - 1 : 0;
                 echo '[';
                 $first = true;
@@ -758,7 +777,7 @@ class XtreamApiController extends Controller
                         $logo = $channel->logo ?? $channel->logo_internal ?? '';
                         $streamIcon = filter_var($logo, FILTER_VALIDATE_URL) ? $logo : $baseUrl."/$logo";
                     }
-                    if ($playlist->enable_logo_proxy) {
+                    if ($playlist->enable_logo_proxy && filter_var($streamIcon, FILTER_VALIDATE_URL) && ! str_starts_with($streamIcon, url('/'))) {
                         $streamIcon = LogoProxyController::generateProxyUrl($streamIcon);
                     }
 
@@ -781,8 +800,8 @@ class XtreamApiController extends Controller
 
                     $vodChannelNo = ($isCustomPlaylist && ! empty($channel->ccp_channel_number))
                         ? (int) $channel->ccp_channel_number
-                        : ($channel->channel ?: $num);
-                    if ($playlist->auto_channel_increment) {
+                        : $channel->channel;
+                    if (! $vodChannelNo && ($playlist->auto_channel_increment || $idChannelBy === PlaylistChannelId::Number)) {
                         $vodChannelNo = ++$channelNumber;
                     }
 
@@ -2626,5 +2645,88 @@ class XtreamApiController extends Controller
         $password = $request->input('password');
 
         return PlaylistFacade::authenticate($username, $password);
+    }
+
+    /**
+     * Resolve optional m3u-editor capabilities advertised to compatible clients.
+     *
+     * The proxy feature is advertised when the playlist owner may use the proxy
+     * and, for PlaylistAuth credentials, the individual auth has proxy access
+     * enabled. Owner/alias credentials act with the owner's own permission.
+     *
+     * @return array<int, string>
+     */
+    private function resolveM3uEditorFeatures($playlist, string $authMethod, ?PlaylistAuth $playlistAuth): array
+    {
+        $features = ['viewers', 'progress'];
+
+        if ($this->canAdvertiseProxyFeature($playlist, $authMethod, $playlistAuth)) {
+            $features[] = 'proxy';
+        }
+
+        return $features;
+    }
+
+    private function canAdvertiseProxyFeature($playlist, string $authMethod, ?PlaylistAuth $playlistAuth): bool
+    {
+        if (! $playlist->user?->canUseProxy()) {
+            return false;
+        }
+
+        if ($authMethod === 'playlist_auth') {
+            return (bool) $playlistAuth?->proxy_enabled;
+        }
+
+        return true;
+    }
+
+    /**
+     * Build the proxy payload for the auth response: whether the proxy is forced
+     * at the playlist level, and the transcoding profiles the authenticated user
+     * may apply to proxied streams. Profile ffmpeg args are intentionally never
+     * exposed to clients.
+     *
+     * When 'forced' is true the playlist already routes every stream through the
+     * proxy, so clients should present the proxy as locked on — profile selection
+     * still applies.
+     *
+     * @return array{forced: bool, profiles: array<int, array{id: int, name: string, description: string|null, format: string|null}>}|array{}
+     */
+    private function resolveProxyData($playlist, array $features, string $authMethod, ?PlaylistAuth $playlistAuth): array
+    {
+        if (! in_array('proxy', $features)) {
+            return [];
+        }
+
+        $forced = (bool) ($playlist->enable_proxy ?? false);
+
+        $query = StreamProfile::where('user_id', $playlist->user_id)->orderBy('name');
+
+        if ($authMethod === 'playlist_auth') {
+            $access = $playlistAuth->proxy_profile_access ?? 'all';
+            if ($access === 'none') {
+                return ['forced' => $forced, 'profiles' => []];
+            }
+            if ($access === 'selected') {
+                $allowedIds = array_map('intval', $playlistAuth->proxy_stream_profile_ids ?? []);
+                if (empty($allowedIds)) {
+                    return ['forced' => $forced, 'profiles' => []];
+                }
+                $query->whereIn('id', $allowedIds);
+            }
+        }
+
+        return [
+            'forced' => $forced,
+            'profiles' => $query->get(['id', 'name', 'description', 'format'])
+                ->map(fn (StreamProfile $profile) => [
+                    'id' => $profile->id,
+                    'name' => $profile->name,
+                    'description' => $profile->description,
+                    'format' => $profile->format,
+                ])
+                ->values()
+                ->all(),
+        ];
     }
 }

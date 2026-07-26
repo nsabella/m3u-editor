@@ -3,6 +3,7 @@
 namespace App\Filament\Resources\PlaylistAliases;
 
 use App\Facades\PlaylistFacade;
+use App\Filament\Actions\GeneratePasswordAction;
 use App\Filament\Concerns\HasCopilotSupport;
 use App\Filament\Resources\CustomPlaylists\CustomPlaylistResource;
 use App\Filament\Resources\Playlists\PlaylistResource;
@@ -372,6 +373,11 @@ class PlaylistAliasResource extends Resource implements CopilotResource
             Schemas\Components\Fieldset::make(__('Provider Credentials'))
                 ->columnSpanFull()
                 ->schema([
+                    Forms\Components\Toggle::make('inherit_dns_failover')
+                        ->label(__('Inherit DNS failover from source playlist'))
+                        ->helperText(__('When enabled, if the source playlist fails over to a new URL, this alias will automatically follow the new URL while keeping its own credentials.'))
+                        ->default(true)
+                        ->columnSpanFull(),
                     Forms\Components\Repeater::make('xtream_config')
                         ->label(__('Credentials'))
                         ->helperText(__('Provider credentials to use for this alias. At least one set of credentials is required.'))
@@ -485,9 +491,8 @@ class PlaylistAliasResource extends Resource implements CopilotResource
                         ])->columnSpanFull(),
                 ]),
 
-            Schemas\Components\Fieldset::make(__('Proxy Options'))
+            Schemas\Components\Fieldset::make(__('Streaming Output'))
                 ->columns(2)
-                ->hidden(fn () => ! auth()->user()->canUseProxy())
                 ->schema([
                     Forms\Components\Toggle::make('enable_proxy')
                         ->label(__('Enable Stream Proxy'))
@@ -496,7 +501,8 @@ class PlaylistAliasResource extends Resource implements CopilotResource
                         ->live()
                         ->helperText(__('When enabled, all streams will be proxied through the application. This allows for better compatibility with various clients and enables features such as stream limiting and output format selection.'))
                         ->inline(false)
-                        ->default(false),
+                        ->default(false)
+                        ->hidden(fn () => ! auth()->user()->canUseProxy()),
                     Forms\Components\Toggle::make('enable_logo_proxy')
                         ->label(__('Enable Logo Proxy'))
                         ->hint(fn (Get $get): string => $get('enable_logo_proxy') ? 'Proxied' : 'Not proxied')
@@ -504,7 +510,8 @@ class PlaylistAliasResource extends Resource implements CopilotResource
                         ->live()
                         ->helperText(__('When enabled, channel logos will be proxied through the application. Logos will be cached for up to 30 days to reduce bandwidth and speed up loading times.'))
                         ->inline(false)
-                        ->default(false),
+                        ->default(false)
+                        ->hidden(fn () => ! auth()->user()->canUseProxy()),
                     Forms\Components\TextInput::make('streams')
                         ->label(__('HDHR/Xtream API Streams'))
                         ->helperText(__('Number of streams available for HDHR and Xtream API service (if using).'))
@@ -658,7 +665,8 @@ class PlaylistAliasResource extends Resource implements CopilotResource
                         ->label(__('Password'))
                         ->columnSpan(1)
                         ->password()
-                        ->revealable(),
+                        ->revealable()
+                        ->suffixAction(GeneratePasswordAction::make()),
                     Forms\Components\DateTimePicker::make('expires_at')
                         ->label(__('Expiration (date & time)'))
                         ->seconds(false)

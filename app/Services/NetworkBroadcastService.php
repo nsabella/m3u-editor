@@ -5,9 +5,11 @@ namespace App\Services;
 use App\Enums\TranscodeMode;
 use App\Models\MediaServerIntegration;
 use App\Models\Network;
+use App\Models\NetworkContent;
 use App\Models\NetworkProgramme;
 use Carbon\Carbon;
 use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 
@@ -303,12 +305,113 @@ class NetworkBroadcastService
         // Get the callback URL
         $callbackUrl = $this->getProxyService()->getBroadcastCallbackUrl();
 
-        // Only trust URL-based seeking when using server-side transcoding (TranscodeMode::Server).
-        // For direct streams (static=true), media servers like Emby/Jellyfin ignore StartTimeTicks,
-        // so FFmpeg must always handle seeking via -ss. Double-seeking is only a risk when the
-        // server is actively transcoding and applying the seek itself.
+        // Seek-coordination rules (verified against a live Emby at 192.168.1.42:18096):
+        //  - Static URL (static=true, no VideoCodec=copy): Emby IGNORES StartTimeTicks/offset
+        //    server-side (returns identical bytes with or without the flag — verified by md5).
+        //    The static endpoint DOES support byte-range requests (Accept-Ranges: bytes,
+        //    206 Partial Content), so ffmpeg can seek it via input -ss (byte-range).
+        //    ffmpeg must always seek. seek_seconds = $seekPosition.
+        //  - Server transcode URL (TranscodeMode::Server): Emby honors StartTimeTicks
+        //    server-side (this is what the transcode session was built for). ffmpeg must NOT
+        //    also seek. seek_seconds = 0.
+        //  - Remux URL (VideoCodec=copy with StartTimeTicks): Emby SILENTLY IGNORES
+        //    StartTimeTicks on this endpoint (returns the full file from byte 0 with
+        //    Accept-Ranges: none and unknown duration — verified by direct probe). ffmpeg
+        //    also can't seek it because the remux has no Range support and no duration.
+        //    The naive contract (send seek_seconds = 0 and trust the server) silently plays
+        //    from content-time 0 instead of the requested seek offset.
+        //
+        //    Remediation: when a seek is required on a remux URL, rewrite the URL to the
+        //    seek-capable static endpoint by stripping VideoCodec=copy AND StartTimeTicks/offset
+        //    (Emby ignores both on static anyway). The static endpoint supports byte-range
+        //    requests so ffmpeg can seek it via input -ss. The static endpoint also preserves
+        //    all original streams, so the resolved absolute MediaStreams audio index maps
+        //    directly to ffmpeg's track position — ffmpeg can -map 0:a:{idx} to honour the
+        //    preferred-audio-language selection that originally required the remux.
+        //    After the rewrite, the URL is no longer a "remux" and behaves like static:
+        //    ffmpeg MUST seek. seek_seconds = $seekPosition.
         $isServerTranscode = ($network->transcode_mode ?? null) === TranscodeMode::Server;
         $urlHasSeeking = preg_match('/[?&](offset|StartTimeTicks)=/', $streamUrl);
+        $urlIsRemux = preg_match('/[?&]VideoCodec=copy\b/', $streamUrl);
+
+        // Rewrite a remux+seek URL to the seek-capable static endpoint. Strip
+        // VideoCodec=copy (the remux trigger) AND StartTimeTicks/offset (Emby ignores both
+        // on static — verified by md5 — so they're just noise after the rewrite).
+        // Keep AudioStreamIndex (no-op on static but harmless; ffmpeg does the selection).
+        $remuxRewrittenToStatic = false;
+        if ($urlIsRemux && $urlHasSeeking) {
+            $streamUrl = preg_replace('/[?&]VideoCodec=copy\b/', '', $streamUrl);
+            $streamUrl = preg_replace('/[?&](?:offset|StartTimeTicks)=[^&]*/', '', $streamUrl);
+            $streamUrl = str_replace('?&', '?', $streamUrl);
+            if (str_ends_with($streamUrl, '?')) {
+                $streamUrl = rtrim($streamUrl, '?');
+            }
+            // Add static=true if the URL doesn't already have it (EmbyJellyfinService adds
+            // static=true only when there's no audio selection; after the audio selection
+            // was the trigger for VideoCodec=copy, static was NOT added, so we add it now).
+            if (! str_contains($streamUrl, 'static=')) {
+                $separator = str_contains($streamUrl, '?') ? '&' : '?';
+                $streamUrl .= $separator.'static=true';
+            }
+            $urlIsRemux = false;
+            // After the rewrite the URL no longer carries server-side seeking; ffmpeg must
+            // do the seek itself against the now-seekable static endpoint.
+            $urlHasSeeking = false;
+            // Mark that the rewrite just fired — only the rewritten-static path is a
+            // candidate for the #range= byte-offset hint below.
+            $remuxRewrittenToStatic = true;
+        }
+
+        // Range hint for the rewritten-static path. Emby's static endpoint supports HTTP
+        // byte-range requests but ignores StartTimeTicks server-side. After the rewrite
+        // strips the server-side seek, the only way to land ffmpeg at the right byte is
+        // a Range header on the very first read. The proxy accepts a `#range=<n>-$`
+        // fragment on the stream URL as a one-shot byte offset; ffmpeg then issues the
+        // range request and from byte N+ reads normally. Only Emby's rewritten-static URL
+        // gets this — non-Emby servers don't honour the static endpoint the same way and
+        // the rest of the URL shapes don't need it.
+        if ($remuxRewrittenToStatic && $seekPosition > 0) {
+            try {
+                $integration = $network->mediaServerIntegration;
+
+                if ($integration && $integration->isEmby()) {
+                    $itemId = $this->getMediaServerItemId($programme->contentable);
+
+                    if ($itemId) {
+                        $sizeMeta = MediaServerService::make($integration)->getStreamByteSize($itemId);
+
+                        if ($sizeMeta && ! empty($sizeMeta['runtime_seconds']) && $sizeMeta['runtime_seconds'] > 0) {
+                            $offset = intval(($seekPosition / $sizeMeta['runtime_seconds']) * $sizeMeta['bytes']);
+                            Log::debug('📍 #range= byte offset computed for rewritten-static URL', [
+                                'network_id' => $network->id,
+                                'item_id' => $itemId,
+                                'seek_seconds' => $seekPosition,
+                                'runtime_seconds' => $sizeMeta['runtime_seconds'],
+                                'bytes' => $sizeMeta['bytes'],
+                                'offset' => $offset,
+                            ]);
+                            $streamUrl .= '#range='.$offset.'-';
+                        } else {
+                            Log::warning('📍 #range= byte offset NOT computed — getStreamByteSize returned unusable data', [
+                                'network_id' => $network->id,
+                                'item_id' => $itemId,
+                                'seek_seconds' => $seekPosition,
+                                'size_meta' => $sizeMeta,
+                            ]);
+                        }
+                    }
+                }
+            } catch (\Exception $e) {
+                Log::warning('Failed to compute #range= byte offset for rewritten-static URL', [
+                    'network_id' => $network->id,
+                    'exception' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        // Server transcode: Emby honors StartTimeTicks server-side, ffmpeg must NOT seek.
+        // Static (raw or post-rewrite): Emby ignores StartTimeTicks server-side; the
+        // static endpoint IS seekable (Range support), so ffmpeg MUST seek via input -ss.
         $ffmpegSeekSeconds = ($isServerTranscode && $urlHasSeeking) ? 0 : $seekPosition;
 
         // If using server-side transcoding, ensure we have a valid transcode start URL from the media server
@@ -324,6 +427,17 @@ class NetworkBroadcastService
 
             return false;
         }
+
+        $subtitleInfo = $this->resolveSubtitleInfo($network, $programme, $seekPosition);
+
+        // When the media server already seeked the subtitle URL server-side (rebasing its
+        // cues to zero at $seekPosition, mirroring the video's own StartTimeTicks seek), the
+        // subtitle input shares the video's timeline origin and must NOT be seeked again in
+        // the proxy — so the proxy seek is 0. Otherwise (full-file subtitle, e.g. a provider
+        // that can't seek server-side) the proxy still needs the true offset. This single
+        // source of truth replaces the old always-full-offset value that desynced whenever
+        // the subtitle was in fact already server-seeked.
+        $subtitleSeekSeconds = $subtitleInfo['server_seeked'] ? 0 : $seekPosition;
 
         $payload = [
             'stream_url' => $streamUrl,
@@ -344,7 +458,36 @@ class NetworkBroadcastService
             'audio_codec' => $network->audio_codec,
             'preset' => $network->transcode_preset,
             'hwaccel' => $network->hwaccel,
+            // Preferred audio language (ISO 639 code, e.g. "eng", "jpn") forwarded to the
+            // proxy so FFmpeg can select via -map 0:a:m:language:XX?. This replaces the
+            // earlier PHP-side index resolution, which required a media-server round-trip
+            // and broke on remux URLs. For Server mode the pref is already baked into the
+            // stream URL via AudioStreamIndex, so this is null (proxy uses default).
+            // Falls back to the network-level default when this specific item has no
+            // per-content override (see NetworkContent::preferred_audio_track).
+            'preferred_audio_language' => ($network->transcode_mode ?? null) !== TranscodeMode::Server
+                ? $this->resolveTrackPreference($network, $programme->contentable, 'preferred_audio_track')
+                : null,
+            // Whether the proxy should detect embedded subtitle tracks on the source and
+            // expose them as a toggleable WebVTT rendition in the HLS output. Only meaningful
+            // outside Server mode: Media Server transcoding strips subtitle tracks before the
+            // proxy ever receives the stream.
+            'subtitles_enabled' => $this->subtitlesEnabledForProxy($network, $programme->contentable),
+            // Explicit subtitle URL resolved from the media server's own metadata (covers
+            // embedded AND external/sidecar-file subtitles). When present, the proxy uses
+            // this directly as a second FFmpeg input instead of probing the raw video stream.
+            'subtitle_url' => $subtitleInfo['url'],
+            'subtitle_language' => $subtitleInfo['language'],
+            // Seek offset the proxy must apply to the subtitle input. It is 0 when the
+            // subtitle URL was already seeked server-side (cues rebased to zero at the seek
+            // point, matching the video) so the proxy leaves it untouched; otherwise it is
+            // the true offset for a full-file subtitle. Derived from $subtitleInfo above.
+            'subtitle_seek_seconds' => $subtitleSeekSeconds,
             'callback_url' => $callbackUrl,
+            // Pre-compute next programme config for zero-round-trip auto-transition.
+            // The proxy will start the next programme immediately when the current
+            // FFmpeg exits with code 0, without waiting for a Laravel callback.
+            'next_stream_config' => $this->computeNextStreamConfig($network, $programme),
             // Tell the proxy exactly where to write broadcast segments.
             // Honors BROADCAST_TEMP_DIR (default /dev/shm) so ephemeral .ts files
             // are written to RAM and never touch persistent disk.
@@ -757,6 +900,29 @@ class NetworkBroadcastService
             $request->merge(['static' => 'true']); // static stream for HLS
         }
 
+        // For Server transcode mode the media server honors AudioStreamIndex /
+        // SubtitleStreamIndex URL params, so we forward the preferences and let
+        // PlexService/EmbyJellyfinService resolve them to concrete indexes.
+        // For Local/Direct mode the proxy handles selection natively via FFmpeg's
+        // -map 0:a:m:language:XX? filter, so we skip the media-server round-trip.
+        if (($network->transcode_mode ?? null) === TranscodeMode::Server) {
+            $preferredAudioTrack = $this->resolveTrackPreference($network, $content, 'preferred_audio_track');
+            $preferredSubtitleTrack = $this->resolveTrackPreference($network, $content, 'preferred_subtitle_track');
+
+            // NOTE: not empty($x) — a resolved track preference can legitimately be
+            // the string "0" (the first stream of that type), and PHP's empty("0")
+            // is true. That silently dropped the preference whenever the operator's
+            // pick happened to be the first audio/subtitle track — very much not a
+            // rare case.
+            if ($preferredAudioTrack !== null && $preferredAudioTrack !== '') {
+                $request->merge(['PreferredAudioTrack' => $preferredAudioTrack]);
+            }
+
+            if ($preferredSubtitleTrack !== null && $preferredSubtitleTrack !== '') {
+                $request->merge(['PreferredSubtitleTrack' => $preferredSubtitleTrack]);
+            }
+        }
+
         // Use media server's native seeking if we need to seek
         if ($seekSeconds > 0) {
             // Jellyfin/Emby use ticks (100-nanosecond intervals)
@@ -818,6 +984,13 @@ class NetworkBroadcastService
         // transcoding locally instead (much more reliable for live broadcasting).
         $transcodeOptions['skip_plex_transcode'] = true;
 
+        // Inject the preferred audio track preference into the request so the media
+        // server's own track-prefs logic (Plex resolvePreferredStreamId / Emby
+        // resolvePreferredStreamIndex) picks the right stream when it builds the
+        // direct URL — only for Server transcode mode (see the conditional above).
+        // For Local/Direct mode, the raw language string is forwarded to the proxy
+        // via startViaProxy() / computeNextStreamConfig() and FFmpeg handles
+        // selection with -map 0:a:m:language:XX?, avoiding this round-trip entirely.
         $streamUrl = $service->getDirectStreamUrl($request, $itemId, 'ts', $transcodeOptions);
 
         return $streamUrl;
@@ -826,7 +999,7 @@ class NetworkBroadcastService
     /**
      * Get the media server item ID from content.
      */
-    protected function getMediaServerItemId($content): ?string
+    public function getMediaServerItemId($content): ?string
     {
         // First priority: Check info array for media server ID
         // This is the most reliable for media server content
@@ -855,7 +1028,7 @@ class NetworkBroadcastService
     /**
      * Get media server integration from content.
      */
-    protected function getIntegrationFromContent($content): ?MediaServerIntegration
+    public function getIntegrationFromContent($content): ?MediaServerIntegration
     {
         // Try to extract from cover URL
         $coverUrl = $content->info['cover_big'] ?? $content->info['movie_image'] ?? null;
@@ -1319,5 +1492,275 @@ class NetworkBroadcastService
         Log::warning('BOOT RECOVERY: Proxy did not become ready within timeout — cleanup calls may fail');
 
         return false;
+    }
+
+    /**
+     * Compute the next programme's stream configuration for proxy auto-transition.
+     *
+     * Returns a payload array suitable for the `next_stream_config` key in the
+     * broadcast start request. The proxy uses it to immediately start the next
+     * FFmpeg process when the current one exits with code 0, eliminating the
+     * Laravel callback round-trip and reducing the inter-programme gap.
+     *
+     * Returns null when no next programme exists or its stream URL cannot be resolved.
+     */
+    protected function computeNextStreamConfig(Network $network, NetworkProgramme $currentProgramme): ?array
+    {
+        $nextProgramme = $network->getNextProgramme();
+
+        if (! $nextProgramme) {
+            return null;
+        }
+
+        $nextStreamUrl = $this->getStreamUrl($network, $nextProgramme, 0);
+
+        if (! $nextStreamUrl) {
+            Log::debug('computeNextStreamConfig: could not resolve next stream URL', [
+                'network_id' => $network->id,
+                'next_programme_id' => $nextProgramme->id,
+            ]);
+
+            return null;
+        }
+
+        $nextDuration = (int) $nextProgramme->start_time->diffInSeconds($nextProgramme->end_time);
+        $callbackUrl = $this->getProxyService()->getBroadcastCallbackUrl();
+        $nextSubtitleInfo = $this->resolveSubtitleInfo($network, $nextProgramme, 0);
+
+        $config = [
+            'stream_url' => $nextStreamUrl,
+            'seek_seconds' => 0,
+            'duration_seconds' => $nextDuration,
+            'segment_duration' => $network->segment_duration ?? 6,
+            'hls_list_size' => $network->hls_list_size ?? 20,
+            'transcode' => ($network->transcode_mode ?? null) === TranscodeMode::Local,
+            'video_bitrate' => $network->video_bitrate ? (string) $network->video_bitrate : null,
+            'audio_bitrate' => $network->audio_bitrate ?? 192,
+            'video_resolution' => $network->video_resolution,
+            'video_codec' => $network->video_codec,
+            'audio_codec' => $network->audio_codec,
+            'preset' => $network->transcode_preset,
+            'hwaccel' => $network->hwaccel,
+            // Preferred audio language forwarded to the proxy for FFmpeg -map selection.
+            // Null in Server mode (the stream URL already carries AudioStreamIndex).
+            'preferred_audio_language' => ($network->transcode_mode ?? null) !== TranscodeMode::Server
+                ? $this->resolveTrackPreference($network, $nextProgramme->contentable, 'preferred_audio_track')
+                : null,
+            'subtitles_enabled' => $this->subtitlesEnabledForProxy($network, $nextProgramme->contentable),
+            'subtitle_url' => $nextSubtitleInfo['url'],
+            'subtitle_language' => $nextSubtitleInfo['language'],
+            // A next programme always starts from its own beginning, so neither the video
+            // nor the subtitle needs seeking — kept explicit so the proxy's auto-transition
+            // payload is symmetric with the initial start payload.
+            'subtitle_seek_seconds' => 0,
+            'callback_url' => $callbackUrl,
+        ];
+
+        // Attach provider-specific headers (same logic as startViaProxy).
+        try {
+            $integration = $network->mediaServerIntegration;
+
+            if ($integration && $integration->isPlex()) {
+                $parsed = parse_url($nextStreamUrl);
+                parse_str($parsed['query'] ?? '', $qs);
+                $isServerTranscode = ($network->transcode_mode ?? null) === TranscodeMode::Server;
+
+                if ($isServerTranscode) {
+                    $headers = [
+                        'X-Plex-Product' => 'Plex Web',
+                        'X-Plex-Client-Identifier' => 'm3u-proxy',
+                        'X-Plex-Platform' => 'Chrome',
+                        'X-Plex-Device' => 'OSX',
+                    ];
+
+                    if (! empty($qs['X-Plex-Token'])) {
+                        $headers['X-Plex-Token'] = $qs['X-Plex-Token'];
+                    }
+
+                    if (! empty($qs['session'])) {
+                        $headers['X-Plex-Session-Identifier'] = $qs['session'];
+                        $headers['X-Plex-Playback-Session-Id'] = $qs['session'];
+                    }
+
+                    if (str_contains($nextStreamUrl, 'start.mpd')) {
+                        $headers['Accept'] = 'application/dash+xml';
+                    } else {
+                        $headers['Accept'] = 'application/vnd.apple.mpegurl';
+                    }
+
+                    $config['headers'] = $headers;
+                } else {
+                    $headers = [];
+
+                    if (! empty($qs['X-Plex-Token'])) {
+                        $headers['X-Plex-Token'] = $qs['X-Plex-Token'];
+                    }
+
+                    if (! empty($headers)) {
+                        $config['headers'] = $headers;
+                    }
+                }
+            }
+        } catch (\Exception $e) {
+            Log::warning('computeNextStreamConfig: failed to attach provider headers', [
+                'network_id' => $network->id,
+                'exception' => $e->getMessage(),
+            ]);
+        }
+
+        return $config;
+    }
+
+    /**
+     * Resolve the effective track preference (audio or subtitle language/index) for a
+     * specific content item: a per-item override on its NetworkContent row takes
+     * precedence over the Network-level default. $column is 'preferred_audio_track' or
+     * 'preferred_subtitle_track' — both the Network and NetworkContent tables share the
+     * same column names.
+     *
+     * The Network-level default is always a plain ISO 639 code (e.g. "eng") — it's
+     * forwarded as-is regardless of mode; both Server (the media server's own fuzzy
+     * language matching) and Direct/Local (FFmpeg's `-map ...:m:language:XX` metadata
+     * specifier) already understand plain language codes natively.
+     *
+     * A per-item override from the Track Preferences picker is a composite
+     * "{type_relative_position}:{native_id}" string (see
+     * NetworkContentRelationManager::getTrackPreferencesAction() /
+     * MediaServer::getAvailableTracks()) — neither half works for both modes alone:
+     * native_id is the media server's own stream identifier (Plex's database-wide
+     * stream ID, Emby's absolute container index), meaningful only to that media
+     * server's own PreferredAudioTrack/PreferredSubtitleTrack resolution (Server
+     * mode); type_relative_position (e.g. "the 2nd audio stream") is what FFmpeg's
+     * plain index specifier (`-map 0:a:{N}?`) needs to select that exact stream when
+     * opening the file directly (Direct/Local mode) — unlike the metadata specifier,
+     * a plain index degrades gracefully via `?` if the position no longer exists.
+     *
+     * $content may be null (e.g. a programme with no resolvable contentable) — falls
+     * back to the network-level default in that case, same as if no override existed.
+     */
+    protected function resolveTrackPreference(Network $network, mixed $content, string $column): ?string
+    {
+        $value = null;
+
+        if ($content instanceof Model) {
+            $override = NetworkContent::findForNetwork($network, $content)?->{$column};
+
+            // NOTE: not empty($override) — a resolved position can legitimately be
+            // "0" (the first stream of that type), which PHP's empty() treats as
+            // falsy. Explicit null/'' checks throughout this method avoid silently
+            // dropping that valid pick.
+            if ($override !== null && $override !== '') {
+                $value = $override;
+            }
+        }
+
+        $value ??= $network->{$column};
+
+        if ($value === null || $value === '' || ! str_contains($value, ':')) {
+            return $value;
+        }
+
+        [$position, $nativeId] = explode(':', $value, 2);
+
+        return ($network->transcode_mode ?? null) === TranscodeMode::Server
+            ? $nativeId
+            : $position;
+    }
+
+    /**
+     * Whether the proxy should attempt to detect and expose embedded subtitle
+     * tracks for this broadcast. Derived from the effective preferred_subtitle_track
+     * (per-item override, or the Network-level default — any non-empty value means
+     * the operator wants subtitles). Forced off in Server transcode mode, since the
+     * media server's own transcode strips subtitle streams before the proxy ever
+     * receives the file — the operator's preference would otherwise silently do nothing.
+     *
+     * $content is optional so existing call sites without a resolved contentable still
+     * work (falls back to the network-level default only).
+     */
+    protected function subtitlesEnabledForProxy(Network $network, mixed $content = null): bool
+    {
+        $preference = $this->resolveTrackPreference($network, $content, 'preferred_subtitle_track');
+
+        // NOTE: not empty($preference) — a resolved subtitle track position can
+        // legitimately be "0" (the first subtitle stream), and PHP's empty("0") is
+        // true. That silently disabled subtitles whenever the operator's per-item
+        // pick happened to be the first subtitle track in the file.
+        return $preference !== null && $preference !== ''
+            && ($network->transcode_mode ?? null) !== TranscodeMode::Server;
+    }
+
+    /**
+     * Whether subtitles should be exposed for the network's CURRENTLY airing
+     * programme. Public (unlike subtitlesEnabledForProxy()) because
+     * NetworkHlsController needs it to decide whether to synthesize an HLS master
+     * playlist referencing a subtitle rendition, or serve the plain video playlist.
+     */
+    public function subtitlesEnabledForCurrentBroadcast(Network $network): bool
+    {
+        $content = $network->getCurrentProgramme()?->contentable;
+
+        return $this->subtitlesEnabledForProxy($network, $content);
+    }
+
+    /**
+     * Resolve a subtitle URL for the current programme from the media server's own
+     * metadata (covers embedded AND external/sidecar-file subtitles). Returns null
+     * values when subtitles are disabled, unsupported for this content, or the
+     * media server integration doesn't implement subtitle lookup (Local/WebDAV/Plex).
+     * When this returns a URL, the proxy uses it directly instead of probing the raw
+     * video stream — the media server's metadata already knows definitively whether
+     * a subtitle exists, which is more complete and cheaper than a fresh ffprobe.
+     *
+     * Accepts an explicit programme so computeNextStreamConfig() can resolve subtitle
+     * info for the upcoming programme's content, not whatever is currently airing —
+     * defaults to the current programme for the startViaProxy() call site.
+     *
+     * $seekSeconds is forwarded to the media server so the subtitle URL can be seeked
+     * server-side (rebasing cues to zero at the seek point) to match the video's own
+     * server-side seek — keeping both on one timeline origin. The returned 'server_seeked'
+     * flag propagates to subtitle_seek_seconds so the proxy never double-seeks the input.
+     *
+     * When no sidecar/embedded URL can be resolved via the media server's metadata API
+     * (Local/WebDAV stubs, or no match found), 'language' still carries the effective
+     * preferred language so the proxy can attempt its own embedded-stream language match
+     * (-map 0:s:m:language:XX?) instead of falling back to "any subtitle track".
+     *
+     * @return array{url: ?string, language: ?string, server_seeked: bool}
+     */
+    protected function resolveSubtitleInfo(Network $network, ?NetworkProgramme $programme = null, int $seekSeconds = 0): array
+    {
+        $empty = ['url' => null, 'language' => null, 'server_seeked' => false];
+
+        $programme ??= $network->getCurrentProgramme();
+        if (! $programme) {
+            return $empty;
+        }
+
+        $content = $programme->contentable;
+        if (! $content) {
+            return $empty;
+        }
+
+        if (! $this->subtitlesEnabledForProxy($network, $content)) {
+            return $empty;
+        }
+
+        $preferredLanguage = $this->resolveTrackPreference($network, $content, 'preferred_subtitle_track');
+        $noSidecar = ['url' => null, 'language' => $preferredLanguage, 'server_seeked' => false];
+
+        $integration = $network->mediaServerIntegration ?? $this->getIntegrationFromContent($content);
+        if (! $integration) {
+            return $noSidecar;
+        }
+
+        $itemId = $this->getMediaServerItemId($content);
+        if (! $itemId) {
+            return $noSidecar;
+        }
+
+        $subtitle = MediaServerService::make($integration)->getSubtitleUrl($itemId, $seekSeconds, $preferredLanguage);
+
+        return $subtitle ?? $noSidecar;
     }
 }

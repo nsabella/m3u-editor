@@ -11,19 +11,23 @@ use App\Filament\CopilotTools\ExecuteDatabaseQueryTool;
 use App\Filament\CopilotTools\GetDatabaseSchemaTool;
 use App\Filament\CopilotTools\SearchDocsTool;
 use App\Filament\Resources\Assets\AssetResource;
+use App\Filament\Resources\PushDeviceTokens\PushDeviceTokenResource;
 use App\Jobs\RestartQueue;
 use App\Models\CustomPlaylist;
 use App\Models\MergedPlaylist;
 use App\Models\Playlist;
 use App\Models\PlaylistAlias;
+use App\Models\PushDeviceToken;
 use App\Models\StreamFileSetting;
 use App\Models\StreamProfile;
 use App\Notifications\Notification as AppNotification;
+use App\Notifications\TelegramAlert;
 use App\Rules\Cron;
 use App\Rules\ValidDateFormat;
 use App\Services\DateFormatService;
 use App\Services\M3uProxyService;
 use App\Services\PlaylistService;
+use App\Services\PushRelayService;
 use App\Settings\GeneralSettings;
 use App\Support\CopilotProvider;
 use Cron\CronExpression;
@@ -55,8 +59,10 @@ use Filament\Support\Enums\Width;
 use Illuminate\Contracts\Bus\Dispatcher;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Config;
+use Illuminate\Support\Facades\Crypt;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Facades\Notification as NotificationFacade;
 use Illuminate\Support\Facades\Redis;
 use Illuminate\Support\HtmlString;
 use Illuminate\Support\Str;
@@ -278,9 +284,9 @@ class Preferences extends SettingsPage
                                                     ->label(__('Suppress success notifications'))
                                                     ->hintIcon(
                                                         'heroicon-m-question-mark-circle',
-                                                        tooltip: 'When enabled, success notifications from background tasks (e.g. sync completed successfully) will be hidden. Errors and warnings will still be shown regardless of this setting.'
+                                                        tooltip: 'When enabled, success and informational notifications from background tasks (e.g. sync started or completed successfully) will be hidden. Errors and warnings will still be shown regardless of this setting.'
                                                     )
-                                                    ->helperText(__('Hide success notifications from background tasks (errors and warnings are always shown).')),
+                                                    ->helperText(__('Hide success and informational notifications from background tasks (errors and warnings are always shown).')),
                                             ]),
                                         Grid::make()
                                             ->columnSpanFull()
@@ -403,6 +409,19 @@ class Preferences extends SettingsPage
                                             ->columnSpanFull()
                                             ->columns(2)
                                             ->schema([
+                                                Toggle::make('app_output_enabled')
+                                                    ->label(__('Enhanced output enabled'))
+                                                    ->helperText(__('When enabled, the application will output additional Xtream API fields for the M3U TV app.'))
+                                                    ->hintAction(
+                                                        Action::make('TV App settings')
+                                                            ->label(__('TV App settings'))
+                                                            ->icon('heroicon-o-arrow-top-right-on-square')
+                                                            ->iconPosition('after')
+                                                            ->size('sm')
+                                                            ->url('/preferences?tab=tv-app%3A%3Adata%3A%3Atab')
+                                                    )
+                                                    ->columnSpanFull()
+                                                    ->default(true),
                                                 TextInput::make('xtream_api_details.http_port')
                                                     ->label(__('HTTP Port'))
                                                     ->numeric()
@@ -875,13 +894,16 @@ class Preferences extends SettingsPage
 
                         Tab::make(__('TV App'))
                             ->schema([
+                                Callout::make()
+                                    ->warning()
+                                    ->description(__('Enhanced Xtream API output is disabled. Please enable that in the "General" settings tab to use the TV app.'))
+                                    ->hidden(fn (Get $get): bool => (bool) $get('app_output_enabled')),
                                 Section::make(__('TV Notification Tester'))
                                     ->description(__('Send a test notification to a playlist target to verify the TV app notification system is connected and working.'))
-                                    ->icon('heroicon-m-device-phone-mobile')
+                                    ->icon('heroicon-m-bell-alert')
                                     ->headerActions([
                                         Action::make('send_tv_notification')
                                             ->label(__('Send Notification'))
-                                            ->color('gray')
                                             ->icon('heroicon-o-paper-airplane')
                                             ->modalWidth('2xl')
                                             ->schema([
@@ -1008,6 +1030,7 @@ class Preferences extends SettingsPage
                                             }),
                                         Action::make('get_tv_app')
                                             ->label(__('Download the app'))
+                                            ->color('gray')
                                             ->icon('heroicon-o-arrow-top-right-on-square')
                                             ->url('https://github.com/m3ue/m3u-tv/releases')
                                             ->openUrlInNewTab(true),
@@ -1016,6 +1039,84 @@ class Preferences extends SettingsPage
                                         Callout::make()
                                             ->info()
                                             ->description(__('Use the "Send Notification" button above to dispatch a test TV notification to any playlist target.')),
+                                    ]),
+
+                                Section::make(__('Push Notifications (Mobile)'))
+                                    ->description(__('Deliver TV notifications to phone/tablet devices when the app is backgrounded or closed.'))
+                                    ->icon('heroicon-m-device-phone-mobile')
+                                    ->headerActions([
+                                        Action::make('test_push_relay')
+                                            ->label(__('Send Push Notification'))
+                                            ->icon('heroicon-o-paper-airplane')
+                                            ->visible(fn (Get $get): bool => (bool) $get('push_relay_enabled') && app(PushRelayService::class)->isEnabled())
+                                            ->schema([
+                                                Select::make('device_id')
+                                                    ->label(__('Registered device'))
+                                                    ->required()
+                                                    ->searchable()
+                                                    ->options(fn (): array => PushDeviceToken::query()
+                                                        ->latest()
+                                                        ->limit(50)
+                                                        ->get()
+                                                        ->mapWithKeys(fn (PushDeviceToken $d) => [
+                                                            $d->id => "{$d->notifiable?->name} ({$d->platform}, ".$d->last_seen_at?->diffForHumans().')',
+                                                        ])
+                                                        ->all()),
+                                            ])
+                                            ->action(function (array $data): void {
+                                                $device = PushDeviceToken::find($data['device_id']);
+
+                                                if (! $device) {
+                                                    Notification::make()
+                                                        ->danger()
+                                                        ->title(__('Device not found'))
+                                                        ->send();
+
+                                                    return;
+                                                }
+
+                                                try {
+                                                    app(PushRelayService::class)->send(
+                                                        $device->token,
+                                                        $device->platform,
+                                                        '[TEST] m3u editor',
+                                                        __('This is a test push notification. Your push relay integration is working correctly.'),
+                                                    );
+
+                                                    Notification::make()
+                                                        ->success()
+                                                        ->title(__('Test Push Sent'))
+                                                        ->body(__('Check the device for the test notification.'))
+                                                        ->send();
+                                                } catch (Exception $e) {
+                                                    Notification::make()
+                                                        ->danger()
+                                                        ->title(__('Failed to Send Push'))
+                                                        ->body($e->getMessage())
+                                                        ->send();
+                                                }
+                                            }),
+                                        Action::make('view_relay_status')
+                                            ->label(__('View Relay Status'))
+                                            ->color('gray')
+                                            ->icon('heroicon-o-arrow-top-right-on-square')
+                                            ->url(config('services.push_relay.status_monitor_url'))
+                                            ->openUrlInNewTab()
+                                            ->hidden(fn (Get $get): bool => ! (bool) $get('push_relay_enabled')),
+                                    ])
+                                    ->schema([
+                                        Callout::make()
+                                            ->info()
+                                            ->description(__('The relay forwards TV notifications to Apple/Google push services so the mobile app can receive them while backgrounded or closed.')),
+                                        Toggle::make('push_relay_enabled')
+                                            ->label(__('Enable push relay'))
+                                            ->helperText(__('When enabled, TV notifications are also forwarded to registered mobile devices through the public relay.'))
+                                            ->live(),
+                                        Action::make(__('Manage Devices'))
+                                            ->label(__('Manage Devices'))
+                                            ->icon('heroicon-o-device-phone-mobile')
+                                            ->url(PushDeviceTokenResource::getUrl())
+                                            ->hidden(fn (Get $get): bool => ! (bool) $get('push_relay_enabled')),
                                     ]),
 
                                 Section::make(__('Notification Channels'))
@@ -2041,9 +2142,87 @@ HTML))
                                             ->visible(fn (Get $get): bool => (bool) $get('slack_alerts_enabled'))
                                             ->columnSpanFull(),
                                     ]),
+                                Section::make(__('Telegram'))
+                                    ->description(__('Send alerts to a Telegram chat via a bot.'))
+                                    ->headerActions([
+                                        Action::make('test_telegram_alert')
+                                            ->label(__('Send test alert'))
+                                            ->icon('heroicon-o-paper-airplane')
+                                            ->color('gray')
+                                            ->size('sm')
+                                            ->visible(fn (Get $get): bool => (bool) $get('telegram_alerts_enabled') && ! empty($get('telegram_bot_token')) && ! empty($get('telegram_chat_id')))
+                                            ->action(function (Get $get): void {
+                                                $botToken = $get('telegram_bot_token');
+                                                $chatId = $get('telegram_chat_id');
+
+                                                if (empty($botToken) || empty($chatId)) {
+                                                    Notification::make()
+                                                        ->title(__('Missing Bot Token or Chat ID'))
+                                                        ->body(__('Please enter a Telegram bot token and chat ID first.'))
+                                                        ->warning()
+                                                        ->send();
+
+                                                    return;
+                                                }
+
+                                                try {
+                                                    NotificationFacade::route('telegram', $chatId)
+                                                        ->notifyNow(new TelegramAlert('[TEST] This is a test alert from m3u-editor. Your Telegram integration is working correctly.', Crypt::encryptString($botToken)));
+
+                                                    Notification::make()
+                                                        ->title(__('Test Alert Sent'))
+                                                        ->body(__('Check your Telegram chat for the test message.'))
+                                                        ->success()
+                                                        ->send();
+                                                } catch (Exception $e) {
+                                                    Notification::make()
+                                                        ->title(__('Failed to Send Alert'))
+                                                        ->body(__('Could not send the test alert. Check your bot token and chat ID and try again.'))
+                                                        ->danger()
+                                                        ->send();
+                                                }
+                                            }),
+                                    ])
+                                    ->schema([
+                                        Toggle::make('telegram_alerts_enabled')
+                                            ->label(__('Enable Telegram alerts'))
+                                            ->helperText(__('When enabled, error-level log entries will be forwarded to your Telegram chat.'))
+                                            ->live(),
+                                        Placeholder::make('telegram_setup_guide')
+                                            ->label(__('Setup Guide'))
+                                            ->content(new HtmlString(<<<'HTML'
+<div class="space-y-3 text-sm text-gray-600 dark:text-gray-400">
+    <p>Create a Telegram bot and find the chat ID to send alerts to.</p>
+    <ol class="list-decimal list-inside space-y-1.5 ml-1">
+        <li>Open Telegram and start a chat with <a href="https://t.me/BotFather" target="_blank" class="text-primary-600 dark:text-primary-400 hover:underline font-medium">@BotFather</a></li>
+        <li>Send <strong class="text-gray-700 dark:text-gray-300">/newbot</strong> and follow the prompts to name your bot</li>
+        <li>Copy the <strong class="text-gray-700 dark:text-gray-300">bot token</strong> BotFather gives you and paste it below</li>
+        <li>Start a chat with your new bot and send it any message (for group alerts, add the bot to the group and post a message there)</li>
+        <li>Open <code class="bg-gray-100 dark:bg-gray-800 rounded px-1.5 py-0.5 text-xs text-gray-700 dark:text-gray-300">https://api.telegram.org/bot&lt;YOUR_BOT_TOKEN&gt;/getUpdates</code> in your browser</li>
+        <li>Find <strong class="text-gray-700 dark:text-gray-300">"chat":{"id":...}</strong> in the response and paste that ID below (group IDs are negative numbers)</li>
+    </ol>
+</div>
+HTML))
+                                            ->visible(fn (Get $get): bool => (bool) $get('telegram_alerts_enabled'))
+                                            ->columnSpanFull(),
+                                        TextInput::make('telegram_bot_token')
+                                            ->label(__('Telegram Bot Token'))
+                                            ->password()
+                                            ->revealable()
+                                            ->placeholder(__('123456789:ABC-DEF1234ghIkl-zyx57W2v1u123ew11'))
+                                            ->helperText(__('The bot token you received from BotFather.'))
+                                            ->visible(fn (Get $get): bool => (bool) $get('telegram_alerts_enabled'))
+                                            ->columnSpanFull(),
+                                        TextInput::make('telegram_chat_id')
+                                            ->label(__('Telegram Chat ID'))
+                                            ->placeholder(__('e.g. 123456789 or -100123456789'))
+                                            ->helperText(__('The ID of the chat, group or channel to send alerts to.'))
+                                            ->visible(fn (Get $get): bool => (bool) $get('telegram_alerts_enabled'))
+                                            ->columnSpanFull(),
+                                    ]),
                                 Section::make(__('Additional Notifications'))
                                     ->description(__('Opt in to targeted notifications beyond the default error log forwarding.'))
-                                    ->visible(fn (Get $get): bool => (bool) $get('discord_alerts_enabled') || (bool) $get('slack_alerts_enabled'))
+                                    ->visible(fn (Get $get): bool => (bool) $get('discord_alerts_enabled') || (bool) $get('slack_alerts_enabled') || (bool) $get('telegram_alerts_enabled'))
                                     ->schema([
                                         Toggle::make('alerts_on_job_failed')
                                             ->label(__('Notify on queued job failures'))

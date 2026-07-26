@@ -72,7 +72,17 @@ class ProcessEpgImport implements ShouldQueue
     public function __construct(
         public Epg $epg,
         public ?bool $force = false,
-    ) {}
+    ) {
+        // SchedulesDirect syncs share a single external account/API per user, and
+        // running more than one at a time for the same account gets it rate-limited
+        // or blocked by SD. Route them onto a dedicated queue that Horizon runs with
+        // maxProcesses = 1 (see config/horizon.php) so concurrency is enforced by the
+        // queue itself rather than app-level locking. M3U/XML imports are unaffected
+        // and continue to run on the default/import queues with full concurrency.
+        if ($epg->source_type === EpgSourceType::SCHEDULES_DIRECT) {
+            $this->onQueue('schedules-direct');
+        }
+    }
 
     /**
      * Execute the job.
@@ -346,7 +356,7 @@ class ProcessEpgImport implements ShouldQueue
                                             if (! $elementData['display_name']) {
                                                 // Only use the first display-name element (could be multiple)
                                                 $rawDisplayName = trim($innerReader->readString());
-                                                $elementData['name'] = $this->sanitizeUtf8(Str::limit($rawDisplayName, 255));
+                                                $elementData['name'] = $this->sanitizeUtf8(Str::limit($rawDisplayName, 500, ''));
                                                 $elementData['display_name'] = $this->sanitizeUtf8($rawDisplayName);
                                                 $elementData['lang'] = trim($innerReader->getAttribute('lang'));
                                             } else {
@@ -620,6 +630,15 @@ class ProcessEpgImport implements ShouldQueue
             ->body("\"{$epg->name}\" has been synced successfully. Import completed in {$completedInRounded} seconds.")
             ->broadcast($epg->user)
             ->sendToDatabase($epg->user);
+
+        // Re-run any recurring EPG maps now that the merged EPG has been rebuilt
+        $epg->epgMaps()->where('recurring', true)->get()->each(function ($map) {
+            dispatch(new MapPlaylistChannelsToEpg(
+                epg: $map->epg_id,
+                playlist: $map->playlist_id,
+                epgMapId: $map->id,
+            ));
+        });
 
         event(new SyncCompleted($epg));
     }

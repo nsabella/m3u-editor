@@ -2481,6 +2481,76 @@ class PlaylistResource extends Resource implements CopilotResource
                             : null
                         ),
                 ]),
+            Section::make(__('Auto Enable/Disable Rules'))
+                ->description(__('Automatically enable or disable channels whose title or name matches a regex pattern, re-evaluated after each playlist sync. Rules run in order and the last matching rule wins; channels matching no rule keep their current state. Useful for event channels that providers rename between syncs (e.g. disable "NO EVENT" placeholders).'))
+                ->columnSpanFull()
+                ->collapsible()
+                ->collapsed($creating)
+                ->schema([
+                    Repeater::make('channel_enable_rules')
+                        ->label(__('Auto enable/disable rules'))
+                        ->schema([
+                            Toggle::make('enabled')
+                                ->label(__('Enabled'))
+                                ->default(true)
+                                ->inline(false)
+                                ->columnSpan(1),
+                            TextInput::make('name')
+                                ->label(__('Rule Name'))
+                                ->required()
+                                ->placeholder(__('e.g. Disable idle event channels'))
+                                ->columnSpan(2),
+                            Select::make('target')
+                                ->label(__('Target'))
+                                ->options([
+                                    'channels' => 'Live Channels',
+                                    'vod_channels' => 'VOD Channels',
+                                ])
+                                ->default('channels')
+                                ->required()
+                                ->columnSpan(2),
+                            Select::make('column')
+                                ->label(__('Column to match'))
+                                ->options([
+                                    'title' => 'Channel Title',
+                                    'name' => 'Channel Name (tvg-name)',
+                                ])
+                                ->default('title')
+                                ->required()
+                                ->columnSpan(2),
+                            Select::make('action')
+                                ->label(__('Action'))
+                                ->options([
+                                    'enable' => 'Enable matching channels',
+                                    'disable' => 'Disable matching channels',
+                                ])
+                                ->default('disable')
+                                ->required()
+                                ->columnSpan(2),
+                            TextInput::make('pattern')
+                                ->label(__('Pattern to match'))
+                                ->required()
+                                ->placeholder(__('e.g. NO EVENT'))
+                                ->suffixAction(
+                                    RegexTesterAction::make(
+                                        name: 'test-enable-rules',
+                                        samplesContext: fn (Get $get): string => $get('target') ?? 'channels',
+                                        patternField: 'pattern',
+                                    )
+                                )
+                                ->columnSpan(5),
+                        ])
+                        ->columns(7)
+                        ->reorderable()
+                        ->reorderableWithButtons()
+                        ->collapsible()
+                        ->defaultItems(0)
+                        ->addActionLabel('Add enable/disable rule')
+                        ->itemLabel(fn (array $state): ?string => ($state['name'] ?? null)
+                            ? ($state['name'].($state['enabled'] ?? true ? '' : ' (disabled)'))
+                            : null
+                        ),
+                ]),
             Section::make(__('Sort Alpha Configs'))
                 ->description(__('Define sort configurations that automatically run after each playlist sync. Configurations execute in order.'))
                 ->columnSpanFull()
@@ -2500,41 +2570,70 @@ class PlaylistResource extends Resource implements CopilotResource
                                 ->options([
                                     'live_groups' => 'Live Groups',
                                     'vod_groups' => 'VOD Groups',
+                                    'series_categories' => 'Series Categories',
                                 ])
                                 ->live()
                                 ->default('live_groups')
                                 ->required()
-                                ->afterStateUpdated(fn (Set $set) => $set('group', ['all']))
+                                ->afterStateUpdated(function (Set $set, ?string $state): void {
+                                    $set('group', ['all']);
+                                    $set('column', $state === 'series_categories' ? 'release_date' : 'title');
+                                    $set('sort', $state === 'series_categories' ? 'DESC' : 'ASC');
+                                })
                                 ->columnSpan(1),
                             Select::make('group')
-                                ->label(__('Groups'))
-                                ->options(fn (Get $get, ?Playlist $record): array => [
-                                    'all' => 'All groups',
-                                    ...($record
-                                        ? SourceGroup::where('playlist_id', $record->id)
-                                            ->where('type', match ($get('target')) {
-                                                'vod_groups' => 'vod',
-                                                default => 'live',
-                                            })
-                                            ->orderBy('name')
-                                            ->pluck('name', 'name')
-                                            ->toArray()
-                                        : []),
-                                ])
+                                ->label(fn (Get $get): string => $get('target') === 'series_categories' ? __('Categories') : __('Groups'))
+                                ->options(function (Get $get, ?Playlist $record): array {
+                                    if ($get('target') === 'series_categories') {
+                                        return [
+                                            'all' => 'All categories',
+                                            ...($record
+                                                ? SourceCategory::where('playlist_id', $record->id)
+                                                    ->orderBy('name')
+                                                    ->pluck('name', 'name')
+                                                    ->toArray()
+                                                : []),
+                                        ];
+                                    }
+
+                                    return [
+                                        'all' => 'All groups',
+                                        ...($record
+                                            ? SourceGroup::where('playlist_id', $record->id)
+                                                ->where('type', match ($get('target')) {
+                                                    'vod_groups' => 'vod',
+                                                    default => 'live',
+                                                })
+                                                ->orderBy('name')
+                                                ->pluck('name', 'name')
+                                                ->toArray()
+                                            : []),
+                                    ];
+                                })
                                 ->default(['all'])
                                 ->multiple()
                                 ->searchable()
                                 ->columnSpan(3),
                             Select::make('column')
                                 ->label(__('Sort By'))
-                                ->options([
-                                    'title' => 'Title (or override if set)',
-                                    'name' => 'Name (or override if set)',
-                                    'stream_id' => 'ID (or override if set)',
-                                    'channel' => 'Channel No.',
-                                ])
+                                ->options(function (Get $get): array {
+                                    $alphaOptions = [
+                                        'title' => 'Title (or override if set)',
+                                        'name' => 'Name (or override if set)',
+                                        'stream_id' => 'ID (or override if set)',
+                                        'channel' => 'Channel No.',
+                                    ];
+
+                                    return match ($get('target')) {
+                                        'series_categories' => ['release_date' => 'Release Date'],
+                                        'vod_groups' => [...$alphaOptions, 'release_date' => 'Release Date'],
+                                        default => $alphaOptions,
+                                    };
+                                })
+                                ->live()
                                 ->default('title')
                                 ->required()
+                                ->afterStateUpdated(fn (Set $set, ?string $state) => $set('sort', ($state ?? '') === 'release_date' ? 'DESC' : 'ASC'))
                                 ->columnSpan(2),
                             Select::make('sort')
                                 ->label(__('Sort Order'))
@@ -2556,7 +2655,11 @@ class PlaylistResource extends Resource implements CopilotResource
                             if (empty($state['target'])) {
                                 return null;
                             }
-                            $targetLabel = $state['target'] === 'vod_groups' ? 'VOD Groups' : 'Live Groups';
+                            $targetLabel = match ($state['target']) {
+                                'vod_groups' => 'VOD Groups',
+                                'series_categories' => 'Series Categories',
+                                default => 'Live Groups',
+                            };
                             $groups = (array) ($state['group'] ?? ['all']);
                             $groupLabel = \in_array('all', $groups) ? 'All' : implode(', ', $groups);
                             $disabled = ($state['enabled'] ?? true) ? '' : ' (disabled)';
@@ -2842,7 +2945,6 @@ class PlaylistResource extends Resource implements CopilotResource
                 ->collapsible()
                 ->collapsed($creating)
                 ->columns(2)
-                ->hidden(fn () => ! auth()->user()->canUseProxy())
                 ->schema([
                     Toggle::make('enable_proxy')
                         ->label(__('Enable Stream Proxy'))
@@ -2855,7 +2957,8 @@ class PlaylistResource extends Resource implements CopilotResource
                         ->disabled(fn (Get $get): bool => (bool) $get('profiles_enabled'))
                         ->dehydrated()
                         ->inline(false)
-                        ->default(false),
+                        ->default(false)
+                        ->hidden(fn () => ! auth()->user()->canUseProxy()),
                     Toggle::make('enable_logo_proxy')
                         ->label(__('Enable Logo Proxy'))
                         ->hint(fn (Get $get): string => $get('enable_logo_proxy') ? 'Proxied' : 'Not proxied')
@@ -2863,7 +2966,8 @@ class PlaylistResource extends Resource implements CopilotResource
                         ->live()
                         ->helperText(__('When enabled, channel logos will be proxied through the application. Logos will be cached for up to 30 days to reduce bandwidth and speed up loading times.'))
                         ->inline(false)
-                        ->default(false),
+                        ->default(false)
+                        ->hidden(fn () => ! auth()->user()->canUseProxy()),
                     TextInput::make('streams')
                         ->label(__('HDHR/Xtream API Streams'))
                         ->helperText(__('Number of streams available for HDHR and Xtream API service (if using).'))

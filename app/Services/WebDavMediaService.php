@@ -943,4 +943,19 @@ class WebDavMediaService implements MediaServer
             'password' => $this->integration->webdav_password,
         ];
     }
+
+    public function getSubtitleUrl(string $itemId, int $seekSeconds = 0, ?string $preferredLanguage = null): ?array
+    {
+        return null;
+    }
+
+    public function getAvailableTracks(string $itemId): array
+    {
+        return ['audio' => [], 'subtitle' => []];
+    }
+
+    public function getStreamByteSize(string $itemId): ?array
+    {
+        return null;
+    }
 }

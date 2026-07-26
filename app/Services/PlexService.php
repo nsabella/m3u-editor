@@ -418,6 +418,53 @@ class PlexService implements MediaServer
         );
     }
 
+    /**
+     * Resolve a Plex audio or subtitle stream ID from a user preference.
+     *
+     * @param  array<string, mixed>  $metadata
+     */
+    protected function resolvePreferredStreamId(array $metadata, int $streamType, string $preference): ?string
+    {
+        $preference = trim($preference);
+
+        if ($preference === '') {
+            return null;
+        }
+
+        if (ctype_digit($preference)) {
+            return $preference;
+        }
+
+        $normalizedPreference = strtolower($preference);
+        $streams = $metadata['Media'][0]['Part'][0]['Stream'] ?? [];
+
+        $typed = array_filter($streams, fn ($s) => (int) ($s['streamType'] ?? 0) === $streamType);
+
+        // First pass: exact match on any field
+        foreach ($typed as $stream) {
+            foreach (['languageCode', 'language', 'title', 'displayTitle', 'extendedDisplayTitle'] as $key) {
+                if (strtolower((string) ($stream[$key] ?? '')) === $normalizedPreference) {
+                    $id = (string) ($stream['id'] ?? '');
+
+                    return $id !== '' ? $id : null;
+                }
+            }
+        }
+
+        // Second pass: substring match (less precise, used as fallback)
+        foreach ($typed as $stream) {
+            foreach (['languageCode', 'language', 'title', 'displayTitle', 'extendedDisplayTitle'] as $key) {
+                if (str_contains(strtolower((string) ($stream[$key] ?? '')), $normalizedPreference)) {
+                    $id = (string) ($stream['id'] ?? '');
+
+                    return $id !== '' ? $id : null;
+                }
+            }
+        }
+
+        return null;
+    }
+
     public function getDirectStreamUrl(Request $request, string $itemId, string $container = 'ts', array $transcodeOptions = []): string
     {
         try {
@@ -449,6 +496,30 @@ class PlexService implements MediaServer
                         $params['subtitleStreamID'] = $request->input('SubtitleStreamIndex');
                     }
 
+                    if ($request->has('PreferredAudioTrack')) {
+                        $audioStreamId = $this->resolvePreferredStreamId(
+                            $metadata,
+                            2,
+                            (string) $request->input('PreferredAudioTrack')
+                        );
+
+                        if ($audioStreamId !== null) {
+                            $params['audioStreamID'] = $audioStreamId;
+                        }
+                    }
+
+                    if ($request->has('PreferredSubtitleTrack')) {
+                        $subtitleStreamId = $this->resolvePreferredStreamId(
+                            $metadata,
+                            3,
+                            (string) $request->input('PreferredSubtitleTrack')
+                        );
+
+                        if ($subtitleStreamId !== null) {
+                            $params['subtitleStreamID'] = $subtitleStreamId;
+                        }
+                    }
+
                     // If transcode options are provided use Plex's transcode endpoint
                     // UNLESS the caller explicitly requests to skip Plex transcoding via the
                     // 'skip_plex_transcode' flag. This allows direct file access for better
@@ -473,6 +544,8 @@ class PlexService implements MediaServer
                             'videoBitrate' => $videoBitrate,
                             'audioBitrate' => $audioBitrate,
                             'videoResolution' => $resolution,
+                            'audioStreamID' => $params['audioStreamID'] ?? null,
+                            'subtitleStreamID' => $params['subtitleStreamID'] ?? null,
                         ]);
 
                         // Preferred flow: ask Plex's universal decision endpoint for the correct
@@ -883,5 +956,109 @@ class PlexService implements MediaServer
                 'message' => 'Failed to trigger refresh: '.$e->getMessage(),
             ];
         }
+    }
+
+    public function getSubtitleUrl(string $itemId, int $seekSeconds = 0, ?string $preferredLanguage = null): ?array
+    {
+        return null;
+    }
+
+    /**
+     * @return array{
+     *     audio: list<array{index: int, label: string, language: ?string}>,
+     *     subtitle: list<array{index: int, label: string, language: ?string}>,
+     * }
+     */
+    public function getAvailableTracks(string $itemId): array
+    {
+        $empty = ['audio' => [], 'subtitle' => []];
+
+        try {
+            $response = $this->client()->get("/library/metadata/{$itemId}");
+
+            if (! $response->successful()) {
+                return $empty;
+            }
+
+            $metadata = $response->json('MediaContainer.Metadata.0');
+            $streams = $metadata['Media'][0]['Part'][0]['Stream'] ?? [];
+
+            $tracks = ['audio' => [], 'subtitle' => []];
+            $typeMap = [2 => 'audio', 3 => 'subtitle'];
+            // Tracks the type-relative position FFmpeg itself would assign via
+            // `0:a:N`/`0:s:N` — incremented for every embedded stream of that type,
+            // including ones we don't offer as a pick (e.g. a bitmap subtitle). FFmpeg
+            // addresses raw container stream slots regardless of codec, so a bitmap
+            // stream sitting between two text subtitle streams still occupies a slot;
+            // excluding it from this counter (as an earlier version did) desynced every
+            // later text stream's stored position from what FFmpeg actually sees,
+            // silently selecting the wrong subtitle track.
+            $positionByType = ['audio' => 0, 'subtitle' => 0];
+
+            foreach ($streams as $stream) {
+                $type = $typeMap[(int) ($stream['streamType'] ?? 0)] ?? null;
+                if (! $type) {
+                    continue;
+                }
+
+                $language = $stream['language'] ?? $stream['languageCode'] ?? null;
+                $label = $stream['extendedDisplayTitle'] ?? $stream['displayTitle'] ?? $stream['title'] ?? ($language ?? 'Unknown');
+
+                // External streams (a sidecar subtitle file sitting next to the video,
+                // not muxed into it — Plex labels these "(... External)" in its own
+                // extendedDisplayTitle, confirmed against a real server) can never be
+                // reached via FFmpeg's `-map 0:s:{N}?` type-relative addressing when
+                // opening the raw file directly — that only sees streams actually
+                // embedded in the container, so these never occupy one of its position
+                // slots either. Plex flags this with a 'key' attribute pointing at the
+                // external file; fall back to the label text since that's the only
+                // signal confirmed against real Plex API output.
+                if (! empty($stream['key']) || str_contains(strtolower($label), 'external')) {
+                    continue;
+                }
+
+                // Position among embedded streams of this same type seen so far
+                // (0-indexed) — matches FFmpeg's own `0:a:N`/`0:s:N` type-relative
+                // addressing when opening this file directly. Plex's 'id' is a
+                // database-wide stream identifier with no relationship to FFmpeg's
+                // numbering, so it's only usable server-side (Server mode's
+                // PreferredAudioTrack resolution).
+                $position = $positionByType[$type]++;
+
+                // Bitmap subtitle formats (PGS/VobSub/DVD — common on Blu-ray rips) can't
+                // be converted to WebVTT, FFmpeg's default HLS subtitle codec (text-to-text
+                // or bitmap-to-bitmap only). Mapping one for Direct/Local's embedded
+                // subtitle output crashes FFmpeg outright ("Subtitle encoding currently
+                // only possible from text to text or bitmap to bitmap") rather than
+                // degrading gracefully — confirmed against a real broadcast. Plex has no
+                // Emby-style IsTextSubtitleStream flag, so this allowlists known text
+                // codec names instead of trying to denylist every bitmap format. Excluded
+                // from the offered list (after claiming its position slot above), not
+                // from the counting itself.
+                if ($type === 'subtitle' && ! in_array(strtolower((string) ($stream['codec'] ?? '')), ['srt', 'subrip', 'ass', 'ssa', 'webvtt', 'text'], true)) {
+                    continue;
+                }
+
+                $tracks[$type][] = [
+                    'index' => "{$position}:".((int) ($stream['id'] ?? 0)),
+                    'label' => $label,
+                    'language' => $language,
+                ];
+            }
+
+            return $tracks;
+        } catch (Exception $e) {
+            Log::warning('PlexService: Failed to list available tracks', [
+                'item_id' => $itemId,
+                'error' => $e->getMessage(),
+            ]);
+
+            return $empty;
+        }
+    }
+
+    public function getStreamByteSize(string $itemId): ?array
+    {
+        return null;
     }
 }

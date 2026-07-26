@@ -63,8 +63,22 @@ class M3uProxyApiController extends Controller
         // If neither is set, the stream is proxied directly without transcoding.
         // An adaptive profile (backend === 'adaptive') is unwrapped to its
         // concrete target via the channel's cached probe data.
-        $profile = $channel->streamProfile
-            ?? ($channel->is_vod ? $playlist->vodStreamProfile : $playlist->streamProfile);
+        //
+        // A client-selected profile (validated upstream in XtreamStreamController and
+        // passed via request attributes) replaces the playlist-level default; the
+        // channel-level profile still wins since it is pinned to make that specific
+        // stream work (e.g. resolver profiles). 'none' means explicit direct proxy.
+        $playlistProfile = $channel->is_vod ? $playlist->vodStreamProfile : $playlist->streamProfile;
+        $clientProfile = $request->attributes->get('client_stream_profile');
+        if ($clientProfile === 'none') {
+            $playlistProfile = null;
+        } elseif ($clientProfile !== null) {
+            $profileId = (int) $clientProfile;
+            $playlistProfile = StreamProfile::where('id', $profileId)
+                ->where('user_id', $playlist->user_id)
+                ->first();
+        }
+        $profile = $channel->streamProfile ?? $playlistProfile;
         $profile = app(StreamProfileRuleEvaluator::class)->unwrap($profile, $channel->stream_stats);
 
         $url = app(M3uProxyService::class)
@@ -112,8 +126,20 @@ class M3uProxyApiController extends Controller
             $playlist->load('streamProfile', 'vodStreamProfile');
         }
 
-        // For Series, use the VOD stream profile if set
+        // For Series, use the VOD stream profile if set.
+        // A client-selected profile (validated upstream in XtreamStreamController and
+        // passed via request attributes) replaces the playlist-level default;
+        // 'none' means explicit direct proxy.
         $profile = $playlist->vodStreamProfile;
+        $clientProfile = $request->attributes->get('client_stream_profile');
+        if ($clientProfile === 'none') {
+            $profile = null;
+        } elseif ($clientProfile !== null) {
+            $profileId = (int) $clientProfile;
+            $profile = StreamProfile::where('id', $profileId)
+                ->where('user_id', $playlist->user_id)
+                ->first();
+        }
 
         $url = app(M3uProxyService::class)
             ->getEpisodeUrl(
@@ -446,23 +472,75 @@ class M3uProxyApiController extends Controller
 
     /**
      * Handle programme ended callback - transition to next programme.
+     *
+     * When the proxy includes `auto_transitioned=true` it has already started the
+     * next FFmpeg process (zero-round-trip transition). In that case we update DB
+     * state atomically to reflect the new running programme without calling start()
+     * again. For the normal path we set `broadcast_restart_locked` to prevent the
+     * tick loop from racing while start() is in flight.
      */
     protected function handleProgrammeEnded(Network $network, array $data, NetworkBroadcastService $service): void
     {
         $finalSegment = $data['final_segment_number'] ?? 0;
         $durationStreamed = $data['duration_streamed'] ?? 0;
+        $autoTransitioned = $data['auto_transitioned'] ?? false;
+        $newPid = $data['new_pid'] ?? null;
 
         Log::info('Programme completed via proxy', [
             'network_id' => $network->id,
             'network_name' => $network->name,
             'final_segment' => $finalSegment,
             'duration_streamed' => $durationStreamed,
+            'auto_transitioned' => $autoTransitioned,
         ]);
 
         // Clean up Plex transcode session before transitioning to next programme
         $service->cleanupTranscodeSession($network);
 
-        // Update segment sequence for next programme
+        if ($autoTransitioned && $newPid !== null) {
+            // The proxy already started the next programme — update DB state atomically
+            // to reflect the running broadcast without an intermediate null state that
+            // the tick loop could misread as "stopped".
+            $endedProgrammeId = $network->broadcast_programme_id;
+            $network->refresh();
+
+            // Guard: getCurrentProgramme() uses end_time > now(), so a callback that
+            // arrives before the wall clock crosses end_time returns the just-ended
+            // programme. Skip it so we always resolve the next one.
+            $nextProgramme = $network->getCurrentProgramme();
+            if ($nextProgramme?->id === $endedProgrammeId) {
+                $nextProgramme = null;
+            }
+            $nextProgramme ??= $network->getNextProgramme();
+
+            $network->update([
+                'broadcast_segment_sequence' => $finalSegment + 1,
+                'broadcast_started_at' => now(),
+                'broadcast_pid' => $newPid,
+                'broadcast_programme_id' => $nextProgramme?->id,
+                'broadcast_initial_offset_seconds' => 0,
+                'broadcast_error' => null,
+                'broadcast_fail_count' => 0,
+                'broadcast_last_exit_code' => null,
+                'broadcast_transcode_session_id' => null,
+                'broadcast_restart_locked' => false,
+            ]);
+
+            $network->increment('broadcast_discontinuity_sequence');
+
+            Log::info('Auto-transitioned to next programme', [
+                'network_id' => $network->id,
+                'new_pid' => $newPid,
+                'next_programme_id' => $nextProgramme?->id,
+                'next_programme_title' => $nextProgramme?->title,
+            ]);
+
+            return;
+        }
+
+        // Normal transition: clear current programme state and start next.
+        // Set restart lock to prevent tick loop from also trying to start while
+        // this handler's start() call is in flight.
         $network->update([
             'broadcast_segment_sequence' => $finalSegment + 1,
             'broadcast_started_at' => null,
@@ -473,29 +551,32 @@ class M3uProxyApiController extends Controller
             'broadcast_fail_count' => 0,
             'broadcast_last_exit_code' => null,
             'broadcast_transcode_session_id' => null,
+            'broadcast_restart_locked' => true,
         ]);
 
         // Increment discontinuity sequence for transition
         $network->increment('broadcast_discontinuity_sequence');
 
-        // Check if there's a next programme to broadcast
         $network->refresh();
         $nextProgramme = $network->getCurrentProgramme() ?? $network->getNextProgramme();
 
-        if ($nextProgramme && $network->broadcast_requested) {
-            Log::info('Starting next programme via proxy', [
-                'network_id' => $network->id,
-                'programme_id' => $nextProgramme->id,
-                'programme_title' => $nextProgramme->title,
-            ]);
+        try {
+            if ($nextProgramme && $network->broadcast_requested) {
+                Log::info('Starting next programme via proxy', [
+                    'network_id' => $network->id,
+                    'programme_id' => $nextProgramme->id,
+                    'programme_title' => $nextProgramme->title,
+                ]);
 
-            // Start next programme
-            $service->start($network);
-        } else {
-            Log::info('No next programme to broadcast', [
-                'network_id' => $network->id,
-                'broadcast_requested' => $network->broadcast_requested,
-            ]);
+                $service->start($network);
+            } else {
+                Log::info('No next programme to broadcast', [
+                    'network_id' => $network->id,
+                    'broadcast_requested' => $network->broadcast_requested,
+                ]);
+            }
+        } finally {
+            $network->update(['broadcast_restart_locked' => false]);
         }
     }
 

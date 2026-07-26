@@ -68,17 +68,28 @@ class NetworkHlsController extends Controller
                 return response('Broadcast not available', $response->status());
             }
 
-            $playlist = $response->body();
-
-            // Rewrite segment URLs to go through our proxy route
-            // FFmpeg outputs segment names like "live000001.ts" in the playlist
-            // We need to rewrite them to full URLs: /m3u-proxy/broadcast/{uuid}/segment/live000001.ts
-            $baseUrl = url("/network/{$network->uuid}");
-            $playlist = preg_replace(
-                '/^(live\d+\.ts)$/m',
-                $baseUrl.'/$1',
-                $playlist
-            );
+            if ($this->broadcastService->subtitlesEnabledForCurrentBroadcast($network)) {
+                // FFmpeg auto-converts a mapped subtitle stream to WebVTT and writes it
+                // as a companion sub-playlist (live_vtt.m3u8, derived from the video
+                // playlist's own filename) — but it never upgrades live.m3u8 itself
+                // into a proper HLS master playlist referencing both renditions, even
+                // with a subtitle stream mapped. Synthesize that master playlist here;
+                // the video/subtitle sub-playlists are served unchanged via variant()'s
+                // existing fetch-and-rewrite logic (built for this in #1291, but never
+                // actually reachable before now — the proxy alone never emits
+                // #EXT-X-STREAM-INF, confirmed by testing FFmpeg's HLS muxer directly).
+                $playlist = $this->buildMasterPlaylistWithSubtitles($network);
+            } else {
+                // Rewrite segment URLs to go through our proxy route
+                // FFmpeg outputs segment names like "live000001.ts" in the playlist
+                // We need to rewrite them to full URLs: /m3u-proxy/broadcast/{uuid}/segment/live000001.ts
+                $baseUrl = url("/network/{$network->uuid}");
+                $playlist = preg_replace(
+                    '/^(live\d+\.ts)$/m',
+                    $baseUrl.'/$1',
+                    $response->body()
+                );
+            }
 
             return response($playlist, 200, [
                 'Content-Type' => 'application/vnd.apple.mpegurl',
@@ -118,6 +129,106 @@ class NetworkHlsController extends Controller
         $proxyUrl = $this->proxyService->getProxyBroadcastSegmentUrl($network, $segment);
 
         return redirect()->to($proxyUrl);
+    }
+
+    /**
+     * Serve an HLS sub-playlist or segment referenced from the master playlist
+     * when subtitles are enabled (video variant, subtitle variant, or their .ts/.vtt
+     * segments). Unlike segment(), .m3u8 files are fetched and rewritten here (they're
+     * playlists, not opaque binary segments) so their own references resolve back
+     * through our domain; .ts/.vtt segments are redirected straight to the proxy.
+     */
+    public function variant(Request $request, Network $network, string $filename): RedirectResponse|Response
+    {
+        if (! $network->broadcast_enabled) {
+            return response('Broadcast not enabled for this network', 404);
+        }
+
+        if (! str_ends_with($filename, '.m3u8')) {
+            if ($network->enabled && $network->broadcast_requested && $network->broadcast_on_demand) {
+                $this->broadcastService->markConnectionSeen($network);
+            }
+
+            return redirect()->to($this->proxyService->getProxyBroadcastFileUrl($network, $filename));
+        }
+
+        try {
+            $http = Http::timeout(10);
+
+            if ($token = $this->proxyService->getApiToken()) {
+                $http = $http->withHeaders(['X-API-Token' => $token]);
+            }
+
+            $url = $this->proxyService->getApiBaseUrl()."/broadcast/{$network->uuid}/segment/{$filename}";
+            $response = $http->get($url);
+
+            if (! $response->successful()) {
+                return response('Not available', $response->status());
+            }
+
+            $content = $this->rewriteVariantPlaylist($response->body(), $network);
+
+            return response($content, 200, [
+                'Content-Type' => 'application/vnd.apple.mpegurl',
+                'Cache-Control' => 'no-cache, no-store, must-revalidate',
+                'Pragma' => 'no-cache',
+                'Access-Control-Allow-Origin' => '*',
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Failed to fetch HLS sub-playlist', [
+                'network_id' => $network->id,
+                'filename' => $filename,
+                'error' => $e->getMessage(),
+            ]);
+
+            return response('Not available', 503);
+        }
+    }
+
+    /**
+     * Synthesize an HLS master playlist referencing the video variant (the flat
+     * live.m3u8 FFmpeg already produces) and the subtitle variant (the
+     * live_vtt.m3u8 WebVTT sub-playlist FFmpeg automatically derives whenever a
+     * subtitle stream is mapped — same base filename with a "_vtt" suffix before
+     * the extension). Both are served through hls-variant/ (variant()), which
+     * already knows how to fetch an arbitrary .m3u8 from the proxy and rewrite its
+     * bare segment references back through our domain.
+     *
+     * DEFAULT=NO/AUTOSELECT=YES: available in the player's subtitle menu but not
+     * forced on for every viewer — matches the operator's "make it available"
+     * intent (enabling the preference), not "force it on".
+     *
+     * If the source has no subtitle stream at all, FFmpeg never produces
+     * live_vtt.m3u8 despite subtitles being requested — the URI below then 404s,
+     * which players tolerate by simply not offering that rendition.
+     */
+    protected function buildMasterPlaylistWithSubtitles(Network $network): string
+    {
+        $variantBaseUrl = url("/network/{$network->uuid}/hls-variant");
+
+        return implode("\n", [
+            '#EXTM3U',
+            '#EXT-X-VERSION:3',
+            '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="Subtitle",DEFAULT=NO,AUTOSELECT=YES,URI="'.$variantBaseUrl.'/live_vtt.m3u8"',
+            '#EXT-X-STREAM-INF:BANDWIDTH=1400000,SUBTITLES="subs"',
+            $variantBaseUrl.'/live.m3u8',
+            '',
+        ]);
+    }
+
+    /**
+     * Rewrite a video/subtitle variant sub-playlist's bare .ts/.vtt segment
+     * references so they resolve back through our domain.
+     */
+    protected function rewriteVariantPlaylist(string $playlist, Network $network): string
+    {
+        $variantBaseUrl = url("/network/{$network->uuid}/hls-variant");
+
+        return preg_replace(
+            '/^(live[^\s]*\.(?:ts|vtt))$/m',
+            $variantBaseUrl.'/$1',
+            $playlist
+        );
     }
 
     protected function fetchPlaylistResponse(Network $network): ClientResponse
@@ -178,6 +289,10 @@ class NetworkHlsController extends Controller
             return true;
         }
 
+        // The raw playlist fetched from the proxy is always the flat video
+        // playlist — FFmpeg itself never emits a master playlist (subtitles, when
+        // enabled, are synthesized into one separately by buildMasterPlaylistWithSubtitles()
+        // in playlist(), from the same flat live.m3u8 checked here).
         preg_match_all('/^live\d+\.ts$/m', $playlist, $matches);
         $segmentCount = count($matches[0] ?? []);
 

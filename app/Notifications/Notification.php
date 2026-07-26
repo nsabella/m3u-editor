@@ -3,6 +3,7 @@
 namespace App\Notifications;
 
 use App\Events\TvNotificationEvent;
+use App\Jobs\SendPushNotificationRelay;
 use App\Models\TvNotification;
 use App\Settings\GeneralSettings;
 use Filament\Notifications\Notification as BaseNotification;
@@ -14,7 +15,7 @@ class Notification extends BaseNotification
 {
     public function broadcast(Model|Authenticatable|Collection|array $users): static
     {
-        if ($this->getStatus() === 'success' && app(GeneralSettings::class)->suppress_success_notifications) {
+        if (($this->getStatus() === 'success' || $this->getStatus() === 'info') && app(GeneralSettings::class)->suppress_success_notifications) {
             return $this;
         }
 
@@ -23,7 +24,7 @@ class Notification extends BaseNotification
 
     public function sendToDatabase(Model|Authenticatable|Collection|array $users, bool $isEventDispatched = false): static
     {
-        if ($this->getStatus() === 'success' && app(GeneralSettings::class)->suppress_success_notifications) {
+        if (($this->getStatus() === 'success' || $this->getStatus() === 'info') && app(GeneralSettings::class)->suppress_success_notifications) {
             return $this;
         }
 
@@ -32,7 +33,7 @@ class Notification extends BaseNotification
 
     public function tvBroadcast(Model $playlist, string $channel = 'general', bool $adminOnly = false): static
     {
-        TvNotification::create([
+        $record = TvNotification::create([
             'notifiable_type' => $playlist->getMorphClass(),
             'notifiable_id' => $playlist->id,
             'channel' => $channel,
@@ -43,6 +44,7 @@ class Notification extends BaseNotification
         ]);
 
         broadcast(new TvNotificationEvent(
+            id: $record->id,
             notifiableType: $playlist->getMorphClass(),
             notifiableUuid: $playlist->uuid,
             adminOnly: $adminOnly,
@@ -51,6 +53,13 @@ class Notification extends BaseNotification
             body: $this->getBody() ?? '',
             status: $this->getStatus() ?? 'info',
         ));
+
+        SendPushNotificationRelay::dispatch(
+            $playlist->getMorphClass(),
+            $playlist->id,
+            $this->getTitle() ?? '',
+            $this->getBody(),
+        );
 
         return $this;
     }

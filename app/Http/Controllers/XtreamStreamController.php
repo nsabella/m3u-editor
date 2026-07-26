@@ -13,6 +13,7 @@ use App\Models\PlaylistAlias;
 use App\Models\PlaylistAuth;
 use App\Services\PlaylistService;
 use App\Services\PlaylistUrlService;
+use Carbon\Carbon;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Http\Request;
@@ -20,6 +21,44 @@ use Illuminate\Support\Facades\Redirect;
 
 class XtreamStreamController extends Controller
 {
+    /**
+     * Validate a client-requested transcoding profile (?profile=<id>|none) and stash
+     * the result in request attributes for the proxy controller. Request attributes
+     * are server-side only, so downstream code can trust the resolved value.
+     *
+     * Invalid or unauthorized selections are ignored (playback continues with the
+     * default proxy behavior) rather than failing the stream — a client may hold a
+     * profile the admin has since revoked.
+     */
+    private function applyClientStreamProfile(Request $request, $playlist, ?PlaylistAuth $playlistAuth): void
+    {
+        $requested = $request->input('profile');
+        if ($requested === null || $requested === '') {
+            return;
+        }
+
+        // Explicit direct proxy — suppress the playlist-level default profile.
+        if ($requested === 'none' || $requested === '0') {
+            $request->attributes->set('client_stream_profile', 'none');
+
+            return;
+        }
+
+        if (! is_numeric($requested)) {
+            return;
+        }
+
+        $profileId = (int) $requested;
+
+        // PlaylistAuth users may only use profiles the auth allows; owner/alias
+        // credentials may use any of the playlist owner's profiles.
+        if ($playlistAuth instanceof PlaylistAuth && ! $playlistAuth->allowsProxyStreamProfile($profileId)) {
+            return;
+        }
+
+        $request->attributes->set('client_stream_profile', $profileId);
+    }
+
     /**
      * Authenticates a playlist using either PlaylistAuth credentials or the original method
      * (username = playlist owner's name, password = playlist UUID).
@@ -231,6 +270,7 @@ class XtreamStreamController extends Controller
                 if ($playlistAuth instanceof PlaylistAuth) {
                     $request->merge(['playlist_auth_id' => $playlistAuth->id]);
                 }
+                $this->applyClientStreamProfile($request, $playlist, $playlistAuth);
 
                 // player=true signals an in-app player request — route to channelPlayer
                 // so the in-app transcoding profile is applied instead of the playlist profile
@@ -282,6 +322,7 @@ class XtreamStreamController extends Controller
                 if ($playlistAuth instanceof PlaylistAuth) {
                     $request->merge(['playlist_auth_id' => $playlistAuth->id]);
                 }
+                $this->applyClientStreamProfile($request, $playlist, $playlistAuth);
 
                 // player=true signals an in-app player request — apply in-app transcoding profile
                 $method = $request->input('player') === 'true' ? 'channelPlayer' : 'channel';
@@ -317,6 +358,7 @@ class XtreamStreamController extends Controller
                 if ($playlistAuth instanceof PlaylistAuth) {
                     $request->merge(['playlist_auth_id' => $playlistAuth->id]);
                 }
+                $this->applyClientStreamProfile($request, $playlist, $playlistAuth);
 
                 // player=true signals an in-app player request — apply in-app transcoding profile
                 $method = $request->input('player') === 'true' ? 'episodePlayer' : 'episode';
@@ -391,8 +433,13 @@ class XtreamStreamController extends Controller
             }
         }
 
+        // Convert Unix timestamp to Xtream format if the player sends a numeric date string
+        if (ctype_digit($date)) {
+            $date = Carbon::createFromTimestamp((int) $date)->format('Y-m-d:H-i-s');
+        }
+
         // Parse the date parameter and add timeshift parameters to the request
-        // Date format from Xtream API: YYYY-MM-DD:HH-MM-SS
+        // Expected downstream format: YYYY-MM-DD:HH-MM-SS
         // Also add username for proxy traceability
         $mergeData = [
             'timeshift_duration' => $duration,
@@ -404,14 +451,16 @@ class XtreamStreamController extends Controller
         }
         $request->merge($mergeData);
 
-        if ($playlist->enable_proxy && $playlist->user->canUseProxy()) {
+        if (($playlist->enable_proxy || $request->input('proxy') === 'true') && $playlist->user->canUseProxy()) {
+            $this->applyClientStreamProfile($request, $playlist, $playlistAuth);
+
             return app()->call([app(M3uProxyApiController::class), 'channel'], [
                 'id' => $timeshiftChannel->id,
                 'uuid' => $playlist->uuid,
             ]);
         } else {
             $streamUrl = PlaylistUrlService::getChannelUrl($timeshiftChannel, $playlist);
-            $streamUrl = PlaylistService::generateTimeshiftUrl($request, $streamUrl, $playlist);
+            $streamUrl = PlaylistService::generateTimeshiftUrl($request, $streamUrl, $playlist, $timeshiftChannel);
 
             return Redirect::to($this->applyMediaFlowProxy($streamUrl));
         }
