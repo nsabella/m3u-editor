@@ -31,13 +31,10 @@ services:
       - PG_USER=m3ue
       - PG_PASSWORD=devpass
 
-      # Database Connection
-      - DB_CONNECTION=pgsql
-      - DB_HOST=localhost
-      - DB_PORT=5432
-      - DB_DATABASE=m3ue_dev
-      - DB_USERNAME=m3ue
-      - DB_PASSWORD=devpass
+      # Database Connection (use existing SQLite from old container)
+      - DB_CONNECTION=sqlite
+      - DB_DATABASE=/var/www/config/database/database.sqlite
+      - DB_FOREIGN_KEYS=false
 
       # Redis (embedded)
       - REDIS_ENABLED=true
@@ -57,8 +54,8 @@ services:
       - CLAMAV_UPDATE_DEFINITIONS=${CLAMAV_UPDATE_DEFINITIONS:-false}
       - CLAMAV_TIMEOUT=${CLAMAV_TIMEOUT:-60}
     volumes:
-      # Persistent config data (Docker-managed volume — avoids ExFAT fd limits)
-      - configdata_dev:/var/www/config
+      # Persistent config data (bind-mounted from old container to preserve data)
+      - C:\M3U_Editor\data:/var/www/config
 
       # Plugin scaffolding templates are excluded from the image build context.
       - ./stubs:/var/www/html/stubs:ro
