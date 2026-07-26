@@ -739,21 +739,20 @@ class PlaylistGenerateController extends Controller
         $isCustomContext = $playlist instanceof CustomPlaylist
             || ($playlist instanceof PlaylistAlias && ! empty($playlist->custom_playlist_id));
         if ($isCustomContext) {
-            $orderSubquery = '(SELECT MIN(t.order_column) FROM taggables tb INNER JOIN tags t ON t.id = tb.tag_id WHERE tb.taggable_id = channels.id AND tb.taggable_type = ? AND t.type = ?)';
-
-            $query->selectRaw("{$orderSubquery} as custom_order", [Channel::class, $playlistUuid])
-                ->selectRaw(
-                    '(SELECT t.name FROM taggables tb INNER JOIN tags t ON t.id = tb.tag_id WHERE tb.taggable_id = channels.id AND tb.taggable_type = ? AND t.type = ? ORDER BY t.order_column ASC LIMIT 1) as custom_group_name',
-                    [Channel::class, $playlistUuid]
-                )
-                ->orderByRaw("COALESCE({$orderSubquery}, groups.sort_order)", [Channel::class, $playlistUuid])
+            // Select the first custom group name as a fallback (used when no tags are loaded).
+            // Multi-group emission is handled in PHP by iterating through $channel->tags,
+            // so no LEFT JOIN to taggables/tags is needed here.
+            $query->selectRaw(
+                '(SELECT t.name FROM taggables tb INNER JOIN tags t ON t.id = tb.tag_id WHERE tb.taggable_id = channels.id AND tb.taggable_type = ? AND t.type = ? ORDER BY t.order_column ASC LIMIT 1) as custom_group_name',
+                [Channel::class, $playlistUuid]
+            )
+                // Pivot sort (per-playlist channel position) is the primary ordering key.
+                // This ensures channels appear at their saved position regardless of group membership.
                 ->orderByRaw('COALESCE(channel_custom_playlist.sort, channels.sort)')
-                ->orderByRaw('COALESCE(channel_custom_playlist.channel_number, channels.channel)')
+                ->orderBy('channels.channel')
                 ->orderBy('channels.title');
 
             // Eager load all group tags for this playlist (for multi-group output).
-            // Uses a separate query (not a JOIN) so there is no cartesian explosion;
-            // Laravel issues one batch SELECT for all tags across all channels.
             $query->with(['tags' => function ($q) use ($playlistUuid): void {
                 $q->where('type', $playlistUuid)
                     ->orderBy('order_column');
