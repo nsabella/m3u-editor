@@ -20,6 +20,7 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\HasManyThrough;
 use Illuminate\Database\Eloquent\Relations\MorphMany;
+use Illuminate\Database\Eloquent\Relations\MorphToMany;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\URL;
 use Illuminate\Support\Str;
@@ -31,6 +32,18 @@ class Channel extends Model
 {
     use HasFactory;
     use HasTags;
+
+    /**
+     * Override the HasTags trait's tags() relationship to include the `sort` pivot column.
+     * Spatie Tags does NOT call withPivot() by default, so without this override
+     * $tag->pivot->sort will not be populated even after the taggables.sort column exists.
+     *
+     * @return MorphToMany
+     */
+    public function tags(): MorphToMany
+    {
+        return parent::tags()->withPivot('sort');
+    }
 
     /**
      * The attributes that should be cast to native types.
