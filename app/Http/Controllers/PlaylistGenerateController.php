@@ -753,9 +753,12 @@ class PlaylistGenerateController extends Controller
                 ->orderBy('channels.title');
 
             // Eager load all group tags for this playlist (for multi-group output).
+            // withPivot() is redundant here since Channel::tags() already declares it (Step 3),
+            // but kept explicit to document the intent and protect against trait behavior changes.
             $query->with(['tags' => function ($q) use ($playlistUuid): void {
                 $q->where('type', $playlistUuid)
-                    ->orderBy('order_column');
+                    ->orderBy('order_column')
+                    ->withPivot('sort');
             }]);
         } else {
             // Per-alias custom live group ordering (optional). When enabled, the
