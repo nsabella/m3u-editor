@@ -118,8 +118,13 @@ class AutoSyncGroupsToCustomPlaylist implements ShouldQueue
                         // assignments.
                         if ($mode === 'original') {
                             $item->detachTags($playlistTags);
+                            $item->tags()->attach($tag->id, ['sort' => null]);
+                        } else {
+                            // select/create — only attach if not already attached (preserve existing sort).
+                            if (! $item->tags()->where('tags.id', $tag->id)->exists()) {
+                                $item->tags()->attach($tag->id, ['sort' => null]);
+                            }
                         }
-                        $item->attachTag($tag);
                     }
                 }
             });
