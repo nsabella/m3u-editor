@@ -789,6 +789,63 @@ class PlaylistGenerateController extends Controller
     }
 
     /**
+     * Build a flat, sorted list of (channel, tag) emission entries.
+     *
+     * Each entry represents one line in the M3U output or one stream in Xtream API.
+     * Multi-group channels produce multiple entries, each with its own sort position.
+     *
+     * @param  \Illuminate\Support\Collection  $channels  Channels from getChannelQuery()
+     * @param  string  $playlistUuid  The custom playlist UUID for tag filtering
+     * @return array  Sorted array of emission entries
+     */
+    public static function buildSortedEmissionList($channels, string $playlistUuid): array
+    {
+        $entries = [];
+
+        foreach ($channels as $channel) {
+            $tags = $channel->tags; // Already filtered by playlist UUID via eager load
+
+            if ($tags->isEmpty()) {
+                // Channel has no group tags — emit once with fallback sort
+                $entries[] = [
+                    'channel' => $channel,
+                    'tag' => null,
+                    'sort' => $channel->sort ?? PHP_INT_MAX,
+                    'group_name' => $channel->custom_group_name ?? '',
+                    'group_id' => null,
+                ];
+            } else {
+                // Emit one entry per tag, each with its own sort position
+                foreach ($tags as $tag) {
+                    $tagName = is_array($tag->name) ? ($tag->name['en'] ?? reset($tag->name)) : $tag->name;
+                    $entries[] = [
+                        'channel' => $channel,
+                        'tag' => $tag,
+                        // Per-group sort from taggables.sort → fallback to global channel sort
+                        'sort' => $tag->pivot->sort ?? $channel->sort ?? PHP_INT_MAX,
+                        'group_name' => $tagName,
+                        'group_id' => $tag->id,  // Needed for Xtream API category_id
+                    ];
+                }
+            }
+        }
+
+        // Sort by sort value, then by channel name as tiebreaker
+        usort($entries, function ($a, $b) {
+            $sortCompare = $a['sort'] <=> $b['sort'];
+            if ($sortCompare !== 0) return $sortCompare;
+            // Tiebreaker: channel number, then title
+            $chanA = $a['channel']->channel ?? '';
+            $chanB = $b['channel']->channel ?? '';
+            $chanCompare = $chanA <=> $chanB;
+            if ($chanCompare !== 0) return $chanCompare;
+            return ($a['channel']->title ?? '') <=> ($b['channel']->title ?? '');
+        });
+
+        return $entries;
+    }
+
+    /**
      * Generate M3U output for a network playlist (outputs networks instead of channels).
      */
     protected function generateNetworkPlaylist(Request $request, Playlist $playlist)
