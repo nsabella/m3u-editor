@@ -736,6 +736,7 @@ class PlaylistGenerateController extends Controller
             )
                 // Pivot sort (per-playlist channel position) is the primary ordering key.
                 // This ensures channels appear at their saved position regardless of group membership.
+                ->selectRaw('channel_custom_playlist.sort as ccp_sort')
                 ->orderByRaw('COALESCE(channel_custom_playlist.sort, channels.sort)')
                 ->orderBy('channels.channel')
                 ->orderBy('channels.title');
@@ -809,8 +810,8 @@ class PlaylistGenerateController extends Controller
                 $entries[] = [
                     'channel' => $channel,
                     'tag' => null,
-                    // Per-group sort from taggables.sort → fallback to global channel sort
-                    'sort' => $channel->sort ?? PHP_INT_MAX,
+                    // Per-group sort from taggables.sort → fallback to pivot sort (ccp_sort) → fallback to channel sort
+                    'sort' => $channel->ccp_sort ?? $channel->sort ?? PHP_INT_MAX,
                     'group_name' => $groupName,
                     'group_id' => null,
                 ];
@@ -821,8 +822,8 @@ class PlaylistGenerateController extends Controller
                     $entries[] = [
                         'channel' => $channel,
                         'tag' => $tag,
-                        // Per-group sort from taggables.sort → fallback to global channel sort
-                        'sort' => $tag->pivot->sort ?? $channel->sort ?? PHP_INT_MAX,
+                        // Per-group sort from taggables.sort → fallback to pivot sort (ccp_sort) → fallback to channel sort
+                        'sort' => $tag->pivot->sort ?? $channel->ccp_sort ?? $channel->sort ?? PHP_INT_MAX,
                         'group_name' => $tagName,
                         'group_id' => $tag->id,  // Needed for Xtream API category_id
                     ];
