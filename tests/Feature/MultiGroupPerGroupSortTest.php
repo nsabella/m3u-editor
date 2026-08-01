@@ -722,7 +722,7 @@ it('auto-sync select mode preserves existing sort and assigns NULL to new tags',
 
     foreach ($newTags as $tag) {
         // If this is a new tag (not the original Sports), sort should be NULL.
-        if (\DB::table('tags')->where('id', $tag->tag_id)->value('name') !== 'Sports') {
+        if (\DB::table('tags')->where('id', $tag->tag_id)->value('name') !== json_encode(['en' => 'Sports'])) {
             expect($tag->sort)->toBeNull();
         }
     }
