@@ -105,11 +105,20 @@ class PlaylistGenerateController extends Controller
 
         // Build the channel query
         $channels = self::getChannelQuery($playlist);
-        $cursor = $channels->cursor();
+        // Get all channels at once for global sort ordering (replaces cursor() streaming).
+        // Memory trade-off: ~10-20MB for 10k channels × 2 groups avg — acceptable.
+        $channelCollection = $channels->get();
 
-        // Get all active channels
+        // Resolve the custom playlist UUID used by buildSortedEmissionList() to filter tags.
+        $playlistUuid = ($playlist instanceof PlaylistAlias && $playlist->custom_playlist_id)
+            ? ($playlist->customPlaylist?->uuid ?? $playlist->uuid)
+            : $playlist->uuid;
+
+        // Build sorted emission list (per-group sort from taggables.sort → fallback to channel sort).
+        $entries = self::buildSortedEmissionList($channelCollection, $playlistUuid);
+
         return response()->stream(
-            function () use ($cursor, $baseUrl, $playlist, $proxyEnabled, $logoProxyEnabled, $type, $tvgTypeoutputEnabled, $usedAuth, $mfRewriteEnabled) {
+            function () use ($entries, $baseUrl, $playlist, $proxyEnabled, $logoProxyEnabled, $type, $tvgTypeoutputEnabled, $usedAuth, $mfRewriteEnabled) {
                 // Set the auth details
                 if ($usedAuth) {
                     $username = urlencode($usedAuth->username);
@@ -119,12 +128,22 @@ class PlaylistGenerateController extends Controller
                     $password = urlencode($playlist->uuid);
                 }
 
-                // Output the enabled channels
+                // Output the enabled channels (sorted by per-group sort position).
                 $epgUrl = route('epg.generate', ['uuid' => $playlist->uuid]);
                 echo "#EXTM3U x-tvg-url=\"$epgUrl\" \n";
                 $channelNumber = $playlist->auto_channel_increment ? $playlist->channel_start - 1 : 0;
                 $idChannelBy = $playlist->id_channel_by;
-                foreach ($cursor as $channel) {
+
+                // Track assigned channel numbers to prevent drift for multi-group channels.
+                // A channel in N groups gets the same `channelNo` for all N entries, not N
+                // incrementing values that would shift subsequent numbering.
+                $assignedChannelNumbers = [];
+
+                foreach ($entries as $entry) {
+                    // Channel and group come from the sorted emission list.
+                    $channel = $entry['channel'];
+                    $group = $entry['group_name'];
+
                     // Get the title and name
                     $title = $channel->title_custom ?? $channel->title;
                     $name = $channel->name_custom ?? $channel->name;
@@ -134,54 +153,25 @@ class PlaylistGenerateController extends Controller
                     $epgIconCustom = $channel->epg_icon_custom ?? null;
                     $isCustomContext = ($type === 'custom') || ($type === 'alias' && ! empty($playlist->custom_playlist_id));
 
-                    $channelNo = ($isCustomContext && ! empty($channel->pivot?->channel_number))
-                        ? (int) $channel->pivot->channel_number
-                        : $channel->channel;
+                    // Channel number is shared across all group instances for this channel.
+                    $channelId = $channel->id;
+                    if (isset($assignedChannelNumbers[$channelId])) {
+                        $channelNo = $assignedChannelNumbers[$channelId];
+                    } else {
+                        $channelNo = ($isCustomContext && ! empty($channel->pivot?->channel_number))
+                            ? (int) $channel->pivot->channel_number
+                            : $channel->channel;
+
+                        if (! $channelNo && ($playlist->auto_channel_increment || $idChannelBy === PlaylistChannelId::Number)) {
+                            $channelNo = ++$channelNumber;
+                        }
+
+                        $assignedChannelNumbers[$channelId] = $channelNo;
+                    }
+
                     $timeshift = $channel->shift ?? 0;
                     $stationId = $channel->station_id ?? '';
                     $epgShift = $channel->tvg_shift ?? 0;
-                    // Determine the list of group names to emit (multi-group support).
-                    $groupNames = [];
-                    if ($type === 'custom' || ($type === 'alias' && ! empty($channel->custom_group_name))) {
-                        // Custom context: use all tags for this playlist.
-                        $tagNames = $channel->tags?->pluck('name') ?? collect();
-                        foreach ($tagNames as $tagName) {
-                            if (empty($tagName)) {
-                                continue;
-                            }
-
-                            $decoded = json_decode($tagName, true);
-                            if (! is_array($decoded)) {
-                                // Plain string tag name — use it directly.
-                                $groupNames[] = $tagName;
-
-                                continue;
-                            }
-
-                            $groupNames[] = $decoded['en'] ?? ($decoded[array_key_first($decoded)] ?? '');
-                        }
-                        // If no tags found, fall back to source group.
-                        if (empty($groupNames) && ! empty($channel->custom_group_name)) {
-                            $groupName = json_decode($channel->custom_group_name, true);
-                            if (! is_array($groupName)) {
-                                $groupNames[] = $channel->custom_group_name;
-                            } else {
-                                $groupNames[] = $groupName['en'] ?? ($groupName[array_key_first($groupName)] ?? '');
-                            }
-                        }
-                    }
-
-                    if (empty($groupNames)) {
-                        $groupNames = [$channel->group ?? ''];
-                    }
-
-                    // Channel number is shared across all group instances for this channel.
-                    $channelNo = ($isCustomContext && ! empty($channel->pivot?->channel_number))
-                        ? (int) $channel->pivot->channel_number
-                        : $channel->channel;
-                    if (! $channelNo && ($playlist->auto_channel_increment || $idChannelBy === PlaylistChannelId::Number)) {
-                        $channelNo = ++$channelNumber;
-                    }
 
                     // Get the TVG ID
                     switch ($idChannelBy) {
@@ -257,29 +247,27 @@ class PlaylistGenerateController extends Controller
                     // Make sure TVG ID only contains characters and numbers
                     $tvgId = preg_replace(config('dev.tvgid.regex'), '', $tvgId);
 
-                    // Emit one EXTINF + URL per group (multi-group support).
-                    foreach ($groupNames as $group) {
-                        $this->emitChannelOutput(
-                            playlist: $playlist,
-                            channel: $channel,
-                            title: $title,
-                            name: $name,
-                            url: $url,
-                            group: $group,
-                            channelNo: $channelNo,
-                            tvgId: $tvgId,
-                            icon: $icon,
-                            timeshift: $timeshift,
-                            stationId: $stationId,
-                            epgShift: $epgShift,
-                            proxyEnabled: $proxyEnabled,
-                            useInternalXtreamFormat: $useInternalXtreamFormat,
-                            tvgTypeoutputEnabled: $tvgTypeoutputEnabled,
-                            baseUrl: $baseUrl,
-                            username: $username,
-                            password: $password,
-                        );
-                    }
+                    // Emit one EXTINF + URL per entry (one group per emission).
+                    $this->emitChannelOutput(
+                        playlist: $playlist,
+                        channel: $channel,
+                        title: $title,
+                        name: $name,
+                        url: $url,
+                        group: $group,
+                        channelNo: $channelNo,
+                        tvgId: $tvgId,
+                        icon: $icon,
+                        timeshift: $timeshift,
+                        stationId: $stationId,
+                        epgShift: $epgShift,
+                        proxyEnabled: $proxyEnabled,
+                        useInternalXtreamFormat: $useInternalXtreamFormat,
+                        tvgTypeoutputEnabled: $tvgTypeoutputEnabled,
+                        baseUrl: $baseUrl,
+                        username: $username,
+                        password: $password,
+                    );
                 }
 
                 // If the playlist includes series in M3U, include the series episodes
@@ -806,12 +794,24 @@ class PlaylistGenerateController extends Controller
             $tags = $channel->tags; // Already filtered by playlist UUID via eager load
 
             if ($tags->isEmpty()) {
-                // Channel has no group tags — emit once with fallback sort
+                // Channel has no group tags — emit once with fallback.
+                // For custom playlists: use custom_group_name from SQL subquery (or '' if unset).
+                // For standard/merged playlists: use group from LEFT JOIN groups.
+                $groupName = $channel->custom_group_name ?? $channel->group ?? '';
+                // Handle JSON-encoded tag names in the custom_group_name subquery result.
+                if (!empty($groupName)) {
+                    $decoded = json_decode($groupName, true);
+                    if (is_array($decoded) && !json_last_error()) {
+                        $groupName = $decoded['en'] ?? ($decoded[array_key_first($decoded)] ?? '');
+                    }
+                }
+
                 $entries[] = [
                     'channel' => $channel,
                     'tag' => null,
+                    // Per-group sort from taggables.sort → fallback to global channel sort
                     'sort' => $channel->sort ?? PHP_INT_MAX,
-                    'group_name' => $channel->custom_group_name ?? '',
+                    'group_name' => $groupName,
                     'group_id' => null,
                 ];
             } else {
