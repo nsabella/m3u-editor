@@ -35,7 +35,11 @@ class Series extends Model
      */
     public function tags(): MorphToMany
     {
-        return parent::tags()->withPivot('sort');
+        return $this->morphToMany(
+            config('tags.tag_model', \Spatie\Tags\Tag::class),
+            'taggable',
+            'taggables',
+        )->withPivot('sort')->ordered();
     }
 
     /**
