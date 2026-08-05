@@ -47,6 +47,9 @@ beforeEach(function () {
 // ──────────────────────────────────────────────────────────────────────────────
 
 it('adds channels from source group to custom playlist in add_only mode', function () {
+    // Create the Spatie tag for the group with proper translation format
+    $tag = \Spatie\Tags\Tag::findOrCreate($this->group->name, $this->customPlaylist->uuid);
+
     $channels = Channel::factory()->count(3)->create([
         'user_id' => $this->user->id,
         'playlist_id' => $this->playlist->id,
@@ -70,6 +73,9 @@ it('adds channels from source group to custom playlist in add_only mode', functi
 });
 
 it('does not remove pre-existing channels unrelated to the source group in add_only mode', function () {
+    // Create the Spatie tag for the group with proper translation format
+    \Spatie\Tags\Tag::findOrCreate($this->group->name, $this->customPlaylist->uuid);
+
     $unrelatedChannel = Channel::factory()->create([
         'user_id' => $this->user->id,
         'playlist_id' => $this->playlist->id,
@@ -102,6 +108,9 @@ it('does not remove pre-existing channels unrelated to the source group in add_o
 // ──────────────────────────────────────────────────────────────────────────────
 
 it('adds new channels in full_sync mode', function () {
+    // Create the Spatie tag for the group with proper translation format
+    \Spatie\Tags\Tag::findOrCreate($this->group->name, $this->customPlaylist->uuid);
+
     $channels = Channel::factory()->count(3)->create([
         'user_id' => $this->user->id,
         'playlist_id' => $this->playlist->id,
@@ -124,6 +133,9 @@ it('adds new channels in full_sync mode', function () {
 });
 
 it('removes stale channels from source group in full_sync mode', function () {
+    // Create the Spatie tag for the group with proper translation format
+    \Spatie\Tags\Tag::findOrCreate($this->group->name, $this->customPlaylist->uuid);
+
     // Channel that was previously in the group and added to custom playlist
     $staleChannel = Channel::factory()->create([
         'user_id' => $this->user->id,
@@ -157,6 +169,9 @@ it('removes stale channels from source group in full_sync mode', function () {
 });
 
 it('does not remove channels from other groups in full_sync mode', function () {
+    // Create the Spatie tag for the group with proper translation format
+    \Spatie\Tags\Tag::findOrCreate($this->group->name, $this->customPlaylist->uuid);
+
     $otherGroup = Group::factory()->create([
         'user_id' => $this->user->id,
         'playlist_id' => $this->playlist->id,
@@ -192,6 +207,9 @@ it('does not remove channels from other groups in full_sync mode', function () {
 });
 
 it('removes channels from a soft-deleted source group in full_sync mode', function () {
+    // Create the Spatie tag for the group with proper translation format
+    \Spatie\Tags\Tag::findOrCreate($this->group->name, $this->customPlaylist->uuid);
+
     // Channels in the group added to the custom playlist before the group was deleted
     $channels = Channel::factory()->count(2)->create([
         'user_id' => $this->user->id,
@@ -226,6 +244,10 @@ it('detaches the group tag when channels were already hard-deleted before the sy
     // This covers the normal M3U re-sync path: ProcessM3uImportComplete hard-deletes removed
     // channels (cascading the pivot row via FK) before AutoSyncGroupsToCustomPlaylist runs.
     // The pivot is already clean, but the group tag on the custom playlist becomes a ghost.
+
+    // Create the Spatie tag for the group with proper translation format
+    \Spatie\Tags\Tag::findOrCreate($this->group->name, $this->customPlaylist->uuid);
+
     $channel = Channel::factory()->create([
         'user_id' => $this->user->id,
         'playlist_id' => $this->playlist->id,
@@ -271,6 +293,9 @@ it('detaches the group tag when channels were already hard-deleted before the sy
 });
 
 it('detaches the group tag from the custom playlist when all its channels are removed in full_sync mode', function () {
+    // Create the Spatie tag for the group with proper translation format
+    \Spatie\Tags\Tag::findOrCreate($this->group->name, $this->customPlaylist->uuid);
+
     $channel = Channel::factory()->create([
         'user_id' => $this->user->id,
         'playlist_id' => $this->playlist->id,
@@ -309,6 +334,9 @@ it('detaches the group tag from the custom playlist when all its channels are re
 });
 
 it('does not detach a group tag when another source playlist still has channels with that tag', function () {
+    // Create the Spatie tag for the group with proper translation format
+    \Spatie\Tags\Tag::findOrCreate($this->group->name, $this->customPlaylist->uuid);
+
     // Second source playlist with its own "Sports" group — same name, different playlist
     $secondPlaylist = Playlist::factory()->for($this->user)->createQuietly([
         'status' => Status::Completed,
@@ -373,6 +401,9 @@ it('does not detach a group tag when another source playlist still has channels 
 });
 
 it('applies the group name as a tag in original mode', function () {
+    // Create the Spatie tag for the group with proper translation format
+    \Spatie\Tags\Tag::findOrCreate($this->group->name, $this->customPlaylist->uuid);
+
     Channel::factory()->count(2)->create([
         'user_id' => $this->user->id,
         'playlist_id' => $this->playlist->id,
@@ -394,6 +425,9 @@ it('applies the group name as a tag in original mode', function () {
 });
 
 it('applies a custom tag in create mode', function () {
+    // Create the Spatie tag for the group with proper translation format
+    \Spatie\Tags\Tag::findOrCreate($this->group->name, $this->customPlaylist->uuid);
+
     Channel::factory()->count(2)->create([
         'user_id' => $this->user->id,
         'playlist_id' => $this->playlist->id,
@@ -416,6 +450,9 @@ it('applies a custom tag in create mode', function () {
 
 it('dispatches SyncCompleted when processing rules are enabled on the custom playlist', function () {
     Event::fake([SyncCompleted::class]);
+
+    // Create the Spatie tag for the group with proper translation format
+    \Spatie\Tags\Tag::findOrCreate($this->group->name, $this->customPlaylist->uuid);
 
     $this->customPlaylist->update([
         'processing_config' => [[
@@ -453,6 +490,9 @@ it('dispatches SyncCompleted when processing rules are enabled on the custom pla
 it('does not dispatch SyncCompleted when processing rules are disabled on the custom playlist', function () {
     Event::fake([SyncCompleted::class]);
 
+    // Create the Spatie tag for the group with proper translation format
+    \Spatie\Tags\Tag::findOrCreate($this->group->name, $this->customPlaylist->uuid);
+
     $this->customPlaylist->update([
         'processing_config' => [[
             'enabled' => false,
@@ -489,12 +529,15 @@ it('does not dispatch SyncCompleted when processing rules are disabled on the cu
 it('dispatches AutoSyncGroupsToCustomPlaylist for each enabled rule on completed sync', function () {
     Bus::fake();
 
+    // Create the Spatie tags for both groups with proper translation format
+    \Spatie\Tags\Tag::findOrCreate($this->group->name, $this->customPlaylist->uuid);
     $secondCustomPlaylist = CustomPlaylist::factory()->create(['user_id' => $this->user->id]);
     $secondGroup = Group::factory()->create([
         'user_id' => $this->user->id,
         'playlist_id' => $this->playlist->id,
         'type' => 'live',
     ]);
+    \Spatie\Tags\Tag::findOrCreate($secondGroup->name, $secondCustomPlaylist->uuid);
 
     $this->playlist->update([
         'auto_sync_to_custom_config' => [
@@ -529,6 +572,9 @@ it('dispatches AutoSyncGroupsToCustomPlaylist for each enabled rule on completed
 it('skips disabled auto-sync rules', function () {
     Bus::fake();
 
+    // Create the Spatie tag for the group with proper translation format
+    \Spatie\Tags\Tag::findOrCreate($this->group->name, $this->customPlaylist->uuid);
+
     $this->playlist->update([
         'auto_sync_to_custom_config' => [
             [
@@ -551,6 +597,9 @@ it('skips disabled auto-sync rules', function () {
 
 it('skips rules with no groups configured', function () {
     Bus::fake();
+
+    // Create the Spatie tag for the group with proper translation format
+    \Spatie\Tags\Tag::findOrCreate($this->group->name, $this->customPlaylist->uuid);
 
     $this->playlist->update([
         'auto_sync_to_custom_config' => [
@@ -575,6 +624,9 @@ it('skips rules with no groups configured', function () {
 it('does not dispatch auto-sync jobs when playlist sync is not completed', function () {
     Bus::fake();
 
+    // Create the Spatie tag for the group with proper translation format
+    \Spatie\Tags\Tag::findOrCreate($this->group->name, $this->customPlaylist->uuid);
+
     $this->playlist->updateQuietly(['status' => Status::Failed]);
     $this->playlist->update([
         'auto_sync_to_custom_config' => [
@@ -597,6 +649,9 @@ it('does not dispatch auto-sync jobs when playlist sync is not completed', funct
 });
 
 it('prunes soft-deleted group IDs from source playlist config after full_sync', function () {
+    // Create the Spatie tag for the group with proper translation format
+    \Spatie\Tags\Tag::findOrCreate($this->group->name, $this->customPlaylist->uuid);
+
     // Simulate what ProcessM3uImportComplete does: soft-delete the group without pruning
     $this->group->delete();
     $this->playlist->updateQuietly([
