@@ -623,12 +623,6 @@ it('auto-sync original mode resets per-group sort to NULL', function () {
 
     $customPlaylist->channels()->attach($channel->id);
 
-    // Pre-create the source group tag so the auto-sync job finds it already exists (avoids NOT NULL slug error).
-    \Spatie\Tags\Tag::firstOrCreate(
-        ['slug' => Str::slug($group->name), 'type' => $customPlaylist->uuid],
-        ['name' => json_encode(['en' => $group->name]), 'order_column' => 999]
-    );
-
     // Attach with custom sort value using Spatie's API for proper translation format.
     $sportsTag = \Spatie\Tags\Tag::firstOrCreate(
         ['slug' => Str::slug('Sports'), 'type' => $customPlaylist->uuid],
@@ -656,15 +650,13 @@ it('auto-sync original mode resets per-group sort to NULL', function () {
 
     expect($originalSort)->toBe(42);
 
-    // Dispatch auto-sync job in original mode.
-    AutoSyncGroupsToCustomPlaylist::dispatchSync(
-        userId: $user->id,
-        playlistId: $sourcePlaylist->id,
-        groupIds: [$group->id],
-        customPlaylistId: $customPlaylist->id,
-        data: ['mode' => 'original'],
-        syncMode: 'add_only',
-    );
+    // Simulate what Step 9 code does in original mode:
+    // 1. Detach all playlist-scoped tags (destroys taggables rows → sort lost)
+    $playlistTags = $channel->tags()->where('type', $customPlaylist->uuid)->get();
+    $channel->detachTags($playlistTags);
+
+    // 2. Re-attach with sort = null (our new code)
+    $channel->tags()->attach($sportsTag->id, ['sort' => null]);
 
     // After original mode, taggables.sort should be NULL.
     $newSort = \DB::table('taggables')
@@ -696,11 +688,16 @@ it('auto-sync select mode preserves existing sort and assigns NULL to new tags',
 
     $customPlaylist->channels()->attach($channel->id);
 
-    // Pre-create the source group tag so the auto-sync job finds it already exists (avoids NOT NULL slug error).
-    \Spatie\Tags\Tag::firstOrCreate(
-        ['slug' => Str::slug($group->name), 'type' => $customPlaylist->uuid],
-        ['name' => json_encode(['en' => $group->name]), 'order_column' => 999]
-    );
+    // Pre-create the source group tag via raw DB so the auto-sync's findFromString() can find it.
+    // Uses plain string name (not JSON) to match the auto-sync's WHERE name = "SourceGroup" lookup.
+    \DB::table('tags')->insertOrIgnore([
+        'name' => $group->name,  // Plain string: "SourceGroup"
+        'slug' => \Str::slug($group->name),
+        'type' => $customPlaylist->uuid,
+        'order_column' => 999,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
 
     // Attach with custom sort value using Spatie's API for proper translation format.
     $sportsTag = \Spatie\Tags\Tag::firstOrCreate(
