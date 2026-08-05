@@ -56,14 +56,14 @@ function outputCreateMultiGroupChannel(CustomPlaylist $playlist, Group $group, a
         $tagId = outputCreateTagWithOrder($playlist, $name, $i + 1);
 
         // Attach to Channel
-        \DB::table('taggables')->insert([
+        \DB::table('taggables')->insertOrIgnore([
             'tag_id' => $tagId,
             'taggable_type' => Channel::class,
             'taggable_id' => $channel->id,
         ]);
 
         // ALSO attach to CustomPlaylist (required for get_live_categories).
-        \DB::table('taggables')->insert([
+        \DB::table('taggables')->insertOrIgnore([
             'tag_id' => $tagId,
             'taggable_type' => $playlist->getMorphClass(),
             'taggable_id' => $playlist->id,
@@ -94,14 +94,14 @@ function outputCreateSingleGroupChannel(CustomPlaylist $playlist, Group $group):
     $tagId = outputCreateTagWithOrder($playlist, 'Sports', 1);
 
     // Attach to Channel
-    \DB::table('taggables')->insert([
+    \DB::table('taggables')->insertOrIgnore([
         'tag_id' => $tagId,
         'taggable_type' => Channel::class,
         'taggable_id' => $channel->id,
     ]);
 
     // ALSO attach to CustomPlaylist (required for get_live_categories).
-    \DB::table('taggables')->insert([
+    \DB::table('taggables')->insertOrIgnore([
         'tag_id' => $tagId,
         'taggable_type' => $playlist->getMorphClass(),
         'taggable_id' => $playlist->id,

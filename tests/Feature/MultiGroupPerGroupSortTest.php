@@ -75,7 +75,7 @@ function perGroupSortCreateMultiGroupChannel(
         $tagId = perGroupSortCreateTag($customPlaylist, $tagName);
 
         // Attach to Channel with custom sort value.
-        \DB::table('taggables')->insert([
+        \DB::table('taggables')->insertOrIgnore([
             'tag_id' => $tagId,
             'taggable_type' => Channel::class,
             'taggable_id' => $channel->id,
@@ -83,7 +83,7 @@ function perGroupSortCreateMultiGroupChannel(
         ]);
 
         // ALSO attach to CustomPlaylist (required for get_live_categories).
-        \DB::table('taggables')->insert([
+        \DB::table('taggables')->insertOrIgnore([
             'tag_id' => $tagId,
             'taggable_type' => $customPlaylist->getMorphClass(),
             'taggable_id' => $customPlaylist->id,
@@ -239,7 +239,7 @@ it('multiple channels in same group sorted by per-group sort values', function (
     $sportsTagId = perGroupSortCreateTag($customPlaylist, "Sports");
 
     // Attach the shared tag to the custom playlist once.
-    \DB::table('taggables')->insert([
+    \DB::table('taggables')->insertOrIgnore([
         'tag_id' => $sportsTagId,
         'taggable_type' => $customPlaylist->getMorphClass(),
         'taggable_id' => $customPlaylist->id,
@@ -257,7 +257,7 @@ it('multiple channels in same group sorted by per-group sort values', function (
         $customPlaylist->channels()->attach($channel->id);
 
         // Attach to custom playlist with sort value.
-        \DB::table('taggables')->insert([
+        \DB::table('taggables')->insertOrIgnore([
             'tag_id' => $sportsTagId,
             'taggable_type' => Channel::class,
             'taggable_id' => $channel->id,
@@ -311,13 +311,13 @@ it('mixed channels with and without per-group sort interleaved correctly', funct
 
     $customPlaylist->channels()->attach($channelB->id);
 
-    \DB::table('taggables')->insert([
+    \DB::table('taggables')->insertOrIgnore([
         'tag_id' => perGroupSortCreateTag($customPlaylist, "Sports"),
         'taggable_type' => Channel::class,
         'taggable_id' => $channelB->id,
     ]);
 
-    \DB::table('taggables')->insert([
+    \DB::table('taggables')->insertOrIgnore([
         'tag_id' => perGroupSortCreateTag($customPlaylist, "Sports"),
         'taggable_type' => $customPlaylist->getMorphClass(),
         'taggable_id' => $customPlaylist->id,
@@ -332,14 +332,14 @@ it('mixed channels with and without per-group sort interleaved correctly', funct
 
     $customPlaylist->channels()->attach($channelC->id);
 
-    \DB::table('taggables')->insert([
+    \DB::table('taggables')->insertOrIgnore([
         'tag_id' => perGroupSortCreateTag($customPlaylist, "Sports"),
         'taggable_type' => Channel::class,
         'taggable_id' => $channelC->id,
         'sort' => 10,
     ]);
 
-    \DB::table('taggables')->insert([
+    \DB::table('taggables')->insertOrIgnore([
         'tag_id' => perGroupSortCreateTag($customPlaylist, "Sports"),
         'taggable_type' => $customPlaylist->getMorphClass(),
         'taggable_id' => $customPlaylist->id,
@@ -383,14 +383,14 @@ it('Xtream API output mirrors M3U sort order via buildSortedEmissionList()', fun
 
         $customPlaylist->channels()->attach($channel->id);
 
-        \DB::table('taggables')->insert([
+        \DB::table('taggables')->insertOrIgnore([
             'tag_id' => perGroupSortCreateTag($customPlaylist, "Sports"),
             'taggable_type' => Channel::class,
             'taggable_id' => $channel->id,
             'sort' => ($i + 1) * 5, // 5, 10
         ]);
 
-        \DB::table('taggables')->insert([
+        \DB::table('taggables')->insertOrIgnore([
             'tag_id' => perGroupSortCreateTag($customPlaylist, "Sports"),
             'taggable_type' => $customPlaylist->getMorphClass(),
             'taggable_id' => $customPlaylist->id,
@@ -471,13 +471,13 @@ it('all NULL taggables.sort produces same output as before (pivot sort)', functi
             ->update(['sort' => ($i + 1) * 5]); // 5, 10
 
         // Attach with NULL sort (no taggables.sort).
-        \DB::table('taggables')->insert([
+        \DB::table('taggables')->insertOrIgnore([
             'tag_id' => perGroupSortCreateTag($customPlaylist, "Sports"),
             'taggable_type' => Channel::class,
             'taggable_id' => $channel->id,
         ]);
 
-        \DB::table('taggables')->insert([
+        \DB::table('taggables')->insertOrIgnore([
             'tag_id' => perGroupSortCreateTag($customPlaylist, "Sports"),
             'taggable_type' => $customPlaylist->getMorphClass(),
             'taggable_id' => $customPlaylist->id,
@@ -567,14 +567,14 @@ it('two channels with identical sort values are tiebroken by channel name', func
         $customPlaylist->channels()->attach($channel->id);
 
         // Attach with same sort value.
-        \DB::table('taggables')->insert([
+        \DB::table('taggables')->insertOrIgnore([
             'tag_id' => perGroupSortCreateTag($customPlaylist, "Sports"),
             'taggable_type' => Channel::class,
             'taggable_id' => $channel->id,
             'sort' => 50, // Same sort value for both.
         ]);
 
-        \DB::table('taggables')->insert([
+        \DB::table('taggables')->insertOrIgnore([
             'tag_id' => perGroupSortCreateTag($customPlaylist, "Sports"),
             'taggable_type' => $customPlaylist->getMorphClass(),
             'taggable_id' => $customPlaylist->id,
@@ -621,14 +621,14 @@ it('auto-sync original mode resets per-group sort to NULL', function () {
     $customPlaylist->channels()->attach($channel->id);
 
     // Attach with custom sort value.
-    \DB::table('taggables')->insert([
+    \DB::table('taggables')->insertOrIgnore([
         'tag_id' => perGroupSortCreateTag($customPlaylist, "Sports"),
         'taggable_type' => Channel::class,
         'taggable_id' => $channel->id,
         'sort' => 42, // Custom sort value.
     ]);
 
-    \DB::table('taggables')->insert([
+    \DB::table('taggables')->insertOrIgnore([
         'tag_id' => perGroupSortCreateTag($customPlaylist, "Sports"),
         'taggable_type' => $customPlaylist->getMorphClass(),
         'taggable_id' => $customPlaylist->id,
@@ -683,14 +683,14 @@ it('auto-sync select mode preserves existing sort and assigns NULL to new tags',
     $customPlaylist->channels()->attach($channel->id);
 
     // Attach with custom sort value.
-    \DB::table('taggables')->insert([
+    \DB::table('taggables')->insertOrIgnore([
         'tag_id' => perGroupSortCreateTag($customPlaylist, "Sports"),
         'taggable_type' => Channel::class,
         'taggable_id' => $channel->id,
         'sort' => 42, // Existing sort value.
     ]);
 
-    \DB::table('taggables')->insert([
+    \DB::table('taggables')->insertOrIgnore([
         'tag_id' => perGroupSortCreateTag($customPlaylist, "Sports"),
         'taggable_type' => $customPlaylist->getMorphClass(),
         'taggable_id' => $customPlaylist->id,
@@ -752,27 +752,27 @@ it('reordering in group A does not affect order in group B for multi-group chann
     $customPlaylist->channels()->attach($channel->id);
 
     // Initial sort: Group A = 10, Group B = 5.
-    \DB::table('taggables')->insert([
+    \DB::table('taggables')->insertOrIgnore([
         'tag_id' => perGroupSortCreateTag($customPlaylist, "Group A"),
         'taggable_type' => Channel::class,
         'taggable_id' => $channel->id,
         'sort' => 10, // Group A sort.
     ]);
 
-    \DB::table('taggables')->insert([
+    \DB::table('taggables')->insertOrIgnore([
         'tag_id' => perGroupSortCreateTag($customPlaylist, "Group B"),
         'taggable_type' => Channel::class,
         'taggable_id' => $channel->id,
         'sort' => 5, // Group B sort.
     ]);
 
-    \DB::table('taggables')->insert([
+    \DB::table('taggables')->insertOrIgnore([
         'tag_id' => perGroupSortCreateTag($customPlaylist, "Group A"),
         'taggable_type' => $customPlaylist->getMorphClass(),
         'taggable_id' => $customPlaylist->id,
     ]);
 
-    \DB::table('taggables')->insert([
+    \DB::table('taggables')->insertOrIgnore([
         'tag_id' => perGroupSortCreateTag($customPlaylist, "Group B"),
         'taggable_type' => $customPlaylist->getMorphClass(),
         'taggable_id' => $customPlaylist->id,

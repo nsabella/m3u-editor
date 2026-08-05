@@ -56,14 +56,14 @@ function edgeCreateMultiGroupChannel(CustomPlaylist $playlist, Group $group, arr
     foreach ($tagNames as $i => $name) {
         $tagId = edgeCreateTagWithOrder($playlist, $name, $i + 1);
 
-        \DB::table('taggables')->insert([
+        \DB::table('taggables')->insertOrIgnore([
             'tag_id' => $tagId,
             'taggable_type' => Channel::class,
             'taggable_id' => $channel->id,
         ]);
 
         // ALSO attach to CustomPlaylist (required for get_live_categories).
-        \DB::table('taggables')->insert([
+        \DB::table('taggables')->insertOrIgnore([
             'tag_id' => $tagId,
             'taggable_type' => $playlist->getMorphClass(),
             'taggable_id' => $playlist->id,
@@ -465,7 +465,7 @@ it('auto-sync modes: select appends, original replaces (raw DB simulation)', fun
         'updated_at' => now(),
     ]);
 
-    \DB::table('taggables')->insert([
+    \DB::table('taggables')->insertOrIgnore([
         'tag_id' => $existingTag,
         'taggable_type' => Channel::class,
         'taggable_id' => $channel->id,
@@ -487,7 +487,7 @@ it('auto-sync modes: select appends, original replaces (raw DB simulation)', fun
         'updated_at' => now(),
     ]);
 
-    \DB::table('taggables')->insert([
+    \DB::table('taggables')->insertOrIgnore([
         'tag_id' => $featuredTagId,
         'taggable_type' => Channel::class,
         'taggable_id' => $channel->id,
@@ -545,7 +545,7 @@ it('auto-sync original mode replaces all tags with single source group', functio
         'updated_at' => now(),
     ]);
 
-    \DB::table('taggables')->insert([
+    \DB::table('taggables')->insertOrIgnore([
         ['tag_id' => $sportsTagId, 'taggable_type' => Channel::class, 'taggable_id' => $channel->id],
         ['tag_id' => $newsTagId, 'taggable_type' => Channel::class, 'taggable_id' => $channel->id],
     ]);
@@ -571,7 +571,7 @@ it('auto-sync original mode replaces all tags with single source group', functio
         'updated_at' => now(),
     ]);
 
-    \DB::table('taggables')->insert([
+    \DB::table('taggables')->insertOrIgnore([
         'tag_id' => $sourceTagId,
         'taggable_type' => Channel::class,
         'taggable_id' => $channel->id,
