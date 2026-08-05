@@ -23,11 +23,15 @@ use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Notification;
 use Spatie\Tags\Tag;
 
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
+    Event::fake();
+    Notification::fake();
+
     $this->user = User::factory()->create();
     $this->playlist = Playlist::factory()->for($this->user)->createQuietly([
         'status' => Status::Completed,

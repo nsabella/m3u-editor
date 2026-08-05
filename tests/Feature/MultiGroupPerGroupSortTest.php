@@ -8,14 +8,16 @@ use App\Models\Playlist;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Notification;
 use Illuminate\Support\Str;
 use Spatie\Tags\Tag;
 
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
-    // Fake all events to prevent Redis connections and other side effects.
+    // Fake all events and notifications to prevent Redis connections and other side effects.
     Event::fake();
+    Notification::fake();
 });
 
 // ---------------------------------------------------------------------------
@@ -620,16 +622,18 @@ it('auto-sync original mode resets per-group sort to NULL', function () {
 
     $customPlaylist->channels()->attach($channel->id);
 
-    // Attach with custom sort value.
+    // Attach with custom sort value using Spatie's API for proper translation format.
+    $sportsTag = \Spatie\Tags\Tag::findOrCreate("Sports", $customPlaylist->uuid);
+
     \DB::table('taggables')->insertOrIgnore([
-        'tag_id' => perGroupSortCreateTag($customPlaylist, "Sports"),
+        'tag_id' => $sportsTag->id,
         'taggable_type' => Channel::class,
         'taggable_id' => $channel->id,
         'sort' => 42, // Custom sort value.
     ]);
 
     \DB::table('taggables')->insertOrIgnore([
-        'tag_id' => perGroupSortCreateTag($customPlaylist, "Sports"),
+        'tag_id' => $sportsTag->id,
         'taggable_type' => $customPlaylist->getMorphClass(),
         'taggable_id' => $customPlaylist->id,
     ]);
@@ -682,16 +686,18 @@ it('auto-sync select mode preserves existing sort and assigns NULL to new tags',
 
     $customPlaylist->channels()->attach($channel->id);
 
-    // Attach with custom sort value.
+    // Attach with custom sort value using Spatie's API for proper translation format.
+    $sportsTag = \Spatie\Tags\Tag::findOrCreate("Sports", $customPlaylist->uuid);
+
     \DB::table('taggables')->insertOrIgnore([
-        'tag_id' => perGroupSortCreateTag($customPlaylist, "Sports"),
+        'tag_id' => $sportsTag->id,
         'taggable_type' => Channel::class,
         'taggable_id' => $channel->id,
         'sort' => 42, // Existing sort value.
     ]);
 
     \DB::table('taggables')->insertOrIgnore([
-        'tag_id' => perGroupSortCreateTag($customPlaylist, "Sports"),
+        'tag_id' => $sportsTag->id,
         'taggable_type' => $customPlaylist->getMorphClass(),
         'taggable_id' => $customPlaylist->id,
     ]);
