@@ -528,4 +528,35 @@ class ChannelsRelationManager extends RelationManager
 
         return $tabs;
     }
+
+    /**
+     * Get the tag ID for the currently active group tab.
+     * Returns null when on "All" tab or no tab selected.
+     *
+     * Filament v3's HasTabs trait provides $this->getTableTab() which returns
+     * the active tab's slug (e.g., "sports", "group-a"). When no tab is selected
+     * or "All" is clicked, it returns null or an empty string.
+     */
+    private function getActiveGroupTagId(): ?int
+    {
+        $tabSlug = $this->getTableTab();
+        if (empty($tabSlug)) {
+            return null;
+        }
+
+        // Get all tags for this playlist and find the one matching the tab slug.
+        // Tab slugs are auto-generated from Tab::make('name') using Str::slug().
+        $ownerRecord = $this->getOwnerRecord();
+        $tags = \Spatie\Tags\Tag::where('type', $ownerRecord->uuid)->get();
+
+        foreach ($tags as $tag) {
+            // Tag names may be JSON ({"en": "Sports"}) or plain strings.
+            $tagName = is_array($tag->name) ? ($tag->name['en'] ?? reset($tag->name)) : $tag->name;
+            if (\Str::slug($tagName) === $tabSlug) {
+                return $tag->id;
+            }
+        }
+
+        return null;
+    }
 }
