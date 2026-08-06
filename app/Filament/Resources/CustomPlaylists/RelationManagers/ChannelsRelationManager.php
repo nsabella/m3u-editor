@@ -162,17 +162,49 @@ class ChannelsRelationManager extends RelationManager
                     ->label(__('Sort Order'))
                     ->type('number')
                     ->rules(['nullable', 'numeric', 'min:0'])
-                    ->placeholder(fn ($record) => (string) $record->sort)
+                    ->placeholder(fn ($record) => (string) ($this->getActiveGroupTagId()
+                        ? \DB::table('taggables')
+                            ->where('tag_id', $this->getActiveGroupTagId())
+                            ->where('taggable_id', $record->id)
+                            ->where('taggable_type', \App\Models\Channel::class)
+                            ->value('sort')
+                        : $record->pivot?->sort))
                     ->getStateUsing(function ($record) {
+                        $activeTagId = $this->getActiveGroupTagId();
+                        if ($activeTagId) {
+                            return \DB::table('taggables')
+                                ->where('tag_id', $activeTagId)
+                                ->where('taggable_id', $record->id)
+                                ->where('taggable_type', \App\Models\Channel::class)
+                                ->value('sort');
+                        }
                         return $record->pivot?->sort ?? null;
                     })
                     ->updateStateUsing(function ($record, $state) use ($ownerRecord): void {
-                        $ownerRecord->channels()->updateExistingPivot(
-                            $record->id,
-                            ['sort' => ($state !== '' && $state !== null) ? (float) $state : null]
-                        );
+                        $sortValue = ($state !== '' && $state !== null) ? (float) $state : null;
+                        $activeTagId = $this->getActiveGroupTagId();
+                        if ($activeTagId) {
+                            \DB::table('taggables')
+                                ->where('tag_id', $activeTagId)
+                                ->where('taggable_id', $record->id)
+                                ->where('taggable_type', \App\Models\Channel::class)
+                                ->update(['sort' => $sortValue]);
+                            \App\Services\EpgCacheService::clearForCustomPlaylistId($ownerRecord->id);
+                        } else {
+                            $ownerRecord->channels()->updateExistingPivot(
+                                $record->id,
+                                ['sort' => $sortValue]
+                            );
+                        }
                     })
                     ->sortable(query: function (Builder $query, string $direction): Builder {
+                        $activeTagId = $this->getActiveGroupTagId();
+                        if ($activeTagId) {
+                            return $query->orderByRaw(
+                                'COALESCE((SELECT sort FROM taggables WHERE tag_id = ? AND taggable_id = channels.id AND taggable_type = ?), 999999) ' . $direction,
+                                [$activeTagId, \App\Models\Channel::class]
+                            );
+                        }
                         return $query->orderBy('channel_custom_playlist.sort', $direction);
                     });
             }
