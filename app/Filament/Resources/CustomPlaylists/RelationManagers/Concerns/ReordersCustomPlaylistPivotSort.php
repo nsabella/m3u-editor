@@ -17,6 +17,25 @@ trait ReordersCustomPlaylistPivotSort
             return;
         }
 
+        // Check if we're on a group tab — if so, do per-group reorder on taggables.sort
+        $activeTagId = method_exists($this, 'getActiveGroupTagId') ? $this->getActiveGroupTagId() : null;
+        if ($activeTagId) {
+            $this->getTable()->callBeforeReordering($order);
+            \DB::transaction(function () use ($order, $activeTagId): void {
+                foreach (array_values($order) as $index => $recordKey) {
+                    \DB::table('taggables')
+                        ->where('tag_id', $activeTagId)
+                        ->where('taggable_id', $recordKey)
+                        ->where('taggable_type', \App\Models\Channel::class)
+                        ->update(['sort' => ($index + 1) * 10]);
+                }
+            });
+            // Clear EPG cache after reorder
+            \App\Services\EpgCacheService::clearForCustomPlaylistId($this->getOwnerRecord()->id);
+            $this->getTable()->callAfterReordering($order);
+            return;
+        }
+
         $orderColumn = (string) str($this->getTable()->getReorderColumn())->afterLast('.');
         $relationship = $this->getTable()->getRelationship();
 

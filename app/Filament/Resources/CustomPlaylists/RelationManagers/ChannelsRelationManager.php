@@ -534,10 +534,17 @@ class ChannelsRelationManager extends RelationManager
             ->get();
         $tabs = $tags->map(
             fn ($tag) => Tab::make($tag->name)
-                ->modifyQueryUsing(fn ($query) => $query->whereHas('tags', function ($tagQuery) use ($tag) {
-                    $tagQuery->where('type', $tag->type)
-                        ->where('name->en', $tag->name);
-                }))
+                ->modifyQueryUsing(function ($query) use ($tag) {
+                    $query->whereHas('tags', function ($tagQuery) use ($tag) {
+                        $tagQuery->where('type', $tag->type)
+                            ->where('name->en', $tag->name);
+                    });
+                    // Sort by this tag's taggables.sort (NULLs last via COALESCE for SQLite)
+                    $query->orderByRaw(
+                        'COALESCE((SELECT sort FROM taggables WHERE tag_id = ? AND taggable_id = channels.id AND taggable_type = ?), 999999) ASC',
+                        [$tag->id, \App\Models\Channel::class]
+                    );
+                })
                 ->badge($ownerRecord->channels()->where('is_vod', false)->withAnyTags([$tag], $tag->type)->count())
         )->toArray();
 
