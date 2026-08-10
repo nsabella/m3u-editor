@@ -1,0 +1,494 @@
+<?php
+
+use App\Enums\DvrRuleType;
+use App\Filament\Pages\BrowseShows;
+use App\Models\Channel;
+use App\Models\DvrRecordingRule;
+use App\Models\DvrSetting;
+use App\Models\Epg;
+use App\Models\EpgChannel;
+use App\Models\EpgProgramme;
+use App\Models\Playlist;
+use App\Models\User;
+use App\Services\ShowMetadataService;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Queue;
+use Livewire\Livewire;
+
+uses(RefreshDatabase::class);
+
+beforeEach(function () {
+    Queue::fake();
+    config()->set('dvr.dvr_enabled', true);
+    config()->set('proxy.proxy_integration_enabled', true);
+    $this->user = User::factory()->create(['permissions' => ['use_dvr']]);
+    $this->setting = DvrSetting::factory()->enabled()->for($this->user)->create();
+    $this->epg = Epg::factory()->for($this->user)->create();
+    $this->actingAs($this->user);
+});
+
+it('renders the browse shows page', function () {
+    Livewire::test(BrowseShows::class)
+        ->assertSuccessful();
+});
+
+it('pre-selects the dvr setting when the user has only one', function () {
+    $component = Livewire::test(BrowseShows::class);
+
+    expect($component->get('dvr_setting_id'))->toBe($this->setting->id);
+});
+
+it('returns grouped shows after calling search', function () {
+    EpgProgramme::factory()->for($this->epg)->create([
+        'title' => 'The Wire',
+        'start_time' => now()->addHours(2),
+        'end_time' => now()->addHours(3),
+    ]);
+
+    Livewire::test(BrowseShows::class)
+        ->set('keyword', 'The Wire')
+        ->call('search')
+        ->assertSet('searched', true)
+        ->assertSet('shows', fn (array $shows) => count($shows) === 1
+            && $shows[0]['title'] === 'The Wire');
+});
+
+it('filters search results by keyword', function () {
+    EpgProgramme::factory()->for($this->epg)->create([
+        'title' => 'The Wire',
+        'start_time' => now()->addHours(2),
+        'end_time' => now()->addHours(3),
+    ]);
+    EpgProgramme::factory()->for($this->epg)->create([
+        'title' => 'Breaking Bad',
+        'start_time' => now()->addHours(2),
+        'end_time' => now()->addHours(3),
+    ]);
+
+    Livewire::test(BrowseShows::class)
+        ->set('keyword', 'Wire')
+        ->call('search')
+        ->assertSet('shows', fn (array $shows) => count($shows) === 1);
+});
+
+it('returns empty shows when no programmes match', function () {
+    Livewire::test(BrowseShows::class)
+        ->set('keyword', 'Nonexistent Show XYZ')
+        ->call('search')
+        ->assertSet('searched', true)
+        ->assertSet('shows', []);
+});
+
+it('counts multiple airings of the same title as one card with correct airing_count', function () {
+    EpgProgramme::factory()->for($this->epg)->create([
+        'title' => 'The Wire',
+        'start_time' => now()->addHours(2),
+        'end_time' => now()->addHours(3),
+    ]);
+    EpgProgramme::factory()->for($this->epg)->create([
+        'title' => 'The Wire',
+        'start_time' => now()->addHours(5),
+        'end_time' => now()->addHours(6),
+    ]);
+
+    Livewire::test(BrowseShows::class)
+        ->set('keyword', 'The Wire')
+        ->call('search')
+        ->assertSet('shows', fn (array $shows) => count($shows) === 1
+            && $shows[0]['airing_count'] === 2);
+});
+
+it('show card contains expected keys', function () {
+    EpgProgramme::factory()->for($this->epg)->create([
+        'title' => 'Breaking Bad',
+        'start_time' => now()->addHours(2),
+        'end_time' => now()->addHours(3),
+    ]);
+
+    $component = Livewire::test(BrowseShows::class)
+        ->set('keyword', 'Breaking Bad')
+        ->call('search');
+
+    $show = $component->get('shows')[0];
+
+    expect($show)->toHaveKeys([
+        'title', 'next_air_date_human', 'flags',
+        'epg_icon', 'poster_url', 'has_series_rule', 'has_once_rule',
+        'airing_count', 'category',
+    ]);
+});
+
+it('sets postersLoaded to true after loadPosters', function () {
+    $this->mock(ShowMetadataService::class)
+        ->shouldReceive('resolvePosters')
+        ->andReturn([])
+        ->shouldReceive('resolveEpisodeIsNew')
+        ->andReturn([]);
+
+    EpgProgramme::factory()->for($this->epg)->create([
+        'title' => 'The Wire',
+        'start_time' => now()->addHours(2),
+        'end_time' => now()->addHours(3),
+    ]);
+
+    Livewire::test(BrowseShows::class)
+        ->set('keyword', 'The Wire')
+        ->call('search')
+        ->assertSet('postersLoaded', false)
+        ->call('loadPosters')
+        ->assertSet('postersLoaded', true);
+});
+
+it('populates poster_url on shows after loadPosters', function () {
+    $this->mock(ShowMetadataService::class)
+        ->shouldReceive('resolvePosters')
+        ->once()
+        ->andReturn(['The Wire' => 'https://example.com/poster.jpg'])
+        ->shouldReceive('resolveEpisodeIsNew')
+        ->andReturn([]);
+
+    EpgProgramme::factory()->for($this->epg)->create([
+        'title' => 'The Wire',
+        'start_time' => now()->addHours(2),
+        'end_time' => now()->addHours(3),
+    ]);
+
+    Livewire::test(BrowseShows::class)
+        ->set('keyword', 'The Wire')
+        ->call('search')
+        ->call('loadPosters')
+        ->assertSet('shows', fn (array $shows) => $shows[0]['poster_url'] === 'https://example.com/poster.jpg');
+});
+
+it('sets postersLoaded true immediately when shows is empty', function () {
+    Livewire::test(BrowseShows::class)
+        ->call('loadPosters')
+        ->assertSet('postersLoaded', true);
+});
+
+it('openShowDetail sets selectedShowTitle and loads detail', function () {
+    EpgProgramme::factory()->for($this->epg)->create([
+        'title' => 'Breaking Bad',
+        'start_time' => now()->addHours(2),
+        'end_time' => now()->addHours(3),
+    ]);
+
+    Livewire::test(BrowseShows::class)
+        ->set('keyword', 'Breaking Bad')
+        ->call('search')
+        ->call('openShowDetail', 'Breaking Bad')
+        ->assertSet('selectedShowTitle', 'Breaking Bad')
+        ->assertSet('selectedShowDetail', fn (?array $detail) => $detail !== null
+            && $detail['title'] === 'Breaking Bad'
+            && count($detail['airings']) === 1);
+});
+
+it('openShowDetail loads airings in selected show detail', function () {
+    EpgProgramme::factory()->for($this->epg)->create([
+        'title' => 'The Wire',
+        'start_time' => now()->addHours(2),
+        'end_time' => now()->addHours(3),
+    ]);
+    EpgProgramme::factory()->for($this->epg)->create([
+        'title' => 'The Wire',
+        'start_time' => now()->addHours(5),
+        'end_time' => now()->addHours(6),
+    ]);
+
+    Livewire::test(BrowseShows::class)
+        ->set('keyword', 'The Wire')
+        ->call('search')
+        ->call('openShowDetail', 'The Wire')
+        ->assertSet('selectedShowDetail', fn (?array $detail) => $detail !== null
+            && count($detail['airings']) === 2);
+});
+
+it('closeShowDetail clears selectedShowTitle and selectedShowDetail', function () {
+    Livewire::test(BrowseShows::class)
+        ->call('openShowDetail', 'Breaking Bad')
+        ->call('closeShowDetail')
+        ->assertSet('selectedShowTitle', '')
+        ->assertSet('selectedShowDetail', null);
+});
+
+it('quickRecordNextAiring records the first upcoming airing for a title', function () {
+    $programme = EpgProgramme::factory()->for($this->epg)->create([
+        'title' => 'Breaking Bad',
+        'start_time' => now()->addHours(2),
+        'end_time' => now()->addHours(3),
+    ]);
+
+    Livewire::test(BrowseShows::class)
+        ->set('dvr_setting_id', $this->setting->id)
+        ->set('keyword', 'Breaking Bad')
+        ->call('search')
+        ->call('quickRecordNextAiring', 'Breaking Bad');
+
+    expect(DvrRecordingRule::where('user_id', $this->user->id)
+        ->where('type', DvrRuleType::Once)
+        ->where('programme_id', $programme->id)
+        ->exists())->toBeTrue();
+});
+
+it('warns when quickRecordNextAiring is called for a title with no airings', function () {
+    Livewire::test(BrowseShows::class)
+        ->set('dvr_setting_id', $this->setting->id)
+        ->call('quickRecordNextAiring', 'Nonexistent Show');
+
+    expect(DvrRecordingRule::where('user_id', $this->user->id)->count())->toBe(0);
+});
+
+it('creates a once rule from a programme', function () {
+    $programme = EpgProgramme::factory()->for($this->epg)->create([
+        'title' => 'Special Event',
+        'start_time' => now()->addHours(2),
+        'end_time' => now()->addHours(3),
+    ]);
+
+    Livewire::test(BrowseShows::class)
+        ->set('dvr_setting_id', $this->setting->id)
+        ->call('recordOnce', $programme->id);
+
+    expect(DvrRecordingRule::where('user_id', $this->user->id)
+        ->where('type', DvrRuleType::Once)
+        ->where('programme_id', $programme->id)
+        ->exists())->toBeTrue();
+});
+
+it('warns with a notification when a duplicate once rule exists', function () {
+    $programme = EpgProgramme::factory()->for($this->epg)->create(['title' => 'Special Event']);
+
+    DvrRecordingRule::factory()->for($this->setting, 'dvrSetting')->for($this->user)->create([
+        'type' => DvrRuleType::Once,
+        'programme_id' => $programme->id,
+    ]);
+
+    Livewire::test(BrowseShows::class)
+        ->set('dvr_setting_id', $this->setting->id)
+        ->call('recordOnce', $programme->id);
+
+    expect(DvrRecordingRule::where('user_id', $this->user->id)
+        ->where('type', DvrRuleType::Once)
+        ->where('programme_id', $programme->id)
+        ->count())->toBe(1);
+});
+
+it('warns when recordOnce is called without a dvr setting selected', function () {
+    $programme = EpgProgramme::factory()->for($this->epg)->create(['title' => 'Special Event']);
+
+    Livewire::test(BrowseShows::class)
+        ->set('dvr_setting_id', null)
+        ->call('recordOnce', $programme->id);
+
+    expect(DvrRecordingRule::where('user_id', $this->user->id)->count())->toBe(0);
+});
+
+it('creates a series rule with defaults from a show title', function () {
+    Livewire::test(BrowseShows::class)
+        ->set('dvr_setting_id', $this->setting->id)
+        ->call('recordSeriesDefaults', 'Breaking Bad');
+
+    expect(DvrRecordingRule::where('user_id', $this->user->id)
+        ->where('type', DvrRuleType::Series)
+        ->where('series_title', 'Breaking Bad')
+        ->exists())->toBeTrue();
+});
+
+it('warns with a notification when a duplicate series rule already exists', function () {
+    DvrRecordingRule::factory()->for($this->setting, 'dvrSetting')->for($this->user)->create([
+        'type' => DvrRuleType::Series,
+        'series_title' => 'Breaking Bad',
+    ]);
+
+    Livewire::test(BrowseShows::class)
+        ->set('dvr_setting_id', $this->setting->id)
+        ->call('recordSeriesDefaults', 'Breaking Bad');
+
+    expect(DvrRecordingRule::where('user_id', $this->user->id)
+        ->where('type', DvrRuleType::Series)
+        ->where('series_title', 'Breaking Bad')
+        ->count())->toBe(1);
+});
+
+it('warns when recordSeriesDefaults is called without a dvr setting selected', function () {
+    Livewire::test(BrowseShows::class)
+        ->set('dvr_setting_id', null)
+        ->call('recordSeriesDefaults', 'Breaking Bad');
+
+    expect(DvrRecordingRule::where('user_id', $this->user->id)->count())->toBe(0);
+});
+
+it('creates a series rule with custom options', function () {
+    Livewire::test(BrowseShows::class)
+        ->set('dvr_setting_id', $this->setting->id)
+        ->set('seriesNewOnly', 1)
+        ->set('seriesPriority', 75)
+        ->set('seriesStartEarly', 120)
+        ->set('seriesEndLate', 300)
+        ->call('recordSeriesWithOptions', 'Breaking Bad');
+
+    $rule = DvrRecordingRule::where('user_id', $this->user->id)
+        ->where('type', DvrRuleType::Series)
+        ->where('series_title', 'Breaking Bad')
+        ->first();
+
+    expect($rule)->not->toBeNull()
+        ->and($rule->new_only)->toBeTrue()
+        ->and($rule->priority)->toBe(75)
+        ->and($rule->start_early_seconds)->toBe(120)
+        ->and($rule->end_late_seconds)->toBe(300);
+});
+
+it('warns when recordSeriesWithOptions is called without a dvr setting selected', function () {
+    Livewire::test(BrowseShows::class)
+        ->set('dvr_setting_id', null)
+        ->call('recordSeriesWithOptions', 'Breaking Bad');
+
+    expect(DvrRecordingRule::where('user_id', $this->user->id)->count())->toBe(0);
+});
+
+it('paginates results and gotoPage loads a different page', function () {
+    // Create 25 programmes with distinct titles to exceed the 20-per-page limit
+    foreach (range(1, 25) as $i) {
+        EpgProgramme::factory()->for($this->epg)->create([
+            'title' => "Show {$i}",
+            'start_time' => now()->addHours($i),
+            'end_time' => now()->addHours($i + 1),
+        ]);
+    }
+
+    $component = Livewire::test(BrowseShows::class)
+        ->call('search');
+
+    expect($component->get('totalShows'))->toBe(25);
+    expect(count($component->get('shows')))->toBe(20);
+
+    $component->call('gotoPage', 2);
+
+    expect($component->get('currentPage'))->toBe(2);
+    expect(count($component->get('shows')))->toBe(5);
+});
+
+it('does not return programmes belonging to another user', function () {
+    $otherUser = User::factory()->create();
+    $otherEpg = Epg::factory()->for($otherUser)->create();
+
+    // Programme belonging to another user's EPG
+    EpgProgramme::factory()->for($otherEpg)->create([
+        'title' => 'Other User Show',
+        'start_time' => now()->addHours(2),
+        'end_time' => now()->addHours(3),
+    ]);
+
+    // Programme belonging to the authenticated user's EPG
+    EpgProgramme::factory()->for($this->epg)->create([
+        'title' => 'My Show',
+        'start_time' => now()->addHours(2),
+        'end_time' => now()->addHours(3),
+    ]);
+
+    Livewire::test(BrowseShows::class)
+        ->call('search')
+        ->assertSet('shows', fn (array $shows) => count($shows) === 1
+            && $shows[0]['title'] === 'My Show');
+});
+
+it('ignores another user dvr_setting_id injected into the component', function () {
+    $otherUser = User::factory()->create();
+    $otherSetting = DvrSetting::factory()->enabled()->for($otherUser)->create();
+
+    Livewire::test(BrowseShows::class)
+        ->set('dvr_setting_id', $otherSetting->id)
+        ->call('recordSeriesDefaults', 'Breaking Bad');
+
+    // Rule must not be created because the setting doesn't belong to the auth user
+    expect(DvrRecordingRule::count())->toBe(0);
+});
+
+it('channel-options-loaded event includes dvr_setting_id in payload', function () {
+    $playlist = Playlist::factory()->for($this->user)->create();
+    $this->setting->update(['playlist_id' => $playlist->id]);
+
+    Livewire::test(BrowseShows::class)
+        ->set('dvr_setting_id', $this->setting->id)
+        ->call('loadChannelOptions')
+        ->assertDispatched('channel-options-loaded', function (string $event, array $params): bool {
+            return ($params['dvr_setting_id'] ?? null) === $this->setting->id;
+        });
+});
+
+it('hides disabled channels in channel options when include_disabled_channels is false', function () {
+    $playlist = Playlist::factory()->for($this->user)->create();
+    $this->setting->update([
+        'playlist_id' => $playlist->id,
+        'include_disabled_channels' => false,
+    ]);
+
+    $enabled = Channel::factory()->for($this->user)->for($playlist)->create([
+        'title' => 'Enabled Channel',
+        'enabled' => true,
+    ]);
+    Channel::factory()->for($this->user)->for($playlist)->create([
+        'title' => 'Disabled Channel',
+        'enabled' => false,
+    ]);
+
+    Livewire::test(BrowseShows::class)
+        ->set('dvr_setting_id', $this->setting->id)
+        ->call('loadChannelOptions')
+        ->assertDispatched('channel-options-loaded', function (string $event, array $params) use ($enabled): bool {
+            $options = $params['options'] ?? [];
+
+            return ($options[$enabled->id] ?? null) === 'Enabled Channel'
+                && ! in_array('Disabled Channel', $options, true);
+        });
+});
+
+it('includes disabled channels in channel options when include_disabled_channels is true', function () {
+    $playlist = Playlist::factory()->for($this->user)->create();
+    $this->setting->update([
+        'playlist_id' => $playlist->id,
+        'include_disabled_channels' => true,
+    ]);
+
+    $disabled = Channel::factory()->for($this->user)->for($playlist)->create([
+        'title' => 'Disabled Channel',
+        'enabled' => false,
+    ]);
+
+    Livewire::test(BrowseShows::class)
+        ->set('dvr_setting_id', $this->setting->id)
+        ->call('loadChannelOptions')
+        ->assertDispatched('channel-options-loaded', function (string $event, array $params) use ($disabled): bool {
+            return ($params['options'][$disabled->id] ?? null) === 'Disabled Channel';
+        });
+});
+
+it('includes programmes from disabled channels when include_disabled_channels is true', function () {
+    $playlist = Playlist::factory()->for($this->user)->create();
+    $this->setting->update([
+        'playlist_id' => $playlist->id,
+        'include_disabled_channels' => true,
+    ]);
+
+    $epgChannel = EpgChannel::factory()->for($this->epg)->create();
+
+    Channel::factory()->for($this->user)->for($playlist)->create([
+        'epg_channel_id' => $epgChannel->id,
+        'enabled' => false,
+        'title' => 'Disabled Source',
+    ]);
+
+    EpgProgramme::factory()->for($this->epg)->create([
+        'title' => 'Disabled Channel Show',
+        'epg_channel_id' => $epgChannel->channel_id,
+        'start_time' => now()->addHours(2),
+        'end_time' => now()->addHours(3),
+    ]);
+
+    Livewire::test(BrowseShows::class)
+        ->set('dvr_setting_id', $this->setting->id)
+        ->set('keyword', 'Disabled Channel Show')
+        ->call('search')
+        ->assertSet('shows', fn (array $shows) => count($shows) === 1 && $shows[0]['title'] === 'Disabled Channel Show');
+});

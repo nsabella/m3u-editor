@@ -1,5 +1,7 @@
 <?php
 
+use App\Jobs\DvrRetentionCleanup;
+use App\Jobs\DvrSchedulerTick;
 use Illuminate\Support\Facades\Schedule;
 
 /*
@@ -22,6 +24,18 @@ Schedule::command('app:refresh-playlist')
 // Refresh media server integrations
 Schedule::command('app:refresh-media-server-integrations')
     ->everyMinute()
+    ->withoutOverlapping();
+
+// AIOStreams-backed VOD/episodes that have never resolved a stream yet
+// (unaired-at-add-time episodes now past their air date, or entries whose
+// initial resolution attempts all came up empty): resolve a small capped
+// batch. Deliberately never touches already-'resolved' entries — re-checking
+// a working link is exactly the "poking" pattern some debrid backends
+// (TorBox) ban accounts for. Ordinary link rot on resolved content is
+// handled on-demand instead, via M3uProxyService::resolveFailoverUrl's
+// exhaustion hook at actual playback-failure time.
+Schedule::command('app:resolve-pending-aiostreams-candidates')
+    ->hourly()
     ->withoutOverlapping();
 
 // Refresh EPG
@@ -52,7 +66,7 @@ Schedule::command('queue:prune-failed --hours=48')
 Schedule::command('app:prune-old-notifications --days=7')
     ->daily();
 
-// Prune old model history
+// Prune old model history (also handles DeviceAuthorization via its Prunable trait)
 Schedule::command('model:prune')->daily();
 
 // Ensure m3u-proxy webhook is registered (handles proxy restarts, delayed startup, etc.)
@@ -63,11 +77,6 @@ Schedule::command('m3u-proxy:register-webhook')
 // Refresh provider profile info (every 15 minutes)
 Schedule::command('app:refresh-playlist-profiles')
     ->everyFifteenMinutes()
-    ->withoutOverlapping();
-
-// Regenerate network schedules (hourly check, regenerates when needed)
-Schedule::command('networks:regenerate-schedules')
-    ->hourly()
     ->withoutOverlapping();
 
 // Run scheduled plugin invocations
@@ -89,3 +98,17 @@ if (config('plugins.update_check.enabled', true)) {
 }
 
 // Note: HLS broadcast files are managed by m3u-proxy service
+if (config('proxy.proxy_integration_enabled', true)) {
+    // Regenerate network schedules (hourly check, regenerates when needed)
+    Schedule::command('networks:regenerate-schedules')
+        ->hourly()
+        ->withoutOverlapping();
+
+    if (config('dvr.dvr_enabled', true)) {
+        // DVR scheduler tick — every minute, trigger and stop scheduled recordings
+        Schedule::job(new DvrSchedulerTick)->everyMinute()->withoutOverlapping();
+
+        // DVR retention cleanup — run hourly to enforce keepLast, age, and quota policies
+        Schedule::job(new DvrRetentionCleanup)->hourly()->withoutOverlapping();
+    }
+}

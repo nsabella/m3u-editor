@@ -21,6 +21,10 @@ function streamPlayer() {
         _videoHandlers: {},
         _cleaned: false,
 
+        // ── Comskip ───────────────────────────────────────────────────────
+        comskipSegments: [],    // [{ start: float, end: float }, ...]
+        _activeSegmentEnd: 0,   // tracks end of currently-displayed segment to avoid redundant DOM writes
+
         // ── Watch Progress ────────────────────────────────────────────────
         progressConfig: null,   // { contentType, streamId, playlistId, seriesId, seasonNumber }
         _progressTimer: null,
@@ -36,6 +40,31 @@ function streamPlayer() {
             if (!this.player) return;
             const el = this.player;
             const contentType = el.dataset.contentType;
+
+            if (contentType === 'aiostreams') {
+                const aioItemId = el.dataset.aioItemId;
+                if (!aioItemId) return;
+
+                this.progressConfig = {
+                    contentType,
+                    aioItemId,
+                    aioIntegrationId: el.dataset.aioIntegrationId ? parseInt(el.dataset.aioIntegrationId) : null,
+                    playlistId: parseInt(el.dataset.playlistId) || null,
+                    seasonNumber: el.dataset.seasonNumber ? parseInt(el.dataset.seasonNumber) : null,
+                    episodeNumber: el.dataset.episodeNumber ? parseInt(el.dataset.episodeNumber) : null,
+                    title: el.dataset.title || null,
+                    episodeTitle: el.dataset.episodeTitle || null,
+                    thumbnailUrl: el.dataset.thumbnailUrl || null,
+                    backdropUrl: el.dataset.backdropUrl || null,
+                    rating: el.dataset.rating || null,
+                    year: el.dataset.year || null,
+                    plot: el.dataset.plot || null,
+                };
+
+                this._fetchProgress();
+                return;
+            }
+
             const streamId = parseInt(el.dataset.streamId);
             if (!contentType || !streamId) return;
 
@@ -75,11 +104,18 @@ function streamPlayer() {
         async _fetchProgress() {
             if (!this.progressConfig) return;
             try {
-                const params = new URLSearchParams({
-                    content_type: this.progressConfig.contentType,
-                    stream_id: this.progressConfig.streamId,
-                    playlist_id: this.progressConfig.playlistId ?? '',
-                });
+                const params = this.progressConfig.contentType === 'aiostreams'
+                    ? new URLSearchParams({
+                        content_type: 'aiostreams',
+                        aio_item_id: this.progressConfig.aioItemId,
+                        aio_integration_id: this.progressConfig.aioIntegrationId ?? '',
+                        playlist_id: this.progressConfig.playlistId ?? '',
+                    })
+                    : new URLSearchParams({
+                        content_type: this.progressConfig.contentType,
+                        stream_id: this.progressConfig.streamId,
+                        playlist_id: this.progressConfig.playlistId ?? '',
+                    });
                 const res = await fetch(`/api/watch-progress?${params}`, {
                     headers: { 'X-CSRF-TOKEN': this._getCsrfToken() },
                 });
@@ -113,19 +149,40 @@ function streamPlayer() {
             const duration = isFinite(this.player.duration) ? Math.floor(this.player.duration) : null;
             if (!force && Math.abs(position - this._lastSavedPosition) < 5) return;
             this._lastSavedPosition = position;
+
+            const body = this.progressConfig.contentType === 'aiostreams'
+                ? {
+                    content_type: 'aiostreams',
+                    aio_item_id: this.progressConfig.aioItemId,
+                    aio_integration_id: this.progressConfig.aioIntegrationId,
+                    playlist_id: this.progressConfig.playlistId,
+                    season_number: this.progressConfig.seasonNumber,
+                    episode_number: this.progressConfig.episodeNumber,
+                    title: this.progressConfig.title,
+                    episode_title: this.progressConfig.episodeTitle,
+                    thumbnail_url: this.progressConfig.thumbnailUrl,
+                    backdrop_url: this.progressConfig.backdropUrl,
+                    rating: this.progressConfig.rating,
+                    year: this.progressConfig.year,
+                    plot: this.progressConfig.plot,
+                    position_seconds: position,
+                    duration_seconds: duration,
+                }
+                : {
+                    content_type: this.progressConfig.contentType,
+                    stream_id: this.progressConfig.streamId,
+                    playlist_id: this.progressConfig.playlistId,
+                    series_id: this.progressConfig.seriesId,
+                    season_number: this.progressConfig.seasonNumber,
+                    position_seconds: position,
+                    duration_seconds: duration,
+                };
+
             try {
                 await fetch('/api/watch-progress', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'X-CSRF-TOKEN': this._getCsrfToken() },
-                    body: JSON.stringify({
-                        content_type: this.progressConfig.contentType,
-                        stream_id: this.progressConfig.streamId,
-                        playlist_id: this.progressConfig.playlistId,
-                        series_id: this.progressConfig.seriesId,
-                        season_number: this.progressConfig.seasonNumber,
-                        position_seconds: position,
-                        duration_seconds: duration,
-                    }),
+                    body: JSON.stringify(body),
                 });
             } catch (e) {
                 console.warn('[WatchProgress] Failed to save progress:', e);
@@ -163,6 +220,71 @@ function streamPlayer() {
             this._resumePosition = 0;
             this.hideResumePrompt();
         },
+
+        // ── Comskip ───────────────────────────────────────────────────────
+
+        async _initComskip() {
+            if (!this.player) return;
+            const edlUrl = this.player.dataset.edlUrl;
+            if (!edlUrl) return;
+            try {
+                const res = await fetch(edlUrl, {
+                    headers: { 'X-CSRF-TOKEN': this._getCsrfToken() },
+                });
+                if (res.ok) {
+                    this.comskipSegments = await res.json();
+                }
+            } catch (e) {
+                console.warn('[Comskip] Failed to fetch EDL:', e);
+            }
+        },
+
+        _checkComskip() {
+            if (!this.player || this.comskipSegments.length === 0) return;
+            const t = this.player.currentTime;
+            const seg = this.comskipSegments.find(s => t >= s.start && t < s.end);
+            if (seg) {
+                this._showSkipAdPrompt(seg);
+            } else {
+                this._hideSkipAdPrompt();
+            }
+        },
+
+        _showSkipAdPrompt(segment) {
+            const playerId = this.player?.id;
+            if (!playerId) return;
+            const el = document.getElementById(playerId + '-skipad');
+            if (!el) return;
+            if (this._activeSegmentEnd !== segment.end) {
+                this._activeSegmentEnd = segment.end;
+                el.dataset.segmentEnd = segment.end;
+            }
+            el.classList.remove('hidden');
+        },
+
+        _hideSkipAdPrompt() {
+            const playerId = this.player?.id;
+            if (!playerId) return;
+            const el = document.getElementById(playerId + '-skipad');
+            if (el) {
+                el.classList.add('hidden');
+                this._activeSegmentEnd = 0;
+            }
+        },
+
+        skipCommercial() {
+            const playerId = this.player?.id;
+            if (!playerId) return;
+            const el = document.getElementById(playerId + '-skipad');
+            const segmentEnd = el ? parseFloat(el.dataset.segmentEnd || '0') : 0;
+            if (this.player && segmentEnd > 0) {
+                this.player.currentTime = segmentEnd;
+                this.player.play();
+            }
+            this._hideSkipAdPrompt();
+        },
+
+        // ─────────────────────────────────────────────────────────────────
 
         formatSeconds(seconds) {
             if (seconds <= 0) return '0:00';
@@ -205,6 +327,9 @@ function streamPlayer() {
 
             // Initialise progress tracking from data attributes
             this._initProgress();
+
+            // Fetch comskip EDL for DVR recordings (fire-and-forget)
+            this._initComskip();
 
             // Update status
             if (statusEl) statusEl.textContent = 'Connecting...';
@@ -516,6 +641,10 @@ function streamPlayer() {
                 },
                 ended: () => {
                     this._saveProgress(true);
+                    this._hideSkipAdPrompt();
+                },
+                timeupdate: () => {
+                    this._checkComskip();
                 },
                 progress: () => {
                     if (video.buffered.length > 0 && !this.streamMetadata.codec) {
@@ -785,6 +914,11 @@ function streamPlayer() {
             this._lastSavedPosition = -1;
             this._resumePosition = 0;
             this._liveReported = false;
+
+            // Reset comskip state
+            this._hideSkipAdPrompt();
+            this.comskipSegments = [];
+            this._activeSegmentEnd = 0;
 
             // Reset stream metadata
             this.streamMetadata = {

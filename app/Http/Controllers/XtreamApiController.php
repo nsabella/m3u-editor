@@ -3,40 +3,84 @@
 namespace App\Http\Controllers;
 
 use App\Enums\ChannelLogoType;
+use App\Enums\DvrMatchMode;
+use App\Enums\DvrRecordingStatus;
+use App\Enums\DvrRuleType;
+use App\Enums\DvrSeriesMode;
 use App\Enums\PlaylistChannelId;
+use App\Events\ViewerFavoriteEvent;
 use App\Facades\PlaylistFacade;
 use App\Facades\ProxyFacade;
+use App\Models\ArrIntegration;
 use App\Models\Category;
 use App\Models\Channel;
 use App\Models\CustomPlaylist;
+use App\Models\DvrRecording;
+use App\Models\DvrRecordingRule;
 use App\Models\Epg;
+use App\Models\EpgProgramme;
 use App\Models\Group;
 use App\Models\MergedPlaylist;
 use App\Models\Network;
+use App\Models\NetworkProgramme;
 use App\Models\Playlist;
 use App\Models\PlaylistAlias;
 use App\Models\PlaylistAuth;
 use App\Models\PlaylistViewer;
 use App\Models\Series;
 use App\Models\StreamProfile;
+use App\Models\ViewerFavorite;
 use App\Models\ViewerWatchProgress;
 use App\Providers\VersionServiceProvider;
+use App\Services\ContentRequestService;
+use App\Services\DvrRecorderService;
 use App\Services\EpgCacheService;
 use App\Services\LogoCacheService;
 use App\Services\M3uProxyService;
 use App\Settings\GeneralSettings;
+use App\Support\SeriesKey;
 use Carbon\Carbon;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Config;
+use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Support\Facades\Redirect;
+use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Str;
 use Spatie\Tags\Tag;
 use Symfony\Component\HttpFoundation\JsonResponse;
 
 class XtreamApiController extends Controller
 {
+    private const REQUEST_ACTIONS = [
+        'request_search',
+        'request_submit',
+        'request_history',
+        'request_status',
+        'request_dismiss',
+    ];
+
+    private const DVR_ACTIONS = [
+        'get_dvr_recordings',
+        'get_dvr_recording',
+        'get_dvr_storage',
+        'schedule_dvr',
+        'create_dvr_series_rule',
+        'update_dvr_series_rule',
+        'cancel_dvr_recording',
+        'delete_dvr_recording',
+        'list_dvr_series_rules',
+        'delete_dvr_series_rule',
+        'search_epg_shows',
+    ];
+
+    private const FAVORITE_COLUMNS = [
+        'content_type', 'stream_id', 'aio_item_id', 'imdb_id', 'tmdb_id',
+        'aio_integration_id', 'title', 'thumbnail_url', 'item_type', 'favorited_at',
+    ];
+
     /**
      * Xtream API request handler.
      *
@@ -121,6 +165,61 @@ class XtreamApiController extends Controller
      * This provides the same user information as the panel.
      * Contains: `username`, `password`, `message`, `auth`, `status`, `exp_date`, `is_trial`,
      * `active_cons`, `created_at`, `max_connections`, `allowed_output_formats`.
+     *
+     * ### create_dvr_series_rule
+     * Creates a Series-type DVR recording rule for a show title. Query parameters:
+     *   - `title` (string, required): The show title; matched by the chosen match mode.
+     *   - `channel_id` (int, optional): Pin the rule to a specific playlist channel. **Omit
+     *     for "any channel"** — DvrSchedulerService::resolveSeriesEpgScope() then scopes to
+     *     all EPG-mapped channels in the playlist. `source_channel_id` is intentionally NOT
+     *     accepted from the API; setting it would narrow scope back to a single channel.
+     *   - `match_mode` (string, optional, default `contains`): One of `contains`, `exact`,
+     *     `starts_with`, `tmdb`.
+     *   - `series_mode` (string, optional): One of `all`, `new_flag`, `unique_se`. Defaults
+     *     to `dvr_setting.default_series_mode` server-side.
+     *   - `keep_last` (int, optional): Defaults to `dvr_setting.default_series_keep_last`.
+     *   - `priority` (int, optional): Defaults to 50 via the column migration default.
+     *     Clamped 0-100 when supplied. **Omit to inherit the column default; do not send
+     *     a hardcoded value.**
+     *   - `start_early_seconds` (int, optional): Seconds to start early. **Omit to inherit
+     *     `dvr_setting.default_start_early_seconds`** (resolved at runtime). Blank is not
+     *     coerced to 0 — `0` is a meaningful value (no padding) distinct from "inherit".
+     *   - `end_late_seconds` (int, optional): Seconds to end late. Same omit-to-inherit
+     *     semantics as `start_early_seconds`.
+     * Returns `{success: true, rule_id: <int>}`. Returns 409 `{error, rule_id, duplicate: true}`
+     * when a Series rule for the same normalized title already exists under this DVR
+     * setting (+ auth).
+     *
+     * ### update_dvr_series_rule
+     * Updates an existing Series-type DVR recording rule in place — never delete-and-recreate,
+     * because deleting a rule cascades to its recordings and destroys recording history (and
+     * changes the rule id). Query parameters:
+     *   - `rule_id` (int, required): The id of the rule to update.
+     *   - `channel_id` (int, optional): Pin the rule to a specific playlist channel. **Send as
+     *     an empty value to switch to "any channel"**; the request body/param must be present
+     *     (even if blank) to distinguish "set to any channel" from "leave channel unchanged".
+     *   - `match_mode` (string, optional): One of `contains`, `exact`, `starts_with`, `tmdb`.
+     *   - `series_mode` (string, optional): One of `all`, `new_flag`, `unique_se`.
+     *   - `keep_last` (int, optional).
+     *   - `priority` (int, optional): Clamped 0-100 when supplied.
+     *   - `start_early_seconds` (int, optional).
+     *   - `end_late_seconds` (int, optional).
+     * **Omit-to-inherit on update:** only fields present in the request are applied; fields
+     * that are absent are left at their current values. Never send placeholder values — a
+     * field you intend to keep must be omitted, not sent as its current value. `series_mode`
+     * is stored in lockstep with the legacy `new_only` flag (see task 16).
+     * Returns `{success: true, rule_id: <int>}`.
+     *
+     * ### search_epg_shows
+     * Searches EPG programmes across all EPG-mapped channels in the playlist (plus those
+     * that aired in the last 24 hours for discoverability) and groups results by
+     * SeriesKey-normalized title. Query parameter: `q` (string, required, min 2 chars).
+     * Returns at most 100 results, sorted by next-airing first then by episode count.
+     * Each result object contains: `normalized_title`, `display_title`, `has_series_rule`
+     * (bool — whether a Series rule already exists for this title), `series_rule_id` (int|null
+     * — the existing rule's id when `has_series_rule` is true, for delete-without-round-trip),
+     * `channel_count`, `channels` (array of `{channel_id, channel_name}`), `episode_count`,
+     * `next_airing_at` (ISO 8601 or null), `recent_episodes` (up to 5 most-recent airings).
      *
      *
      * @param  string  $uuid  The UUID of the playlist (required path parameter)
@@ -378,6 +477,17 @@ class XtreamApiController extends Controller
      */
     public function handle(Request $request)
     {
+        $action = (string) $request->input('action', 'panel');
+        if (in_array($action, self::REQUEST_ACTIONS, true)) {
+            $credentialValidator = Validator::make($request->all(), [
+                'username' => ['required', 'string'],
+                'password' => ['required', 'string'],
+            ]);
+            if ($credentialValidator->fails()) {
+                return $this->requestValidationError($credentialValidator->errors()->keys());
+            }
+        }
+
         // Authenticate the user based on the provided credentials
         $request->validate([
             'username' => 'required|string',
@@ -387,8 +497,23 @@ class XtreamApiController extends Controller
 
         // If no authentication method worked, return error
         if (! $playlist || $authMethod === 'none') {
+            if (in_array($action, self::REQUEST_ACTIONS, true)) {
+                return $this->requestError('authentication_failed', 'The credentials are invalid.', 401);
+            }
+
             return response()->json(['error' => 'Unauthorized'], 401);
         }
+
+        $playlistAuth = $authMethod === 'playlist_auth'
+            ? PlaylistAuth::where('username', $username)
+                ->where('password', $password)
+                ->where('enabled', true)
+                ->where(function ($query) {
+                    $query->whereNull('expires_at')
+                        ->orWhere('expires_at', '>', now());
+                })
+                ->first()
+            : null;
 
         $urlSafePass = urlencode($password);
         $urlSafeUser = urlencode($username);
@@ -413,15 +538,24 @@ class XtreamApiController extends Controller
         // Resolve alias group filter — only needed for the categories list endpoints.
         // Channel/series stream queries are filtered automatically via the PlaylistAlias
         // channels() / series() relationships, so no per-query wiring is required there.
-        $aliasLiveGroupFilter = ($playlist instanceof PlaylistAlias && $playlist->playlist_id)
+        // For standard playlists these are provider group names matched against
+        // group_internal; for custom playlists they are the displayed category names.
+        $aliasLiveGroupFilter = $playlist instanceof PlaylistAlias
             ? $playlist->getAllowedLiveGroupNames()
             : [];
-        $aliasVodGroupFilter = ($playlist instanceof PlaylistAlias && $playlist->playlist_id)
+        $aliasVodGroupFilter = $playlist instanceof PlaylistAlias
             ? $playlist->getAllowedVodGroupNames()
+            : [];
+        $aliasCategoryFilter = $playlist instanceof PlaylistAlias
+            ? $playlist->getAllowedCategoryNames()
             : [];
 
         $baseUrl = ProxyFacade::getBaseUrl();
-        $action = $request->input('action', 'panel');
+        $rateLimitedResponse = $this->requestRateLimit($action, $playlist, $authMethod, $playlistAuth);
+        if ($rateLimitedResponse) {
+            return $rateLimitedResponse;
+        }
+
         if (
             $action === 'panel' ||
             $action === 'get_user_info' ||
@@ -444,12 +578,6 @@ class XtreamApiController extends Controller
                 $streams = $playlist->streams ?? 1;
                 $activeConnections = 0;
             }
-            // Resolve the PlaylistAuth once — used for the per-auth connection limit
-            // override and for feature advertisement (proxy access).
-            $playlistAuth = $authMethod === 'playlist_auth'
-                ? PlaylistAuth::where('username', $username)->where('password', $password)->first()
-                : null;
-
             // Override max_connections when the request is authenticated via a PlaylistAuth
             // that has a specific per-auth limit configured.
             if ($playlistAuth?->max_connections) {
@@ -530,11 +658,53 @@ class XtreamApiController extends Controller
             // This is required for the M3U TV app to connect via the Xtream API and resolve the features available for the playlist.
             if ($enhancedOutputEnabled) {
                 $features = $this->resolveM3uEditorFeatures($playlist, $authMethod, $playlistAuth);
+                $aiostreamsData = $this->resolveAIOStreamsData($playlist, $features);
 
                 $m3uEditorPayload = [
                     'version' => VersionServiceProvider::getVersion(),
                     'features' => $features,
                 ];
+
+                if (in_array('requests', $features, true)) {
+                    $requestPlaylist = $this->authorizedRequestPlaylist($playlist, $authMethod, $playlistAuth);
+
+                    $m3uEditorPayload['requests'] = [
+                        'api_version' => 1,
+                        'actions' => [
+                            'search' => 'request_search',
+                            'submit' => 'request_submit',
+                            'history' => 'request_history',
+                            'status' => 'request_status',
+                            'dismiss' => 'request_dismiss',
+                        ],
+                        'content_types' => $requestPlaylist
+                            ? app(ContentRequestService::class)->contentTypes($requestPlaylist)
+                            : [],
+                        'approval_behavior' => $playlistAuth->auto_approve_requests
+                            ? 'auto_approval'
+                            : 'pending_approval',
+                        'error_codes' => [
+                            'invalid_request',
+                            'authentication_failed',
+                            'request_access_denied',
+                            'rate_limited',
+                            'providers_unavailable',
+                            'provider_unavailable',
+                            'submission_failed',
+                            'invalid_integration',
+                            'invalid_seasons',
+                            'not_found',
+                            'already_requested',
+                            'already_available',
+                            'request_not_found',
+                            'request_not_dismissible',
+                        ],
+                    ];
+                }
+
+                if (! empty($aiostreamsData)) {
+                    $m3uEditorPayload['aiostreams'] = $aiostreamsData;
+                }
 
                 $proxyData = $this->resolveProxyData($playlist, $features, $authMethod, $playlistAuth);
                 if (! empty($proxyData)) {
@@ -1042,10 +1212,14 @@ class XtreamApiController extends Controller
             // Check if this is a media server integration series (already has metadata from sync)
             $isMediaServerSeries = ! empty($seriesItem->metadata['media_server_id'] ?? null);
 
+            // DVR-generated series have no upstream Xtream source; skip the provider
+            // fetch entirely to avoid calling getSeriesInfo(null) and corrupting the response.
+            $isDvrSeries = $seriesItem->import_batch_no === 'dvr';
+
             // fetchMetadata() handles its own freshness check internally (comparing last_modified
             // against last_metadata_fetch). It returns null when no fetch was needed, false on
             // failure, or an episode count on success.
-            if (! $isMediaServerSeries) {
+            if (! $isMediaServerSeries && ! $isDvrSeries) {
                 $results = $seriesItem->fetchMetadata(sync: false);
                 if ($results !== null && $results !== false) {
                     // Provider returned new data — reload the model with fresh relations
@@ -1134,7 +1308,7 @@ class XtreamApiController extends Controller
                                 'episode_num' => $episode->episode_num,
                                 'title' => $episode->title ?? "Episode {$episode->episode_num}",
                                 'container_extension' => $containerExtension,
-                                'info' => array_merge($episode->info, [
+                                'info' => array_merge($episode->info ?? [], [
                                     'movie_image' => $movieImage ?? null,
                                     'cover_big' => $coverBig ?? null,
                                     'plot' => $episode->plot ?? null,
@@ -1236,6 +1410,10 @@ class XtreamApiController extends Controller
 
                     return $cat;
                 }, $liveCategories);
+
+                // Custom playlist categories are the displayed tag/group names, so the alias
+                // filter is applied to the built list rather than to the underlying queries.
+                $liveCategories = self::filterCategoriesByName($liveCategories, $aliasLiveGroupFilter);
             } else {
                 // For regular Playlist and MergedPlaylist, use the groups() relationship
                 $groups = $playlist->groups()
@@ -1346,6 +1524,8 @@ class XtreamApiController extends Controller
 
                     return $cat;
                 }, $vodCategories);
+
+                $vodCategories = self::filterCategoriesByName($vodCategories, $aliasVodGroupFilter);
             } else {
                 // For regular Playlist and MergedPlaylist, use the groups() relationship
                 $vodGroups = $playlist->groups()
@@ -1471,6 +1651,8 @@ class XtreamApiController extends Controller
 
                     return $cat;
                 }, $seriesCategories);
+
+                $seriesCategories = self::filterCategoriesByName($seriesCategories, $aliasCategoryFilter);
             } else {
                 // Get categories from series only — the series() relationship on PlaylistAlias
                 // automatically applies any alias category filter, so no extra scoping needed.
@@ -1962,7 +2144,7 @@ class XtreamApiController extends Controller
             // For m3u_plus, redirect to the m3u method which handles the request
             return $this->m3u($playlist);
         } elseif ($action === 'get_viewers') {
-            return $this->getViewers($playlist);
+            return $this->getViewers($request, $playlist, $authMethod, $username, $password);
         } elseif ($action === 'create_viewer') {
             return $this->createViewer($request, $playlist);
         } elseif ($action === 'get_progress') {
@@ -1973,6 +2155,49 @@ class XtreamApiController extends Controller
             return $this->getSeriesProgress($request, $playlist, $authMethod, $username, $password);
         } elseif ($action === 'get_recently_watched') {
             return $this->getRecentlyWatched($request, $playlist, $authMethod, $username, $password);
+        } elseif ($action === 'get_favorites') {
+            return $this->getFavorites($request, $playlist, $authMethod, $username, $password);
+        } elseif ($action === 'toggle_favorite') {
+            return $this->toggleFavorite($request, $playlist, $authMethod, $username, $password);
+        } elseif ($action === 'sync_favorites') {
+            return $this->syncFavorites($request, $playlist, $authMethod, $username, $password);
+        } elseif ($action === 'request_search') {
+            return $this->searchRequests($request, $playlist, $authMethod, $playlistAuth);
+        } elseif ($action === 'request_submit') {
+            return $this->submitRequest($request, $playlist, $authMethod, $playlistAuth);
+        } elseif ($action === 'request_history') {
+            return $this->requestHistory($request, $playlist, $authMethod, $playlistAuth);
+        } elseif ($action === 'request_status') {
+            return $this->requestStatus($request, $playlist, $authMethod, $playlistAuth);
+        } elseif ($action === 'request_dismiss') {
+            return $this->dismissRequest($request, $playlist, $authMethod, $playlistAuth);
+        } elseif (in_array($action, self::DVR_ACTIONS, true)) {
+            $dvrPlaylist = $this->resolveDvrPlaylist($playlist);
+            if (! $dvrPlaylist) {
+                return response()->json(['error' => 'DVR access denied'], 403);
+            }
+
+            // Advertising the DVR feature already gates playlist_auth credentials on
+            // their own `dvr_enabled` flag (see canAdvertiseDvrFeature) — enforce the
+            // same rule here so a credential the TV app never showed DVR controls for
+            // can't dispatch DVR actions directly against the shared playlist DVR setting.
+            if ($authMethod === 'playlist_auth' && ! $playlistAuth?->dvr_enabled) {
+                return response()->json(['error' => 'DVR access denied'], 403);
+            }
+
+            return match ($action) {
+                'get_dvr_recordings' => $this->getDvrRecordings($request, $dvrPlaylist, $username, $password, $playlistAuth),
+                'get_dvr_recording' => $this->getDvrRecording($request, $dvrPlaylist, $username, $password, $playlistAuth),
+                'get_dvr_storage' => $this->getDvrStorage($dvrPlaylist, $playlistAuth),
+                'schedule_dvr' => $this->scheduleDvr($request, $dvrPlaylist, $playlistAuth),
+                'create_dvr_series_rule' => $this->createDvrSeriesRule($request, $dvrPlaylist, $playlistAuth),
+                'update_dvr_series_rule' => $this->updateDvrSeriesRule($request, $dvrPlaylist, $playlistAuth),
+                'cancel_dvr_recording' => $this->cancelDvrRecording($request, $dvrPlaylist, $playlistAuth),
+                'delete_dvr_recording' => $this->deleteDvrRecording($request, $dvrPlaylist, $playlistAuth),
+                'list_dvr_series_rules' => $this->listDvrSeriesRules($request, $dvrPlaylist, $playlistAuth),
+                'delete_dvr_series_rule' => $this->deleteDvrSeriesRule($request, $dvrPlaylist, $playlistAuth),
+                'search_epg_shows' => $this->searchEpgShows($request, $dvrPlaylist, $playlistAuth),
+            };
         } else {
             return response()->json(['error' => 'Invalid action parameter'], 400);
         }
@@ -2023,6 +2248,25 @@ class XtreamApiController extends Controller
     }
 
     /**
+     * Restrict a built category list to the names allowed by an alias's channel filter.
+     *
+     * @param  array<int, array<string, mixed>>  $categories
+     * @param  array<string>  $allowedNames  An empty list means no restriction.
+     * @return array<int, array<string, mixed>>
+     */
+    private static function filterCategoriesByName(array $categories, array $allowedNames): array
+    {
+        if (empty($allowedNames)) {
+            return $categories;
+        }
+
+        return array_values(array_filter(
+            $categories,
+            fn (array $category): bool => in_array($category['category_name'], $allowedNames, true)
+        ));
+    }
+
+    /**
      * Get live streams for a network playlist.
      * Each network becomes a "channel" in the Xtream API response.
      */
@@ -2041,14 +2285,13 @@ class XtreamApiController extends Controller
             $streamIcon = $network->logo ?: $baseUrl.'/placeholder.png';
             $categoryId = $categoryMap[$network->effective_group_name] ?? 'networks';
 
-            // Use network ID as stream_id, channel_number as epg_channel_id
             $liveStreams[] = [
                 'num' => $network->channel_number ?? $network->id,
                 'name' => $network->name,
                 'stream_type' => 'live',
                 'stream_id' => $network->id,
                 'stream_icon' => $streamIcon,
-                'epg_channel_id' => 'network-'.($network->channel_number ?? $network->id),
+                'epg_channel_id' => 'network-'.$network->id,
                 'added' => (string) $network->created_at->timestamp,
                 'category_id' => $categoryId,
                 'category_ids' => [$categoryId],
@@ -2129,26 +2372,14 @@ class XtreamApiController extends Controller
             ->where('end_time', '>', $now)
             ->orderBy('start_time')
             ->limit($limit)
+            ->with('contentable')
             ->get();
 
         $epgListings = [];
         foreach ($programmes as $index => $programme) {
             $isCurrentProgramme = $programme->start_time->lte($now) && $programme->end_time->gt($now);
 
-            $epgListings[] = [
-                'id' => (string) $programme->id,
-                'epg_id' => (string) $network->id,
-                'title' => base64_encode($programme->title),
-                'lang' => 'en',
-                'start' => $programme->start_time->format('Y-m-d H:i:s'),
-                'end' => $programme->end_time->format('Y-m-d H:i:s'),
-                'description' => base64_encode($programme->description ?? ''),
-                'channel_id' => 'network-'.($network->channel_number ?? $network->id),
-                'start_timestamp' => (string) $programme->start_time->timestamp,
-                'stop_timestamp' => (string) $programme->end_time->timestamp,
-                'now_playing' => $isCurrentProgramme ? 1 : 0,
-                'has_archive' => 0,
-            ];
+            $epgListings[] = $this->buildNetworkEpgListing($programme, $network, $isCurrentProgramme);
         }
 
         return response()->json(['epg_listings' => $epgListings]);
@@ -2188,53 +2419,125 @@ class XtreamApiController extends Controller
         foreach ($programmes as $programme) {
             $isCurrentProgramme = $programme->start_time->lte($now) && $programme->end_time->gt($now);
 
-            $epgListings[] = [
-                'id' => (string) $programme->id,
-                'epg_id' => (string) $network->id,
-                'title' => base64_encode($programme->title),
-                'lang' => 'en',
-                'start' => $programme->start_time->format('Y-m-d H:i:s'),
-                'end' => $programme->end_time->format('Y-m-d H:i:s'),
-                'description' => base64_encode($programme->description ?? ''),
-                'channel_id' => 'network-'.($network->channel_number ?? $network->id),
-                'start_timestamp' => (string) $programme->start_time->timestamp,
-                'stop_timestamp' => (string) $programme->end_time->timestamp,
-                'now_playing' => $isCurrentProgramme ? 1 : 0,
-                'has_archive' => 0,
-            ];
+            $epgListings[] = $this->buildNetworkEpgListing($programme, $network, $isCurrentProgramme);
         }
 
         return response()->json(['epg_listings' => $epgListings]);
     }
 
     /**
-     * Resolve the PlaylistViewer from the viewer_id (ulid) ensuring it belongs
-     * to the current playlist context.
+     * Build a single Xtream-API-compatible EPG listing array for a network programme.
+     * Resolves description from stored value with fallback to the contentable's metadata.
+     *
+     * @return array<string, mixed>
      */
-    private function resolveViewer(string $viewerUlid, $playlist): ?PlaylistViewer
+    private function buildNetworkEpgListing(NetworkProgramme $programme, Network $network, bool $isCurrentProgramme): array
     {
-        return PlaylistViewer::where('ulid', $viewerUlid)
-            ->where('viewerable_type', $playlist->getMorphClass())
-            ->where('viewerable_id', $playlist->id)
+        $description = $programme->description;
+
+        if (empty($description)) {
+            $content = $programme->contentable;
+            if ($content) {
+                $info = $content->info ?? [];
+                $description = $info['plot']
+                    ?? $info['description']
+                    ?? $content->movie_data['info']['plot']
+                    ?? $content->movie_data['info']['description']
+                    ?? null;
+            }
+        }
+
+        return [
+            'id' => (string) $programme->id,
+            'epg_id' => (string) $network->id,
+            'title' => base64_encode($programme->title),
+            'lang' => 'en',
+            'start' => $programme->start_time->format('Y-m-d H:i:s'),
+            'end' => $programme->end_time->format('Y-m-d H:i:s'),
+            'description' => base64_encode($description ?? ''),
+            'channel_id' => 'network-'.$network->id,
+            'start_timestamp' => (string) $programme->start_time->timestamp,
+            'stop_timestamp' => (string) $programme->end_time->timestamp,
+            'now_playing' => $isCurrentProgramme ? 1 : 0,
+            'has_archive' => 0,
+        ];
+    }
+
+    /**
+     * Resolve the PlaylistAuth for the current request's credentials, applying
+     * the same enabled/expiry filtering used at authentication time.
+     */
+    private function resolvePlaylistAuth(string $authMethod, string $username, string $password): ?PlaylistAuth
+    {
+        if ($authMethod !== 'playlist_auth') {
+            return null;
+        }
+
+        return PlaylistAuth::where('username', $username)
+            ->where('password', $password)
+            ->where('enabled', true)
+            ->where(function ($query) {
+                $query->whereNull('expires_at')
+                    ->orWhere('expires_at', '>', now());
+            })
             ->first();
     }
 
     /**
+     * Resolve the PlaylistViewer from the viewer_id (ulid) ensuring it belongs
+     * both to the current playlist context AND to the requesting auth — a
+     * playlist_auth login may only resolve its own viewer, and an owner/alias
+     * login may only resolve admin-owned (non playlist_auth) viewers.
+     */
+    private function resolveViewer(string $viewerUlid, $playlist, string $authMethod, string $username, string $password): ?PlaylistViewer
+    {
+        $viewer = PlaylistViewer::where('ulid', $viewerUlid)
+            ->where('viewerable_type', $playlist->getMorphClass())
+            ->where('viewerable_id', $playlist->id)
+            ->first();
+
+        if (! $viewer) {
+            return null;
+        }
+
+        if ($authMethod === 'playlist_auth') {
+            $playlistAuth = $this->resolvePlaylistAuth($authMethod, $username, $password);
+
+            return ($playlistAuth && $viewer->playlist_auth_id === $playlistAuth->id) ? $viewer : null;
+        }
+
+        return $viewer->playlist_auth_id === null ? $viewer : null;
+    }
+
+    /**
      * Resolve viewer from request context, with fallback based on auth method:
-     * - viewer_id param provided → use it
+     * - viewer_id param provided and owned by this auth → use it
+     * - viewer_id missing, or provided but owned by someone else (e.g. a
+     *   stale client cache predating per-auth viewer isolation) → self-heal
+     *   by deriving this auth's own viewer instead of failing the request
      * - playlist_auth → find or create PlaylistViewer linked to the PlaylistAuth
      * - owner_auth / alias_auth → use the admin viewer for this playlist
      */
     private function resolveContextViewer(Request $request, $playlist, string $authMethod, string $username, string $password): ?PlaylistViewer
     {
         if ($viewerUlid = $request->input('viewer_id')) {
-            return $this->resolveViewer($viewerUlid, $playlist);
+            $viewer = $this->resolveViewer($viewerUlid, $playlist, $authMethod, $username, $password);
+            if ($viewer) {
+                return $viewer;
+            }
         }
 
+        return $this->resolveOwnViewer($playlist, $authMethod, $username, $password);
+    }
+
+    /**
+     * Derive the viewer that belongs to this auth context, independent of any
+     * (possibly stale or foreign) viewer_id the client may have sent.
+     */
+    private function resolveOwnViewer($playlist, string $authMethod, string $username, string $password): ?PlaylistViewer
+    {
         if ($authMethod === 'playlist_auth') {
-            $playlistAuth = PlaylistAuth::where('username', $username)
-                ->where('password', $password)
-                ->first();
+            $playlistAuth = $this->resolvePlaylistAuth($authMethod, $username, $password);
 
             if ($playlistAuth) {
                 $viewer = PlaylistViewer::where('playlist_auth_id', $playlistAuth->id)
@@ -2265,12 +2568,23 @@ class XtreamApiController extends Controller
     }
 
     /**
-     * Return all viewers for the current playlist context.
+     * Return the viewers visible to the current auth context:
+     * - playlist_auth → only that login's own viewer (auto-created if missing)
+     * - owner_auth / alias_auth → the admin-owned/switchable viewer profiles
+     *   (playlist_auth-owned viewers are a distinct login's identity, not a
+     *   selectable "profile", and must never be exposed to other logins)
      */
-    private function getViewers($playlist): \Illuminate\Http\JsonResponse
+    private function getViewers(Request $request, $playlist, string $authMethod = 'none', string $username = '', string $password = ''): \Illuminate\Http\JsonResponse
     {
+        if ($authMethod === 'playlist_auth') {
+            $viewer = $this->resolveContextViewer($request, $playlist, $authMethod, $username, $password);
+
+            return response()->json($viewer ? [$viewer->only(['id', 'ulid', 'name', 'is_admin'])] : []);
+        }
+
         $viewers = PlaylistViewer::where('viewerable_type', $playlist->getMorphClass())
             ->where('viewerable_id', $playlist->id)
+            ->whereNull('playlist_auth_id')
             ->orderByDesc('is_admin')
             ->orderBy('name')
             ->get(['id', 'ulid', 'name', 'is_admin']);
@@ -2335,10 +2649,14 @@ class XtreamApiController extends Controller
     private function updateProgress(Request $request, $playlist, string $authMethod = 'none', string $username = '', string $password = ''): \Illuminate\Http\JsonResponse
     {
         $contentType = $request->input('content_type');
-        $streamId = (int) $request->input('stream_id');
+        $aioItemId = $request->input('aio_item_id');
 
-        if (! $contentType || ! $streamId) {
-            return response()->json(['error' => 'content_type and stream_id are required'], 400);
+        // AIOStreams content is keyed by aio_item_id rather than an integer stream_id.
+        $isAio = $contentType === 'aiostreams';
+        $streamId = $isAio ? null : (int) $request->input('stream_id');
+
+        if (! $contentType || (! $isAio && ! $streamId) || ($isAio && ! $aioItemId)) {
+            return response()->json(['error' => 'content_type and (stream_id or aio_item_id) are required'], 400);
         }
 
         $viewer = $this->resolveContextViewer($request, $playlist, $authMethod, $username, $password);
@@ -2365,7 +2683,32 @@ class XtreamApiController extends Controller
             'last_watched_at' => now(),
         ];
 
-        if ($contentType === 'live') {
+        if ($isAio) {
+            $aioIntegrationId = $request->input('aio_integration_id') ? (int) $request->input('aio_integration_id') : null;
+
+            $progress = ViewerWatchProgress::updateOrCreate(
+                [
+                    'playlist_viewer_id' => $viewer->id,
+                    'aio_item_id' => $aioItemId,
+                ],
+                array_merge($data, [
+                    'content_type' => 'aiostreams',
+                    'aio_integration_id' => $aioIntegrationId,
+                    'title' => $request->input('title'),
+                    'episode_title' => $request->input('episode_title'),
+                    'thumbnail_url' => $request->input('thumbnail_url'),
+                    'backdrop_url' => $request->input('backdrop_url'),
+                    'rating' => $request->input('rating'),
+                    'year' => $request->input('year'),
+                    'plot' => $request->input('plot'),
+                    'season_number' => $seasonNumber,
+                    'episode_number' => $episodeNumber,
+                    'position_seconds' => $positionSeconds,
+                    'duration_seconds' => $durationSeconds,
+                    'completed' => $completed,
+                ])
+            );
+        } elseif ($contentType === 'live') {
             // For live TV, just increment watch count
             $existing = ViewerWatchProgress::where('playlist_viewer_id', $viewer->id)
                 ->where('content_type', 'live')
@@ -2511,6 +2854,21 @@ class XtreamApiController extends Controller
                 $data['plot'] = $info['plot'] ?? $info['description'] ?? $info['desc'] ?? null;
                 $data['genre'] = $info['genre'] ?? $info['category_name'] ?? null;
                 $data['year'] = $channel?->year ?? $info['releasedate'] ?? $info['year'] ?? null;
+            } elseif ($progress->content_type === 'aiostreams') {
+                // AIOStreams — metadata is stored denormalised; no join needed.
+                $data['title'] = $progress->title;
+                $data['episode_title'] = $progress->episode_title;
+                $data['series_name'] = null;
+                $data['season_number'] = $progress->season_number;
+                $data['episode_number'] = $progress->episode_number;
+                $data['thumbnail_url'] = $progress->thumbnail_url;
+                $data['backdrop_url'] = $progress->backdrop_url;
+                $data['rating'] = $progress->rating;
+                $data['runtime'] = $this->formatRuntimeFromSeconds($progress->duration_seconds);
+                $data['plot'] = $progress->plot;
+                $data['year'] = $progress->year;
+                $data['aio_item_id'] = $progress->aio_item_id;
+                $data['aio_integration_id'] = $progress->aio_integration_id;
             } else {
                 // live
                 $channel = $progress->channel;
@@ -2535,6 +2893,231 @@ class XtreamApiController extends Controller
     }
 
     /**
+     * Get all favorites for a viewer, optionally filtered by content_type.
+     */
+    private function getFavorites(Request $request, $playlist, string $authMethod = 'none', string $username = '', string $password = ''): \Illuminate\Http\JsonResponse
+    {
+        $viewer = $this->resolveContextViewer($request, $playlist, $authMethod, $username, $password);
+        if (! $viewer) {
+            return response()->json(['error' => 'Viewer not found'], 404);
+        }
+
+        $type = $request->input('content_type'); // 'live', 'vod', 'series', 'aiostreams', or null for all
+        $imdbId = $request->input('imdb_id'); // cross-reference: favorites of this title from any content_type/source
+
+        $query = ViewerFavorite::where('playlist_viewer_id', $viewer->id);
+        if ($type && in_array($type, ['live', 'vod', 'series', 'aiostreams'], true)) {
+            $query->where('content_type', $type);
+        }
+        if ($imdbId) {
+            $query->forImdbId($imdbId);
+        }
+
+        $favorites = $query->get(self::FAVORITE_COLUMNS);
+
+        return response()->json($favorites);
+    }
+
+    /**
+     * Add or remove a single favorite for a viewer. Idempotent: favoriting an
+     * already-favorited item (or unfavoriting one that isn't) is a no-op.
+     */
+    private function toggleFavorite(Request $request, $playlist, string $authMethod = 'none', string $username = '', string $password = ''): \Illuminate\Http\JsonResponse
+    {
+        $contentType = $request->input('content_type');
+        $aioItemId = $request->input('aio_item_id');
+        $isAio = $contentType === 'aiostreams';
+        $streamId = $isAio ? null : (int) $request->input('stream_id');
+        $favorited = $request->boolean('favorited', true);
+
+        if (! in_array($contentType, ['live', 'vod', 'series', 'aiostreams'], true)) {
+            return response()->json(['error' => 'content_type must be one of live, vod, series, aiostreams'], 400);
+        }
+
+        if ((! $isAio && ! $streamId) || ($isAio && ! $aioItemId)) {
+            return response()->json(['error' => 'stream_id or aio_item_id is required'], 400);
+        }
+
+        $viewer = $this->resolveContextViewer($request, $playlist, $authMethod, $username, $password);
+        if (! $viewer) {
+            return response()->json(['error' => 'Viewer not found'], 404);
+        }
+
+        $key = $isAio
+            ? ['playlist_viewer_id' => $viewer->id, 'aio_item_id' => $aioItemId]
+            : ['playlist_viewer_id' => $viewer->id, 'content_type' => $contentType, 'stream_id' => $streamId];
+
+        $aioMetadata = [];
+
+        if ($favorited) {
+            $crossRef = $this->resolveFavoriteCrossReference(
+                $contentType,
+                $streamId,
+                $aioItemId,
+                $request->input('imdb_id'),
+                $request->input('tmdb_id'),
+            );
+
+            $aioMetadata = $isAio ? $this->aioMetadataFromRequest($request) : [];
+
+            $attributes = array_merge($key, [
+                'content_type' => $contentType,
+                'favorited_at' => now(),
+                'imdb_id' => $crossRef['imdb'],
+                'tmdb_id' => $crossRef['tmdb'],
+            ], $aioMetadata);
+
+            ViewerFavorite::updateOrCreate($key, $attributes);
+        } else {
+            ViewerFavorite::where($key)->delete();
+        }
+
+        broadcast(ViewerFavoriteEvent::build(
+            $playlist,
+            $viewer,
+            $contentType,
+            $streamId,
+            $aioItemId,
+            $favorited,
+            $aioMetadata,
+        ));
+
+        return response()->json(['favorited' => $favorited]);
+    }
+
+    /**
+     * @return array{aio_integration_id: ?int, title: ?string, thumbnail_url: ?string, item_type: ?string}
+     */
+    private function aioMetadataFromRequest(Request $request): array
+    {
+        return [
+            'aio_integration_id' => $request->input('aio_integration_id') ? (int) $request->input('aio_integration_id') : null,
+            'title' => $request->input('title'),
+            'thumbnail_url' => $request->input('thumbnail_url'),
+            'item_type' => $request->input('item_type'),
+        ];
+    }
+
+    /**
+     * Server-side lookup of universal cross-reference ids for a favorite.
+     * vod/series are resolved from the local Channel/Series row — authoritative,
+     * never trusted from the client. AIOStreams items have no local row, so their
+     * imdb_id is derived from the addon's own item id when it looks like an IMDb
+     * id (the common case for AIOStreams catalogs), falling back to whatever the
+     * addon's metadata told the client, since the server can't independently
+     * verify third-party addon content.
+     *
+     * @return array{imdb: ?string, tmdb: ?string}
+     */
+    private function resolveFavoriteCrossReference(
+        string $contentType,
+        ?int $streamId,
+        ?string $aioItemId,
+        ?string $clientImdbId,
+        ?string $clientTmdbId,
+    ): array {
+        if ($contentType === 'vod' && $streamId) {
+            $channel = Channel::find($streamId);
+            $tmdbId = $channel?->getTmdbId();
+
+            return [
+                'imdb' => $channel?->getImdbId(),
+                'tmdb' => $tmdbId !== null ? (string) $tmdbId : null,
+            ];
+        }
+
+        if ($contentType === 'series' && $streamId) {
+            $ids = Series::find($streamId)?->getMovieDbIds() ?? [];
+
+            return [
+                'imdb' => $ids['imdb'] ?? null,
+                'tmdb' => isset($ids['tmdb']) ? (string) $ids['tmdb'] : null,
+            ];
+        }
+
+        if ($contentType === 'aiostreams') {
+            $looksLikeImdbId = is_string($aioItemId) && preg_match('/^tt\d+$/', $aioItemId) === 1;
+
+            return [
+                'imdb' => $clientImdbId ?: ($looksLikeImdbId ? $aioItemId : null),
+                'tmdb' => $clientTmdbId,
+            ];
+        }
+
+        return ['imdb' => null, 'tmdb' => null];
+    }
+
+    /**
+     * One-time reconciliation for a client with pre-existing local-only favorites:
+     * union the client's set into the viewer's server-side favorites and return the
+     * merged result. Clients call this once (e.g. on first connect after upgrading to
+     * server-backed favorites) and treat get_favorites/toggle_favorite as authoritative
+     * afterward — this endpoint does not delete anything, only adds.
+     */
+    private function syncFavorites(Request $request, $playlist, string $authMethod = 'none', string $username = '', string $password = ''): \Illuminate\Http\JsonResponse
+    {
+        $viewer = $this->resolveContextViewer($request, $playlist, $authMethod, $username, $password);
+        if (! $viewer) {
+            return response()->json(['error' => 'Viewer not found'], 404);
+        }
+
+        $items = $request->input('favorites', []);
+        if (! is_array($items)) {
+            return response()->json(['error' => 'favorites must be an array'], 400);
+        }
+
+        foreach ($items as $item) {
+            if (! is_array($item)) {
+                continue;
+            }
+
+            $contentType = $item['content_type'] ?? null;
+            if (! in_array($contentType, ['live', 'vod', 'series', 'aiostreams'], true)) {
+                continue;
+            }
+
+            $isAio = $contentType === 'aiostreams';
+            $aioItemId = $item['aio_item_id'] ?? null;
+            $streamId = $isAio ? null : (isset($item['stream_id']) ? (int) $item['stream_id'] : null);
+
+            if ((! $isAio && ! $streamId) || ($isAio && ! $aioItemId)) {
+                continue;
+            }
+
+            $key = $isAio
+                ? ['playlist_viewer_id' => $viewer->id, 'aio_item_id' => $aioItemId]
+                : ['playlist_viewer_id' => $viewer->id, 'content_type' => $contentType, 'stream_id' => $streamId];
+
+            $crossRef = $this->resolveFavoriteCrossReference(
+                $contentType,
+                $streamId,
+                $aioItemId,
+                is_string($item['imdb_id'] ?? null) ? $item['imdb_id'] : null,
+                is_string($item['tmdb_id'] ?? null) ? $item['tmdb_id'] : null,
+            );
+
+            $attributes = array_merge($key, [
+                'content_type' => $contentType,
+                'favorited_at' => now(),
+                'imdb_id' => $crossRef['imdb'],
+                'tmdb_id' => $crossRef['tmdb'],
+            ], $isAio ? [
+                'aio_integration_id' => isset($item['aio_integration_id']) ? (int) $item['aio_integration_id'] : null,
+                'title' => is_string($item['title'] ?? null) ? $item['title'] : null,
+                'thumbnail_url' => is_string($item['thumbnail_url'] ?? null) ? $item['thumbnail_url'] : null,
+                'item_type' => is_string($item['item_type'] ?? null) ? $item['item_type'] : null,
+            ] : []);
+
+            ViewerFavorite::updateOrCreate($key, $attributes);
+        }
+
+        $favorites = ViewerFavorite::where('playlist_viewer_id', $viewer->id)
+            ->get(self::FAVORITE_COLUMNS);
+
+        return response()->json($favorites);
+    }
+
+    /**
      * Extract the first URL from a backdrop_path value.
      * Handles both native arrays and double-encoded JSON strings.
      */
@@ -2553,6 +3136,158 @@ class XtreamApiController extends Controller
         }
 
         return null;
+    }
+
+    /**
+     * Resolve optional m3u-editor capabilities advertised to compatible clients.
+     *
+     * DVR is only advertised when the effective playlist has DVR enabled and,
+     * for PlaylistAuth credentials, the individual auth is allowed to use DVR.
+     * Owner/alias credentials keep access when the playlist itself has DVR enabled.
+     *
+     * @return array<int, string>
+     */
+    private function resolveM3uEditorFeatures($playlist, string $authMethod, ?PlaylistAuth $playlistAuth): array
+    {
+        $features = ['viewers', 'progress'];
+
+        if ($this->canAdvertiseDvrFeature($playlist, $authMethod, $playlistAuth)) {
+            $features[] = 'dvr';
+        }
+
+        if ($this->requestsFeatureEnabled($playlist, $authMethod, $playlistAuth)) {
+            $features[] = 'requests';
+        }
+
+        if ($this->hasAIOStreams($playlist, $authMethod, $playlistAuth)) {
+            $features[] = 'aiostreams';
+        }
+
+        if ($this->canAdvertiseProxyFeature($playlist, $authMethod, $playlistAuth)) {
+            $features[] = 'proxy';
+        }
+
+        return $features;
+    }
+
+    private function hasAIOStreams($playlist, string $authMethod, ?PlaylistAuth $playlistAuth): bool
+    {
+        $effectivePlaylist = $this->resolveEffectivePlaylist($playlist);
+
+        if (! $effectivePlaylist) {
+            return false;
+        }
+
+        $hasEnabledAiostreams = $effectivePlaylist->aiostreams_integration_id !== null
+            && optional($effectivePlaylist->aiostreamsIntegration)->enabled;
+
+        if (! $hasEnabledAiostreams) {
+            return false;
+        }
+
+        if ($authMethod !== 'playlist_auth') {
+            return true;
+        }
+
+        return (bool) $playlistAuth?->aiostreams_enabled;
+    }
+
+    /**
+     * Unwrap a PlaylistAlias to its effective playlist; otherwise return the
+     * playlist as-is if it's one of the three playlist types that carry their
+     * own DVR/Requests/AIOStreams settings.
+     */
+    private function resolveEffectivePlaylist($playlist): Playlist|CustomPlaylist|MergedPlaylist|null
+    {
+        $effective = $playlist instanceof PlaylistAlias
+            ? $playlist->getEffectivePlaylist()
+            : $playlist;
+
+        return $effective instanceof Playlist || $effective instanceof CustomPlaylist || $effective instanceof MergedPlaylist
+            ? $effective
+            : null;
+    }
+
+    /**
+     * Build the AIOStreams payload for the auth response.
+     * Returns an array of integration configs with their catalog lists.
+     *
+     * @return array<int, array{id: int, name: string, catalogs: array<int, array{id: string, type: string, name: string}>}>
+     */
+    private function resolveAIOStreamsData($playlist, array $features): array
+    {
+        if (! in_array('aiostreams', $features)) {
+            return [];
+        }
+
+        $effectivePlaylist = $this->resolveEffectivePlaylist($playlist);
+
+        if (! $effectivePlaylist) {
+            return [];
+        }
+
+        $integration = $effectivePlaylist->aiostreamsIntegration;
+        if (! $integration || ! $integration->enabled) {
+            return [];
+        }
+
+        return [
+            [
+                'id' => $integration->id,
+                'name' => $integration->name,
+                'logo' => $integration->aiostreams_logo,
+                'catalogs' => $this->filterAIOStreamsCatalogs($integration),
+            ],
+        ];
+    }
+
+    /**
+     * Filter AIOStreams catalogs by the integration's selected catalog IDs.
+     * A null selection means all catalogs are enabled.
+     *
+     * @return array<int, array{id: string, type: string, name: string, searchable: bool}>
+     */
+    private function filterAIOStreamsCatalogs($integration): array
+    {
+        $all = $integration->aiostreams_catalogs ?? [];
+
+        if ($integration->aiostreams_enable_all_catalogs) {
+            return $all;
+        }
+
+        $selectedSet = array_flip($integration->aiostreams_selected_catalog_ids ?? []);
+
+        return collect($all)
+            ->filter(fn (array $catalog) => isset($selectedSet[$catalog['id'].'_'.$catalog['type']]))
+            ->values()
+            ->all();
+    }
+
+    private function canAdvertiseDvrFeature($playlist, string $authMethod, ?PlaylistAuth $playlistAuth): bool
+    {
+        if (! (config('dvr.dvr_enabled', true) && config('proxy.proxy_integration_enabled', true))) {
+            return false;
+        }
+
+        $dvrPlaylist = $this->resolveDvrPlaylist($playlist);
+        if (! $dvrPlaylist) {
+            return false;
+        }
+
+        if (! $dvrPlaylist->dvrSetting?->enabled) {
+            return false;
+        }
+
+        if ($authMethod !== 'playlist_auth') {
+            return true;
+        }
+
+        return (bool) $playlistAuth?->dvr_enabled;
+    }
+
+    private function resolveDvrPlaylist($playlist): Playlist|CustomPlaylist|MergedPlaylist|null
+    {
+        return $this->resolveEffectivePlaylist($playlist);
     }
 
     /**
@@ -2582,26 +3317,13 @@ class XtreamApiController extends Controller
             ->where('end_time', '>', $now)
             ->orderBy('start_time')
             ->limit($limit)
+            ->with('contentable')
             ->get();
 
         $epgListings = [];
         foreach ($programmes as $programme) {
             $isCurrentProgramme = $programme->start_time->lte($now) && $programme->end_time->gt($now);
-
-            $epgListings[] = [
-                'id' => (string) $programme->id,
-                'epg_id' => (string) $network->id,
-                'title' => base64_encode($programme->title),
-                'lang' => 'en',
-                'start' => $programme->start_time->format('Y-m-d H:i:s'),
-                'end' => $programme->end_time->format('Y-m-d H:i:s'),
-                'description' => base64_encode($programme->description ?? ''),
-                'channel_id' => 'network-'.$network->id,
-                'start_timestamp' => (string) $programme->start_time->timestamp,
-                'stop_timestamp' => (string) $programme->end_time->timestamp,
-                'now_playing' => $isCurrentProgramme ? 1 : 0,
-                'has_archive' => 0,
-            ];
+            $epgListings[] = $this->buildNetworkEpgListing($programme, $network, $isCurrentProgramme);
         }
 
         return response()->json(['epg_listings' => $epgListings]);
@@ -2636,30 +3358,1141 @@ class XtreamApiController extends Controller
             ->where('start_time', '>=', $today)
             ->where('start_time', '<', $tomorrow)
             ->orderBy('start_time')
+            ->with('contentable')
             ->get();
 
         $now = Carbon::now();
         $epgListings = [];
         foreach ($programmes as $programme) {
             $isCurrentProgramme = $programme->start_time->lte($now) && $programme->end_time->gt($now);
-
-            $epgListings[] = [
-                'id' => (string) $programme->id,
-                'epg_id' => (string) $network->id,
-                'title' => base64_encode($programme->title),
-                'lang' => 'en',
-                'start' => $programme->start_time->format('Y-m-d H:i:s'),
-                'end' => $programme->end_time->format('Y-m-d H:i:s'),
-                'description' => base64_encode($programme->description ?? ''),
-                'channel_id' => 'network-'.$network->id,
-                'start_timestamp' => (string) $programme->start_time->timestamp,
-                'stop_timestamp' => (string) $programme->end_time->timestamp,
-                'now_playing' => $isCurrentProgramme ? 1 : 0,
-                'has_archive' => 0,
-            ];
+            $epgListings[] = $this->buildNetworkEpgListing($programme, $network, $isCurrentProgramme);
         }
 
         return response()->json(['epg_listings' => $epgListings]);
+    }
+
+    /**
+     * List DVR recordings for the authenticated playlist, optionally filtered by status.
+     */
+    private function getDvrRecordings(Request $request, $playlist, string $username, string $password, ?PlaylistAuth $playlistAuth): \Illuminate\Http\JsonResponse
+    {
+        $dvrSetting = $playlist->dvrSetting;
+
+        if (! $dvrSetting) {
+            return response()->json([]);
+        }
+
+        $status = $request->input('status');
+        $limit = min((int) $request->input('limit', 50), 200);
+        $offset = (int) $request->input('offset', 0);
+
+        $query = DvrRecording::where('dvr_setting_id', $dvrSetting->id)
+            ->when($playlistAuth, fn ($q) => $q->where('playlist_auth_id', $playlistAuth->id))
+            ->with('channel')
+            ->orderByDesc('scheduled_start');
+
+        if ($status) {
+            $statusEnum = DvrRecordingStatus::tryFrom($status);
+            if ($statusEnum) {
+                $query->where('status', $statusEnum);
+            }
+        }
+
+        $recordings = $query->skip($offset)->take($limit)->get();
+
+        return response()->json($recordings->map(fn (DvrRecording $r) => $this->formatDvrRecording($r, $username, $password)));
+    }
+
+    /**
+     * Get a single DVR recording by UUID.
+     */
+    private function getDvrRecording(Request $request, $playlist, string $username, string $password, ?PlaylistAuth $playlistAuth): \Illuminate\Http\JsonResponse
+    {
+        $uuid = $request->input('recording_id');
+
+        if (! $uuid) {
+            return response()->json(['error' => 'recording_id parameter is required'], 400);
+        }
+
+        $dvrSetting = $playlist->dvrSetting;
+
+        if (! $dvrSetting) {
+            return response()->json(['error' => 'DVR not configured for this playlist'], 404);
+        }
+
+        $recording = DvrRecording::where('dvr_setting_id', $dvrSetting->id)
+            ->where('uuid', $uuid)
+            ->when($playlistAuth, fn ($q) => $q->where('playlist_auth_id', $playlistAuth->id))
+            ->with('channel')
+            ->first();
+
+        if (! $recording) {
+            return response()->json(['error' => 'Recording not found'], 404);
+        }
+
+        return response()->json($this->formatDvrRecording($recording, $username, $password, true));
+    }
+
+    /**
+     * Get the current user/guest's DVR storage usage against their quota.
+     *
+     * A guest (PlaylistAuth) only ever sees their own usage, scoped to their own
+     * recordings, regardless of whether they have an explicit quota configured —
+     * guests never see account-wide totals. The account owner sees the whole
+     * DVR setting's usage against its global quota.
+     */
+    private function getDvrStorage($playlist, ?PlaylistAuth $playlistAuth): \Illuminate\Http\JsonResponse
+    {
+        if ($playlistAuth) {
+            $usedBytes = $playlistAuth->storage_used_bytes;
+            $quotaBytes = $playlistAuth->dvr_storage_quota_gb !== null
+                ? $playlistAuth->dvr_storage_quota_gb * 1024 ** 3
+                : null;
+
+            return response()->json([
+                'used_bytes' => $usedBytes,
+                'quota_bytes' => $quotaBytes,
+                'percent_used' => $quotaBytes !== null
+                    ? ($quotaBytes > 0 ? min(100, round($usedBytes / $quotaBytes * 100, 1)) : 100)
+                    : null,
+                'recording_count' => $playlistAuth->dvrRecordings()->count(),
+                'scope' => 'guest',
+            ]);
+        }
+
+        $dvrSetting = $playlist->dvrSetting;
+
+        if (! $dvrSetting) {
+            return response()->json([
+                'used_bytes' => 0,
+                'quota_bytes' => null,
+                'percent_used' => null,
+                'recording_count' => 0,
+                'scope' => 'account',
+            ]);
+        }
+
+        $usedBytes = $dvrSetting->storage_used_bytes;
+        $quotaBytes = $dvrSetting->global_disk_quota_gb > 0
+            ? $dvrSetting->global_disk_quota_gb * 1024 ** 3
+            : null;
+
+        return response()->json([
+            'used_bytes' => $usedBytes,
+            'quota_bytes' => $quotaBytes,
+            'percent_used' => $quotaBytes ? min(100, round($usedBytes / $quotaBytes * 100, 1)) : null,
+            'recording_count' => $dvrSetting->recordings()->count(),
+            'scope' => 'account',
+        ]);
+    }
+
+    /**
+     * List all enabled series recording rules for the authenticated playlist.
+     */
+    private function listDvrSeriesRules(Request $request, $playlist, ?PlaylistAuth $playlistAuth): \Illuminate\Http\JsonResponse
+    {
+        $dvrSetting = $playlist->dvrSetting;
+
+        if (! $dvrSetting) {
+            return response()->json([]);
+        }
+
+        $rules = DvrRecordingRule::where('dvr_setting_id', $dvrSetting->id)
+            ->where('type', DvrRuleType::Series)
+            ->where('enabled', true)
+            ->when($playlistAuth, fn ($q) => $q->where('playlist_auth_id', $playlistAuth->id))
+            ->with('channel')
+            ->withCount('recordings')
+            ->orderBy('created_at', 'desc')
+            ->get();
+
+        return response()->json($rules->map(fn (DvrRecordingRule $rule) => $this->formatDvrSeriesRule($rule)));
+    }
+
+    /**
+     * Delete a series recording rule by ID.
+     */
+    private function deleteDvrSeriesRule(Request $request, $playlist, ?PlaylistAuth $playlistAuth): \Illuminate\Http\JsonResponse
+    {
+        $ruleId = (int) $request->input('rule_id');
+
+        if (! $ruleId) {
+            return response()->json(['error' => 'rule_id parameter is required'], 400);
+        }
+
+        $dvrSetting = $playlist->dvrSetting;
+
+        if (! $dvrSetting) {
+            return response()->json(['error' => 'DVR not configured for this playlist'], 404);
+        }
+
+        $rule = DvrRecordingRule::where('dvr_setting_id', $dvrSetting->id)
+            ->where('id', $ruleId)
+            ->where('type', DvrRuleType::Series)
+            ->when($playlistAuth, fn ($q) => $q->where('playlist_auth_id', $playlistAuth->id))
+            ->first();
+
+        if (! $rule) {
+            return response()->json(['error' => 'Series rule not found'], 404);
+        }
+
+        $rule->delete();
+
+        return response()->json(['success' => true]);
+    }
+
+    /**
+     * Search EPG programme listings across all mapped channels to discover shows
+     * available for series recording. Uses SeriesKey::normalize() on programme
+     * titles so the returned groups match DvrRecordingRule::saving hook's own
+     * normalization — this guarantees that a series rule created from search
+     * results will match future EPG programme data for the same show.
+     */
+    private function searchEpgShows(Request $request, $playlist, ?PlaylistAuth $playlistAuth): \Illuminate\Http\JsonResponse
+    {
+        $q = trim((string) $request->input('q', ''));
+
+        if (mb_strlen($q) < 2) {
+            return response()->json(['error' => 'q parameter is required (minimum 2 characters)'], 400);
+        }
+
+        $dvrSetting = $playlist->dvrSetting;
+
+        if (! $dvrSetting?->enabled) {
+            return response()->json(['error' => 'DVR is not enabled for this playlist'], 422);
+        }
+
+        // Pre-fetch the set of existing Series rules for this DVR setting (scoped by
+        // playlist_auth when applicable) keyed by their auto-derived normalized_title,
+        // so each result can advertise `has_series_rule` + `series_rule_id` without
+        // a per-group query. Uses the same SeriesKey::normalize normalization as the
+        // grouping below — which matches DvrRecordingRule::saving's column population —
+        // so a normalized-title lookup here is consistent with what a future rule
+        // created from this result would store.
+        $seriesRuleTitles = DvrRecordingRule::where('dvr_setting_id', $dvrSetting->id)
+            ->where('type', DvrRuleType::Series)
+            ->when($playlistAuth, fn ($q) => $q->where('playlist_auth_id', $playlistAuth->id))
+            ->pluck('id', 'normalized_title');
+
+        // Collect the set of EPG channel_id strings this playlist's channels are mapped to.
+        $playlistChannels = $playlist->channels()
+            ->whereNotNull('epg_channel_id')
+            ->with('epgChannel')
+            ->get();
+
+        $epgChannelIds = $playlistChannels
+            ->map(fn (Channel $ch) => $ch->epgChannel?->channel_id)
+            ->filter()
+            ->unique()
+            ->values();
+
+        if ($epgChannelIds->isEmpty()) {
+            return response()->json([]);
+        }
+
+        // Build lookup: epg_channel_id string → [channel_id, channel_name] from the playlist.
+        $channelLookup = [];
+        foreach ($playlistChannels as $ch) {
+            $epgChanId = $ch->epgChannel?->channel_id;
+            if ($epgChanId && ! isset($channelLookup[$epgChanId])) {
+                $channelLookup[$epgChanId] = [
+                    'channel_id' => $ch->id,
+                    'channel_name' => $ch->title ?: ($ch->name ?? ''),
+                ];
+            }
+        }
+
+        // Fetch matching programmes across all mapped EPG channels, including those
+        // that just finished (up to 24 hours ago) for discoverability.
+        $cutoff = Carbon::now()->subHours(24);
+        $programmes = EpgProgramme::whereIn('epg_channel_id', $epgChannelIds->toArray())
+            ->where('start_time', '>=', $cutoff)
+            ->where('title', 'ilike', '%'.$q.'%')
+            ->limit(500)
+            ->get();
+
+        // Group by SeriesKey-normalized title — this must match the normalization
+        // in DvrRecordingRule::saving so rules created from these results will
+        // match future programme data.
+        $groups = [];
+        foreach ($programmes as $p) {
+            $norm = SeriesKey::normalize($p->title);
+
+            if ($norm === '') {
+                continue;
+            }
+
+            if (! isset($groups[$norm])) {
+                $groups[$norm] = [
+                    'display_title' => $p->title,
+                    'programmes' => [],
+                    'channel_ids' => [],
+                ];
+            }
+
+            $groups[$norm]['programmes'][] = $p;
+            $resolved = $channelLookup[$p->epg_channel_id] ?? null;
+            if ($resolved) {
+                $groups[$norm]['channel_ids'][$resolved['channel_id']] = $resolved;
+            }
+        }
+
+        $results = [];
+        foreach ($groups as $norm => $group) {
+            /** @var array<int, EpgProgramme> $progs */
+            $progs = $group['programmes'];
+
+            // Sort within group: most recent first.
+            usort($progs, fn (EpgProgramme $a, EpgProgramme $b) => $b->start_time->timestamp <=> $a->start_time->timestamp);
+
+            $channels = array_values($group['channel_ids']);
+
+            // next_airing_at: earliest start_time in the future, null if none.
+            $now = Carbon::now();
+            $nextAiringAt = null;
+            foreach ($progs as $p) {
+                if ($p->start_time->gt($now)) {
+                    $nextAiringAt = $nextAiringAt
+                        ? ($p->start_time->lt($nextAiringAt) ? $p->start_time : $nextAiringAt)
+                        : $p->start_time;
+                }
+            }
+
+            $recentEpisodes = array_slice(array_map(function (EpgProgramme $p) use ($channelLookup) {
+                $resolved = $channelLookup[$p->epg_channel_id] ?? null;
+
+                return [
+                    'channel_id' => $resolved['channel_id'] ?? null,
+                    'channel_name' => $resolved['channel_name'] ?? null,
+                    'title' => $p->title,
+                    'start_time' => $p->start_time->toIso8601String(),
+                    'end_time' => $p->end_time?->toIso8601String(),
+                    'season' => $p->season,
+                    'episode' => $p->episode,
+                    'description' => $p->description,
+                ];
+            }, $progs), 0, 5);
+
+            $results[] = [
+                'normalized_title' => $norm,
+                'display_title' => $group['display_title'],
+                'has_series_rule' => $seriesRuleTitles->has($norm),
+                'series_rule_id' => $seriesRuleTitles[$norm] ?? null,
+                'channel_count' => count($channels),
+                'channels' => $channels,
+                'episode_count' => count($progs),
+                'next_airing_at' => $nextAiringAt?->toIso8601String(),
+                'recent_episodes' => $recentEpisodes,
+            ];
+        }
+
+        // Sort: next-airing first, then most episodes.
+        usort($results, function (array $a, array $b) {
+            $aNext = $a['next_airing_at'];
+            $bNext = $b['next_airing_at'];
+
+            if ($aNext && ! $bNext) {
+                return -1;
+            }
+            if (! $aNext && $bNext) {
+                return 1;
+            }
+            if ($aNext && $bNext) {
+                return $aNext <=> $bNext;
+            }
+
+            return $b['episode_count'] <=> $a['episode_count'];
+        });
+
+        return response()->json(array_slice($results, 0, 100));
+    }
+
+    /**
+     * Schedule a one-shot DVR recording rule from the TV app.
+     */
+    private function scheduleDvr(Request $request, $playlist, ?PlaylistAuth $playlistAuth): \Illuminate\Http\JsonResponse
+    {
+        $channelId = (int) $request->input('channel_id');
+        $title = trim((string) $request->input('title', ''));
+        $startTime = $request->input('start_time');
+        $endTime = $request->input('end_time');
+
+        if (! $channelId || ! $title || ! $startTime || ! $endTime) {
+            return response()->json(['error' => 'channel_id, title, start_time, and end_time are required'], 400);
+        }
+
+        $dvrSetting = $playlist->dvrSetting?->enabled ? $playlist->dvrSetting : null;
+
+        if (! $dvrSetting) {
+            return response()->json(['error' => 'DVR is not enabled for this playlist'], 422);
+        }
+
+        if ($playlistAuth?->hasReachedConcurrentLimit()) {
+            return response()->json(['error' => 'Concurrent recording limit reached'], 422);
+        }
+
+        $channel = $playlist->channels()->where('channels.id', $channelId)->first();
+        if (! $channel) {
+            return response()->json(['error' => 'Channel not found'], 404);
+        }
+
+        // manual_start/manual_end are cast as `datetime`, which Eloquent re-hydrates by
+        // reinterpreting the stored wall-clock in `app.timezone` (not UTC) — see the same
+        // compensation in EpgCacheService::cachePeriodProgrammes(). $startTime/$endTime
+        // arrive as UTC ISO 8601 strings from the client, so we must convert them to
+        // app.timezone's wall-clock before Eloquent formats them for storage, or the
+        // round-trip re-read will reconstruct the wrong absolute instant.
+        $appTz = config('app.timezone', 'UTC');
+        $rule = DvrRecordingRule::create([
+            'user_id' => $dvrSetting->user_id,
+            'dvr_setting_id' => $dvrSetting->id,
+            'playlist_auth_id' => $playlistAuth?->id,
+            'type' => DvrRuleType::Manual,
+            'channel_id' => $channelId,
+            'series_title' => $title,
+            'match_mode' => DvrMatchMode::Exact,
+            'manual_start' => Carbon::parse($startTime)->setTimezone($appTz),
+            'manual_end' => Carbon::parse($endTime)->setTimezone($appTz),
+            'start_early_seconds' => (int) $request->input('start_early_seconds', $dvrSetting->default_start_early_seconds ?? 0),
+            'end_late_seconds' => (int) $request->input('end_late_seconds', $dvrSetting->default_end_late_seconds ?? 0),
+            'enabled' => true,
+        ]);
+
+        return response()->json([
+            'success' => true,
+            'rule_id' => $rule->id,
+            'message' => "Recording scheduled: {$title}",
+        ]);
+    }
+
+    /**
+     * Create a series recording rule.
+     *
+     * Accepts the full option set (priority, padding, match mode, series mode,
+     * keep_last). All new optional fields use omit-to-inherit: only fields the
+     * caller actually sends are stored. `priority` falls back to its column
+     * default (50 per the migration) when absent/blank/non-numeric; padding
+     * fields fall back to runtime resolution via
+     * DvrSetting::resolveStartEarlySeconds()/resolveEndLateSeconds(). Blank is
+     * NOT coerced to 0 because 0 is a meaningful value for padding (no padding)
+     * and is NOT the same as "inherit".
+     *
+     * Omitting both `channel_id` and `source_channel_id` is the explicit "any
+     * channel" form — see DvrSchedulerService::resolveSeriesEpgScope() for the
+     * scope resolution. `source_channel_id` is intentionally not accepted from
+     * the API; setting it would narrow scope back to a single channel.
+     *
+     * Returns 409 with `rule_id` + `duplicate: true` when a Series rule for
+     * the same normalized title already exists under this DVR setting (+ auth),
+     * so the client can switch its button to the "rule exists" state rather
+     * than showing a generic failure.
+     *
+     * Scheduling is handled by DvrRecordingRule::boot()'s created hook calling
+     * scheduleRuleImmediately() for enabled rules; this action does NOT dispatch
+     * DvrSchedulerTick (the model's hook already covers the API path).
+     */
+    private function createDvrSeriesRule(Request $request, $playlist, ?PlaylistAuth $playlistAuth): \Illuminate\Http\JsonResponse
+    {
+        $rawChannelId = $request->input('channel_id');
+        $channelId = ($rawChannelId === null || $rawChannelId === '')
+            ? null
+            : (int) $rawChannelId;
+        $title = trim((string) $request->input('title', ''));
+
+        if (! $title) {
+            return response()->json(['error' => 'title is required'], 400);
+        }
+
+        $dvrSetting = $playlist->dvrSetting?->enabled ? $playlist->dvrSetting : null;
+
+        if (! $dvrSetting) {
+            return response()->json(['error' => 'DVR is not enabled for this playlist'], 422);
+        }
+
+        // Duplicate guard: same dvr_setting, same normalized show title, same auth.
+        // Uses the auto-derived `normalized_title` column that DvrRecordingRule::saving
+        // populates via SeriesKey::normalize — matching the stored column (not
+        // re-computing with a different normalizer) so future EPG matches align.
+        $normalizedTitle = SeriesKey::normalize($title);
+        $existing = DvrRecordingRule::where('dvr_setting_id', $dvrSetting->id)
+            ->where('type', DvrRuleType::Series)
+            ->where('normalized_title', $normalizedTitle)
+            ->when($playlistAuth, fn ($q) => $q->where('playlist_auth_id', $playlistAuth->id))
+            ->first();
+
+        if ($existing) {
+            return response()->json([
+                'error' => 'A series rule for this show already exists',
+                'rule_id' => $existing->id,
+                'duplicate' => true,
+            ], 409);
+        }
+
+        if ($channelId !== null) {
+            $channel = $playlist->channels()->where('channels.id', $channelId)->first();
+            if (! $channel) {
+                return response()->json(['error' => 'Channel not found'], 404);
+            }
+        }
+
+        $matchMode = DvrMatchMode::tryFrom($request->input('match_mode', 'contains')) ?? DvrMatchMode::Contains;
+        $seriesMode = DvrSeriesMode::tryFrom($request->input('series_mode', $dvrSetting->default_series_mode?->value ?? 'all')) ?? DvrSeriesMode::All;
+        // Same blank-vs-meaningful-zero discipline as the new optional fields: a blank
+        // or non-numeric value falls through to the DVR setting default instead of being
+        // coerced to 0 (which would silently disable the keep-last policy).
+        $rawKeepLast = $request->input('keep_last');
+        $keepLast = is_numeric($rawKeepLast)
+            ? (int) $rawKeepLast
+            : $dvrSetting->default_series_keep_last;
+
+        $createAttrs = [
+            'user_id' => $dvrSetting->user_id,
+            'dvr_setting_id' => $dvrSetting->id,
+            'playlist_auth_id' => $playlistAuth?->id,
+            'type' => DvrRuleType::Series,
+            'channel_id' => $channelId,
+            'series_title' => $title,
+            'match_mode' => $matchMode,
+            'series_mode' => $seriesMode,
+            // Keep the legacy `new_only` flag in lockstep with series_mode so the
+            // DvrRecordingRule::saving hook's new_only→series_mode migration (which
+            // rewrites series_mode=new_flag to all when new_only is false) does not
+            // clobber an explicitly-requested new_flag. Must be EXACTLY this
+            // equality: new_only=true alongside series_mode=unique_se would trip the
+            // hook's first branch and clobber unique_se → new_flag.
+            'new_only' => ($seriesMode === DvrSeriesMode::NewFlag),
+            'keep_last' => $keepLast,
+            'enabled' => true,
+        ];
+
+        // Omit-to-inherit for all three new optional fields. Absent or blank
+        // leaves the key OUT of the create array so the column default (priority=50
+        // per the migration) or runtime resolution via DvrSetting::resolveStartEarly
+        // Seconds()/resolveEndLateSeconds() applies. Critically, blank is NOT
+        // coerced to 0 because 0 is a meaningful value for the padding fields
+        // (no padding) and is NOT the same as "inherit" — see the spec.
+        $rawPriority = $request->input('priority');
+        if (is_numeric($rawPriority)) {
+            $createAttrs['priority'] = max(0, min(100, (int) $rawPriority));
+        }
+
+        $rawStartEarly = $request->input('start_early_seconds');
+        if ($rawStartEarly !== null && $rawStartEarly !== '') {
+            $createAttrs['start_early_seconds'] = (int) $rawStartEarly;
+        }
+        $rawEndLate = $request->input('end_late_seconds');
+        if ($rawEndLate !== null && $rawEndLate !== '') {
+            $createAttrs['end_late_seconds'] = (int) $rawEndLate;
+        }
+
+        $rule = DvrRecordingRule::create($createAttrs);
+
+        return response()->json([
+            'success' => true,
+            'rule_id' => $rule->id,
+        ]);
+    }
+
+    /**
+     * Update an existing Series DVR recording rule in place.
+     *
+     * This intentionally does NOT delete-and-recreate: deleting a rule cascades to
+     * its recordings and would destroy recording history and change the rule id.
+     *
+     * **Omit-to-inherit on update** — only fields actually present in the request are
+     * applied; absent fields keep their current value. Nothing is nulled out unless
+     * the request explicitly says so (see `channel_id` below).
+     */
+    private function updateDvrSeriesRule(Request $request, $playlist, ?PlaylistAuth $playlistAuth): \Illuminate\Http\JsonResponse
+    {
+        $ruleId = (int) $request->input('rule_id');
+
+        if (! $ruleId) {
+            return response()->json(['error' => 'rule_id parameter is required'], 400);
+        }
+
+        $dvrSetting = $playlist->dvrSetting;
+
+        if (! $dvrSetting) {
+            return response()->json(['error' => 'DVR not configured for this playlist'], 404);
+        }
+
+        $rule = DvrRecordingRule::where('dvr_setting_id', $dvrSetting->id)
+            ->where('id', $ruleId)
+            ->where('type', DvrRuleType::Series)
+            ->when($playlistAuth, fn ($q) => $q->where('playlist_auth_id', $playlistAuth->id))
+            ->first();
+
+        if (! $rule) {
+            return response()->json(['error' => 'Series rule not found'], 404);
+        }
+
+        // channel_id: present-and-blank means "any channel" (null); present-with-a-value
+        // pins to that channel; absent means "leave unchanged". `$request->has` returns
+        // false for a blank value, so check presence via `$request->input` + `exists`.
+        if ($request->exists('channel_id')) {
+            $rawChannelId = $request->input('channel_id');
+            $channelId = ($rawChannelId === null || $rawChannelId === '')
+                ? null
+                : (int) $rawChannelId;
+
+            if ($channelId !== null) {
+                $channel = $playlist->channels()->where('channels.id', $channelId)->first();
+                if (! $channel) {
+                    return response()->json(['error' => 'Channel not found'], 404);
+                }
+            }
+
+            $rule->channel_id = $channelId;
+        }
+
+        if ($request->has('match_mode')) {
+            $matchMode = DvrMatchMode::tryFrom($request->input('match_mode'));
+            if ($matchMode !== null) {
+                $rule->match_mode = $matchMode;
+            }
+        }
+
+        if ($request->has('series_mode')) {
+            $seriesMode = DvrSeriesMode::tryFrom($request->input('series_mode'));
+            if ($seriesMode !== null) {
+                $rule->series_mode = $seriesMode;
+                // Keep the legacy new_only flag in lockstep with series_mode for the same
+                // saving-hook migration reason as createDvrSeriesRule (task 16).
+                $rule->new_only = ($seriesMode === DvrSeriesMode::NewFlag);
+            }
+        }
+
+        $rawKeepLast = $request->input('keep_last');
+        if (is_numeric($rawKeepLast)) {
+            $rule->keep_last = (int) $rawKeepLast;
+        }
+
+        $rawPriority = $request->input('priority');
+        if (is_numeric($rawPriority)) {
+            $rule->priority = max(0, min(100, (int) $rawPriority));
+        }
+
+        $rawStartEarly = $request->input('start_early_seconds');
+        if ($rawStartEarly !== null && $rawStartEarly !== '') {
+            $rule->start_early_seconds = (int) $rawStartEarly;
+        }
+
+        $rawEndLate = $request->input('end_late_seconds');
+        if ($rawEndLate !== null && $rawEndLate !== '') {
+            $rule->end_late_seconds = (int) $rawEndLate;
+        }
+
+        $rule->save();
+
+        return response()->json([
+            'success' => true,
+            'rule_id' => $rule->id,
+        ]);
+    }
+
+    /**
+     * Cancel a scheduled or in-progress DVR recording.
+     */
+    private function cancelDvrRecording(Request $request, $playlist, ?PlaylistAuth $playlistAuth): \Illuminate\Http\JsonResponse
+    {
+        $uuid = $request->input('recording_id');
+
+        if (! $uuid) {
+            return response()->json(['error' => 'recording_id parameter is required'], 400);
+        }
+
+        $dvrSetting = $playlist->dvrSetting;
+
+        if (! $dvrSetting) {
+            return response()->json(['error' => 'DVR not configured for this playlist'], 404);
+        }
+
+        $recording = DvrRecording::where('dvr_setting_id', $dvrSetting->id)
+            ->where('uuid', $uuid)
+            ->when($playlistAuth, fn ($q) => $q->where('playlist_auth_id', $playlistAuth->id))
+            ->whereIn('status', [DvrRecordingStatus::Scheduled, DvrRecordingStatus::Recording])
+            ->first();
+
+        if (! $recording) {
+            return response()->json(['error' => 'Recording not found or not cancellable'], 404);
+        }
+
+        app(DvrRecorderService::class)->cancel($recording);
+
+        return response()->json(['success' => true]);
+    }
+
+    /**
+     * Delete a completed, failed, cancelled, or post-processing DVR recording.
+     *
+     * PostProcessing is included alongside the terminal statuses because
+     * DvrRecorderService::cancel() now routes a recording that had already
+     * captured footage through post-processing (so a "kept" cancelled
+     * recording ends up Completed/playable) rather than marking it Cancelled
+     * immediately — the TV app's "Delete recording" choice calls cancel then
+     * delete back-to-back, so by the time this runs such a recording is
+     * already in PostProcessing, not Cancelled.
+     *
+     * A PostProcessing recording deleted this way almost always still has its
+     * proxy_network_id set - the post-processing job that would normally free
+     * those resources hasn't had a chance to run yet. releaseProxyResources()
+     * frees them here instead of leaving them orphaned on the proxy.
+     */
+    private function deleteDvrRecording(Request $request, $playlist, ?PlaylistAuth $playlistAuth): \Illuminate\Http\JsonResponse
+    {
+        $uuid = $request->input('recording_id');
+
+        if (! $uuid) {
+            return response()->json(['error' => 'recording_id parameter is required'], 400);
+        }
+
+        $dvrSetting = $playlist->dvrSetting;
+
+        if (! $dvrSetting) {
+            return response()->json(['error' => 'DVR not configured for this playlist'], 404);
+        }
+
+        $recording = DvrRecording::where('dvr_setting_id', $dvrSetting->id)
+            ->where('uuid', $uuid)
+            ->when($playlistAuth, fn ($q) => $q->where('playlist_auth_id', $playlistAuth->id))
+            ->whereIn('status', [
+                DvrRecordingStatus::Completed,
+                DvrRecordingStatus::Failed,
+                DvrRecordingStatus::Cancelled,
+                DvrRecordingStatus::PostProcessing,
+            ])
+            ->first();
+
+        if (! $recording) {
+            return response()->json(['error' => 'Recording not found or not deletable'], 404);
+        }
+
+        app(DvrRecorderService::class)->releaseProxyResources($recording);
+
+        $recording->delete();
+
+        return response()->json(['success' => true]);
+    }
+
+    /**
+     * Format a DvrRecording into the API response shape.
+     */
+    private function formatDvrRecording(DvrRecording $recording, string $username, string $password, bool $full = false): array
+    {
+        $isRecording = $recording->status === DvrRecordingStatus::Recording;
+        $isCompleted = $recording->status === DvrRecordingStatus::Completed;
+
+        $format = $isCompleted
+            ? ($recording->dvrSetting?->dvr_output_format ?? 'mp4')
+            : 'mp4';
+
+        $baseUrl = config('app.url');
+
+        $streamUrl = $isCompleted
+            ? "{$baseUrl}/dvr/{$username}/{$password}/{$recording->uuid}.{$format}"
+            : null;
+
+        $liveUrl = $isRecording
+            ? "{$baseUrl}/dvr/{$username}/{$password}/{$recording->uuid}/live.m3u8"
+            : null;
+
+        $hasEdl = $isCompleted && ($recording->dvrSetting?->enable_comskip ?? false);
+        $edlUrl = $hasEdl
+            ? "{$baseUrl}/dvr/{$username}/{$password}/{$recording->uuid}/edl"
+            : null;
+
+        $data = [
+            'uuid' => $recording->uuid,
+            'title' => $recording->title,
+            'subtitle' => $recording->subtitle,
+            'status' => $recording->status->value,
+            'channel_name' => $recording->channel?->title ?? $recording->channel?->name,
+            'channel_id' => $recording->channel_id,
+            'scheduled_start' => $recording->scheduled_start?->toIso8601String(),
+            'scheduled_end' => $recording->scheduled_end?->toIso8601String(),
+            'actual_start' => $recording->actual_start?->toIso8601String(),
+            'actual_end' => $recording->actual_end?->toIso8601String(),
+            'duration_seconds' => $recording->duration_seconds,
+            'file_size_bytes' => $recording->file_size_bytes,
+            'season' => $recording->season,
+            'episode' => $recording->episode,
+            'stream_url' => $streamUrl,
+            'live_url' => $liveUrl,
+            'edl_url' => $edlUrl,
+            'has_edl' => $hasEdl,
+        ];
+
+        if ($full) {
+            $data['metadata'] = $recording->metadata;
+            $data['epg_programme_data'] = $recording->epg_programme_data;
+            $data['error_message'] = $recording->error_message;
+        }
+
+        return $data;
+    }
+
+    /**
+     * Format a DvrRecordingRule (series rule) into the API response shape.
+     */
+    private function formatDvrSeriesRule(DvrRecordingRule $rule): array
+    {
+        return [
+            'id' => $rule->id,
+            'channel_id' => $rule->channel_id,
+            'channel_name' => $rule->channel?->title ?? $rule->channel?->name,
+            'series_title' => $rule->series_title,
+            'match_mode' => $rule->match_mode->value,
+            'series_mode' => $rule->series_mode->value,
+            'keep_last' => $rule->keep_last,
+            'priority' => $rule->priority,
+            'enabled' => (bool) $rule->enabled,
+            'enable_comskip' => (bool) $rule->enable_comskip,
+            'start_early_seconds' => $rule->start_early_seconds,
+            'end_late_seconds' => $rule->end_late_seconds,
+            'created_at' => $rule->created_at?->toIso8601String(),
+            'updated_at' => $rule->updated_at?->toIso8601String(),
+            'recording_count' => $rule->recordings_count,
+        ];
+    }
+
+    /**
+     * Determine whether Xtream clients should be told request integrations are available.
+     */
+    private function requestsFeatureEnabled($playlist, string $authMethod, ?PlaylistAuth $playlistAuth): bool
+    {
+        if ($authMethod !== 'playlist_auth' || ! ($playlistAuth?->request_enabled)) {
+            return false;
+        }
+
+        $effectivePlaylist = $this->resolveEffectivePlaylist($playlist);
+
+        if (! $effectivePlaylist) {
+            return false;
+        }
+
+        if (! $effectivePlaylist->requestSetting?->enabled) {
+            return false;
+        }
+
+        return ArrIntegration::where('user_id', $effectivePlaylist->user_id)
+            ->enabled()
+            ->guestEnabled()
+            ->exists();
+    }
+
+    private function searchRequests(
+        Request $request,
+        mixed $playlist,
+        string $authMethod,
+        ?PlaylistAuth $playlistAuth,
+    ): JsonResponse {
+        $effectivePlaylist = $this->authorizedRequestPlaylist($playlist, $authMethod, $playlistAuth);
+        if (! $effectivePlaylist) {
+            return $this->requestError(
+                'request_access_denied',
+                'Content requests are not available for these credentials.',
+                403,
+            );
+        }
+
+        $validator = Validator::make($request->all(), [
+            'query' => ['required', 'string', 'min:2', 'max:100'],
+            'type' => ['nullable', 'string', 'in:movie,series'],
+            'page' => ['nullable', 'integer', 'min:1'],
+            'per_page' => ['nullable', 'integer', 'min:1', 'max:50'],
+        ]);
+        if ($validator->fails()) {
+            return $this->requestValidationError($validator->errors()->keys());
+        }
+
+        $validated = $validator->validated();
+
+        $search = app(ContentRequestService::class)->search(
+            $effectivePlaylist,
+            $validated['query'],
+            $validated['type'] ?? null,
+        );
+        if ($search['searched_providers'] > 0
+            && $search['unavailable_providers'] === $search['searched_providers']) {
+            return $this->requestError(
+                'providers_unavailable',
+                'All request providers are temporarily unavailable.',
+                503,
+            );
+        }
+
+        $page = (int) ($validated['page'] ?? 1);
+        $perPage = (int) ($validated['per_page'] ?? 20);
+        $total = count($search['results']);
+        $results = array_slice($search['results'], ($page - 1) * $perPage, $perPage);
+
+        return $this->requestSuccess(
+            ['results' => $results],
+            [
+                'pagination' => [
+                    'current_page' => $page,
+                    'per_page' => $perPage,
+                    'total' => $total,
+                    'last_page' => max(1, (int) ceil($total / $perPage)),
+                ],
+                'partial' => $search['unavailable_providers'] > 0,
+                'unavailable_providers' => $search['unavailable_providers'],
+            ],
+        );
+    }
+
+    /** @param array<string, mixed> $data */
+    private function requestSuccess(array $data, array $meta = [], int $status = 200): JsonResponse
+    {
+        $payload = [
+            'api_version' => 1,
+            'data' => $data,
+        ];
+
+        if ($meta !== []) {
+            $payload['meta'] = $meta;
+        }
+
+        return response()->json($payload, $status);
+    }
+
+    private function requestError(string $code, string $message, int $status): JsonResponse
+    {
+        return response()->json([
+            'api_version' => 1,
+            'error' => [
+                'code' => $code,
+                'message' => $message,
+            ],
+        ], $status);
+    }
+
+    /** @param array<int, string> $fields */
+    private function requestValidationError(array $fields): JsonResponse
+    {
+        return response()->json([
+            'api_version' => 1,
+            'error' => [
+                'code' => 'invalid_request',
+                'message' => 'The request parameters are invalid.',
+                'fields' => $fields,
+            ],
+        ], 422);
+    }
+
+    private function requestRateLimit(
+        string $action,
+        mixed $playlist,
+        string $authMethod,
+        ?PlaylistAuth $playlistAuth,
+    ): ?JsonResponse {
+        $limit = match ($action) {
+            'request_search' => 20,
+            'request_submit' => 5,
+            'request_history' => 60,
+            'request_status' => 120,
+            'request_dismiss' => 20,
+            default => null,
+        };
+
+        if ($limit === null
+            || ! $playlistAuth
+            || ! $this->requestsFeatureEnabled($playlist, $authMethod, $playlistAuth)) {
+            return null;
+        }
+
+        $key = "xtream-request:{$action}:{$playlistAuth->id}";
+        if (RateLimiter::tooManyAttempts($key, $limit)) {
+            $retryAfter = RateLimiter::availableIn($key);
+
+            return $this->requestError(
+                'rate_limited',
+                'Too many requests. Please try again later.',
+                429,
+            )->header('Retry-After', (string) $retryAfter);
+        }
+
+        RateLimiter::hit($key, 60);
+
+        return null;
+    }
+
+    private function submitRequest(
+        Request $request,
+        mixed $playlist,
+        string $authMethod,
+        ?PlaylistAuth $playlistAuth,
+    ): JsonResponse {
+        $effectivePlaylist = $this->authorizedRequestPlaylist($playlist, $authMethod, $playlistAuth);
+        if (! $effectivePlaylist || ! $playlistAuth) {
+            return $this->requestError(
+                'request_access_denied',
+                'Content requests are not available for these credentials.',
+                403,
+            );
+        }
+
+        $validator = Validator::make($request->all(), [
+            'type' => ['required', 'string', 'in:movie,series'],
+            'integration_id' => ['required', 'integer', 'min:1'],
+            'external_id' => ['required', 'integer', 'min:1'],
+            'seasons' => ['nullable', 'array', 'min:1'],
+            'seasons.*' => ['integer', 'min:0', 'distinct'],
+        ]);
+        if ($validator->fails()) {
+            return $this->requestValidationError($validator->errors()->keys());
+        }
+
+        $validated = $validator->validated();
+
+        $result = app(ContentRequestService::class)->submit(
+            $effectivePlaylist,
+            $playlistAuth,
+            $validated['type'],
+            (int) $validated['integration_id'],
+            (int) $validated['external_id'],
+            $validated['seasons'] ?? null,
+        );
+
+        if (! $result['ok']) {
+            $status = match ($result['code'] ?? null) {
+                'already_requested', 'already_available' => 409,
+                'not_found' => 404,
+                'provider_unavailable' => 503,
+                'submission_failed' => 502,
+                default => 422,
+            };
+
+            return $this->requestError($result['code'], $result['error'], $status);
+        }
+
+        return $this->requestSuccess([
+            'status' => $result['status'],
+            'request' => $result['request'],
+        ], status: $result['status'] === 'pending_approval' ? 201 : 200);
+    }
+
+    private function requestHistory(
+        Request $request,
+        mixed $playlist,
+        string $authMethod,
+        ?PlaylistAuth $playlistAuth,
+    ): JsonResponse {
+        if (! $this->authorizedRequestPlaylist($playlist, $authMethod, $playlistAuth) || ! $playlistAuth) {
+            return $this->requestError(
+                'request_access_denied',
+                'Content requests are not available for these credentials.',
+                403,
+            );
+        }
+
+        $validator = Validator::make($request->all(), [
+            'page' => ['nullable', 'integer', 'min:1'],
+            'per_page' => ['nullable', 'integer', 'min:1', 'max:50'],
+        ]);
+        if ($validator->fails()) {
+            return $this->requestValidationError($validator->errors()->keys());
+        }
+
+        $validated = $validator->validated();
+        $page = (int) ($validated['page'] ?? 1);
+        $perPage = (int) ($validated['per_page'] ?? 20);
+        $history = app(ContentRequestService::class)->history($playlistAuth, $page, $perPage);
+
+        return $this->requestSuccess(
+            ['requests' => $history['requests']],
+            ['pagination' => [
+                'current_page' => $page,
+                'per_page' => $perPage,
+                'total' => $history['total'],
+                'last_page' => max(1, (int) ceil($history['total'] / $perPage)),
+            ]],
+        );
+    }
+
+    private function requestStatus(
+        Request $request,
+        mixed $playlist,
+        string $authMethod,
+        ?PlaylistAuth $playlistAuth,
+    ): JsonResponse {
+        if (! $this->authorizedRequestPlaylist($playlist, $authMethod, $playlistAuth) || ! $playlistAuth) {
+            return $this->requestError(
+                'request_access_denied',
+                'Content requests are not available for these credentials.',
+                403,
+            );
+        }
+
+        $validator = Validator::make($request->all(), [
+            'request_id' => ['required', 'integer', 'min:1'],
+        ]);
+        if ($validator->fails()) {
+            return $this->requestValidationError($validator->errors()->keys());
+        }
+
+        $mediaRequest = app(ContentRequestService::class)->status(
+            $playlistAuth,
+            (int) $validator->validated()['request_id'],
+        );
+        if (! $mediaRequest) {
+            return $this->requestError('request_not_found', 'The request was not found.', 404);
+        }
+
+        return $this->requestSuccess(['request' => $mediaRequest]);
+    }
+
+    private function dismissRequest(
+        Request $request,
+        mixed $playlist,
+        string $authMethod,
+        ?PlaylistAuth $playlistAuth,
+    ): JsonResponse {
+        if (! $this->authorizedRequestPlaylist($playlist, $authMethod, $playlistAuth) || ! $playlistAuth) {
+            return $this->requestError(
+                'request_access_denied',
+                'Content requests are not available for these credentials.',
+                403,
+            );
+        }
+
+        $validator = Validator::make($request->all(), [
+            'request_id' => ['required', 'integer', 'min:1'],
+        ]);
+        if ($validator->fails()) {
+            return $this->requestValidationError($validator->errors()->keys());
+        }
+
+        $requestId = (int) $validator->validated()['request_id'];
+        $result = app(ContentRequestService::class)->dismiss($playlistAuth, $requestId);
+        if (! $result['ok']) {
+            return match ($result['code']) {
+                'request_not_dismissible' => $this->requestError(
+                    'request_not_dismissible',
+                    'Only completed or rejected requests can be dismissed.',
+                    409,
+                ),
+                default => $this->requestError('request_not_found', 'The request was not found.', 404),
+            };
+        }
+
+        return $this->requestSuccess([
+            'dismissed' => true,
+            'request_id' => $requestId,
+        ]);
+    }
+
+    private function authorizedRequestPlaylist(
+        mixed $playlist,
+        string $authMethod,
+        ?PlaylistAuth $playlistAuth,
+    ): Playlist|CustomPlaylist|MergedPlaylist|null {
+        if (! $this->requestsFeatureEnabled($playlist, $authMethod, $playlistAuth)) {
+            return null;
+        }
+
+        return $this->resolveEffectivePlaylist($playlist);
     }
 
     /**
@@ -2678,26 +4511,27 @@ class XtreamApiController extends Controller
         return PlaylistFacade::authenticate($username, $password);
     }
 
+    private function formatRuntimeFromSeconds(?int $seconds): ?string
+    {
+        if (! $seconds || $seconds <= 0) {
+            return null;
+        }
+        $minutes = (int) round($seconds / 60);
+        if ($minutes >= 60) {
+            $h = intdiv($minutes, 60);
+            $m = $minutes % 60;
+
+            return $m > 0 ? "{$h}h {$m}m" : "{$h}h";
+        }
+
+        return "{$minutes} min";
+    }
+
     /**
-     * Resolve optional m3u-editor capabilities advertised to compatible clients.
-     *
      * The proxy feature is advertised when the playlist owner may use the proxy
      * and, for PlaylistAuth credentials, the individual auth has proxy access
      * enabled. Owner/alias credentials act with the owner's own permission.
-     *
-     * @return array<int, string>
      */
-    private function resolveM3uEditorFeatures($playlist, string $authMethod, ?PlaylistAuth $playlistAuth): array
-    {
-        $features = ['viewers', 'progress'];
-
-        if ($this->canAdvertiseProxyFeature($playlist, $authMethod, $playlistAuth)) {
-            $features[] = 'proxy';
-        }
-
-        return $features;
-    }
-
     private function canAdvertiseProxyFeature($playlist, string $authMethod, ?PlaylistAuth $playlistAuth): bool
     {
         if (! $playlist->user?->canUseProxy()) {

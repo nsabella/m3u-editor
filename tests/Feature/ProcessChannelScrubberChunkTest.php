@@ -6,6 +6,7 @@ use App\Models\Channel;
 use App\Models\ChannelFailover;
 use App\Models\ChannelScrubber;
 use App\Models\ChannelScrubberLog;
+use App\Models\Group;
 use App\Models\Playlist;
 use App\Models\User;
 use Illuminate\Support\Facades\Config;
@@ -18,6 +19,7 @@ beforeEach(function () {
 
     $this->user = User::factory()->create();
     $this->playlist = Playlist::withoutEvents(fn () => Playlist::factory()->for($this->user)->create());
+    $this->group = Group::factory()->for($this->playlist)->create();
 
     $this->scrubber = ChannelScrubber::withoutEvents(fn () => ChannelScrubber::create([
         'name' => 'Test Scrubber',
@@ -55,6 +57,7 @@ it('marks a channel dead via ffprobe when ensureStreamStats returns empty', func
     // No URL and no stream_stats → ensureStreamStats() returns [] → dead
     $channel = ($this->channel)([
         'user_id' => $this->user->id,
+        'group_id' => $this->group->id,
         'enabled' => true,
         'url' => null,
         'url_custom' => null,
@@ -88,6 +91,7 @@ it('marks a channel dead via ffprobe even when stream_stats are cached', functio
     // are irrelevant. A null URL with cached stats is still dead.
     $channel = ($this->channel)([
         'user_id' => $this->user->id,
+        'group_id' => $this->group->id,
         'enabled' => true,
         'url' => null,
         'url_custom' => null,
@@ -119,12 +123,14 @@ it('marks a channel dead via ffprobe even when stream_stats are cached', functio
 it('increments dead_count on the scrubber for each dead channel', function () {
     $dead1 = ($this->channel)([
         'user_id' => $this->user->id,
+        'group_id' => $this->group->id,
         'url' => null,
         'url_custom' => null,
         'stream_stats' => null,
     ]);
     $dead2 = ($this->channel)([
         'user_id' => $this->user->id,
+        'group_id' => $this->group->id,
         'url' => null,
         'url_custom' => null,
         'stream_stats' => null,
@@ -150,6 +156,7 @@ it('increments dead_count on the scrubber for each dead channel', function () {
 it('skips processing when the batch uuid does not match', function () {
     $channel = ($this->channel)([
         'user_id' => $this->user->id,
+        'group_id' => $this->group->id,
         'enabled' => true,
         'url' => null,
         'stream_stats' => null,
@@ -173,6 +180,7 @@ it('skips processing when the scrubber is cancelled', function () {
 
     $channel = ($this->channel)([
         'user_id' => $this->user->id,
+        'group_id' => $this->group->id,
         'enabled' => true,
         'url' => null,
         'stream_stats' => null,
@@ -198,6 +206,7 @@ it('skips processing when the scrubber is cancelled', function () {
 it('does not disable dead channels when disableDead is false', function () {
     $channel = ($this->channel)([
         'user_id' => $this->user->id,
+        'group_id' => $this->group->id,
         'enabled' => true,
         'url' => null,
         'url_custom' => null,
@@ -235,6 +244,7 @@ it('does not disable dead channels when disableDead is false', function () {
 it('re-enables a previously disabled live channel when enableLive is true', function () {
     $channel = ($this->channel)([
         'user_id' => $this->user->id,
+        'group_id' => $this->group->id,
         'enabled' => false,
         'url' => 'http://example.invalid/stream',
         'url_custom' => null,

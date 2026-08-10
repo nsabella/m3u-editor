@@ -211,6 +211,41 @@ return [
             'timeout' => 60 * 125,
             'nice' => 0,
         ],
+
+        'dvr-queue' => [
+            'connection' => 'redis',
+            'queue' => ['dvr', 'dvr-post', 'dvr-meta'],
+            'balance' => 'auto',
+            'autoScalingStrategy' => 'time',
+            // Set maxProcesses to 1 if using SQLite to avoid database locks
+            'maxProcesses' => env('DB_CONNECTION', 'sqlite') === 'sqlite' ? 1 : 4,
+            'maxTime' => 0,
+            'maxJobs' => 0,
+            'memory' => 512, // MB
+            'tries' => 2, // DVR jobs get fewer retries to avoid duplicate recordings
+            'timeout' => 60 * 60, // 1 hour (long-running recordings)
+            'nice' => 5,
+        ],
+
+        // ResolveAioStreamsChannel/ResolveAioStreamsEpisode run here exclusively, kept
+        // low-concurrency and isolated from the general queue on purpose: bursts of
+        // resolution jobs (e.g. bulk-add, or many exhausted failover chains around the
+        // same time) hit AIOStreams and, transitively, debrid backends that penalize
+        // aggressive/concurrent request patterns — see PLAN_AIOSTREAMS.md's ban-avoidance
+        // notes. AIOStreamsService::waitForRateLimit() throttles within a single worker;
+        // capping maxProcesses here bounds concurrency across workers too.
+        'aiostreams-queue' => [
+            'connection' => 'redis',
+            'queue' => ['aiostreams-resolve'],
+            'balance' => 'simple',
+            'maxProcesses' => 2,
+            'maxTime' => 0,
+            'maxJobs' => 0,
+            'memory' => 512, // MB
+            'tries' => 1, // jobs handle their own empty-result retry/backoff internally
+            'timeout' => 60 * 5,
+            'nice' => 5,
+        ],
     ],
 
     'environments' => [

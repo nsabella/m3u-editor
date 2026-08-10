@@ -63,8 +63,35 @@ return [
             'guzzlehttp/guzzle',
             // updated alongside guzzlehttp/guzzle 7.12.1
             'guzzlehttp/psr7',
+            // v5.7.6 was the deliberate upgrade target: fixes an MFA access-control
+            // gap (panel access wasn't checked before presenting the MFA challenge,
+            // v5.7.5) and hashes cached MFA codes by secret instead of secret+code
+            // (v5.7.6). Applies to all filament/* subpackages pulled in together.
+            'filament/actions',
+            'filament/filament',
+            'filament/forms',
+            'filament/infolists',
+            'filament/notifications',
+            'filament/query-builder',
+            'filament/schemas',
+            'filament/spatie-laravel-settings-plugin',
+            'filament/spatie-laravel-tags-plugin',
+            'filament/support',
+            'filament/tables',
+            'filament/widgets',
+            // direct filament/* dependencies, bumped alongside the filament/*
+            // upgrade above (danharrin is a Filament core maintainer)
+            'anourvalar/eloquent-serialize',
+            'danharrin/livewire-rate-limiting',
+            // same guzzle-family pattern as guzzlehttp/guzzle + psr7 above
+            'guzzlehttp/promises',
             // ── Core Laravel ecosystem — trusted first-party packages ────────
             'laravel/framework',
+            // transitive deps of laravel/framework, bumped alongside it
+            'nesbot/carbon',
+            'symfony/http-foundation',
+            'symfony/http-kernel',
+            'symfony/mime',
             // ── Well-known, widely-audited ecosystem packages ────────────────
             'league/flysystem',
             'vlucas/phpdotenv',
@@ -72,6 +99,14 @@ return [
             'phpstan/phpdoc-parser',
             'pestphp/pest',
             'rector/rector',
+            // dev-only, first-party Laravel tool; 1.30.x needed for Blade formatting support
+            'laravel/pint',
+            // ── Transitive deps of already-trusted packages above ────────────
+            // phpunit/phpunit (via pestphp/pest v5) requires these sebastian/* internals
+            'sebastian/cli-parser',
+            'sebastian/recursion-context',
+            // laravel/framework requires league/commonmark
+            'league/commonmark',
             // ── Application-specific packages ────────────────────────────────
             'dedoc/scramble',
             'stechstudio/filament-impersonate',
@@ -148,6 +183,10 @@ return [
         // not a credential.
         '3d9d85f224d4',
 
+        // ArrIntegration: 'api_key' => 'encrypted' is a Laravel Eloquent cast
+        // declaration, not a hardcoded credential.
+        'acca5cf068e1',
+
         // GenerateTranslations: "{PH{$index}}" is a placeholder token template,
         // not a secret.
         '2a3eaf0a6403',
@@ -172,6 +211,10 @@ return [
         '1581e67a6553',
         'a7ab544d3f1b',
         'fe1b0d7dc7fe',
+        // DvrPostProcessorService::hlsConcat — $cmd is built by passing every
+        // argument through escapeshellarg(). $ffmpegPath and $outputPath are
+        // server-resolved filesystem paths, not user input.
+        '2027df1d5791',
 
         // ── TLS Verification ─────────────────────────────────────────────────
         // MediaServerProxyController + WebDavMediaService — SSL verification is
@@ -220,6 +263,26 @@ return [
         '53e3187b2a5f',
         'a215f7e698e0',
 
+        // SortService natural-sort rewrite (issue #1369): same guarantees as the
+        // original SortService entries above, just on new lines/hashes.
+        // $orderByColumn/$fallbackOrderByColumn come from a match() that throws
+        // on anything unrecognized; $direction is ternary-validated; $casesSql/
+        // $idsSql are built only from integer channel IDs already in the DB;
+        // persistSortColumn's $table/$column are always hardcoded literals at
+        // its one call site, never attacker-influenced.
+        '8065865cc700',
+        '197210f042df',
+        '05467e06f0a6',
+        // bulkSortGroupChannels' mysql/pgsql/sqlite branches: introducing the
+        // Postgres integer->text cast fix (naturalSortKeyExpr()) moved
+        // $orderByColumn behind a new $sortKeyExpr variable, changing these
+        // 3 hashes. Same $orderByColumn/$direction guarantees as above —
+        // $sortKeyExpr is just naturalSortKeyExpr($driver, $orderByColumn),
+        // where $driver comes from the PDO attribute, not user input.
+        '66a1a4c351d7',
+        '6b5bb290e977',
+        '4c12ed674220',
+
         // Migration 2026_04_06: one-time data migration building a CASE
         // expression from UUIDs generated in the same migration — no user input.
         '93f78b977cb1',
@@ -258,6 +321,17 @@ return [
         // string with only ? placeholders — no interpolated user input.
         '8a7c4d000066',
         '21366c44e0ab',
+        // PR #1344 (custom playlist alias group order) inserted a block above this call,
+        // splitting it out of its previous fluent chain into `$query->orderByRaw(...)` on
+        // its own line. Same call, same hardcoded-SQL/bound-placeholder guarantee — the
+        // finding text changed enough to produce a new hash.
+        'f90188eb168b',
+
+        // VodContentSearchTool: $genreExpr comes from jsonExtract() which
+        // interpolates a hardcoded column name ('genre') only; $like comes
+        // from likeOperator() which returns 'LIKE'|'ILIKE'. The actual user
+        // input $genre is bound via the ? placeholder.
+        '3489035c968f',
 
         // ChannelController: $sortOrder was unsanitized — now validated to
         // 'ASC'|'DESC' before use. Hashes left here in case pattern still
@@ -275,13 +349,21 @@ return [
         // fetched server-side via authenticated API — not user-supplied HTML.
         'ac51fa6935e0',
 
-        // ── Environment (local dev only) ─────────────────────────────────────
+        // chat-message.blade.php: {!! $assistantHtml !!} renders CommonMark output
+        // from LLM assistant messages. Raw HTML is stripped before conversion via
+        // ['html_input' => 'strip'], so only CommonMark-generated HTML is emitted.
+        'de53226d18d1',
+
+        // ── Environment (local dev / CI) ─────────────────────────────────────
         // APP_DEBUG=true, APP_ENV=local, SESSION_SECURE_COOKIE off — expected
         // in local development. CI uses .env.example which sets production
         // values; these hashes only appear locally.
         '3ff08f5321c5',
         '788146a4921b',
         '3804ebbc7280',
+        // APP_URL=http://localhost — placeholder value in .env.example, not a
+        // production deployment concern for the scanner.
+        '3ded26cb467c',
 
         // ── File Permissions (dev/Docker) ────────────────────────────────────
         // .env 644 and storage/ 777 are typical in local Docker volume mounts.
@@ -357,6 +439,23 @@ return [
         'a6558982e4e4', // PlaylistAuthPivot
         'b06385c305da', // AedProfile
         'eadad9842f9e', // TvNotification
+        '24408d770873', // ViewerFavorite
+
+        // Experimental branch — new models managed via Filament forms,
+        // same rationale as all other models above.
+        'e2bd9aa629d2', // DvrSetting
+        '6d9744816fe0', // DvrRecording
+        '6903bd970c3a', // StreamFileSetting
+        '2dce3e94d599', // EpgProgramme
+        '16a8d1dc6e60', // DvrRecordingRule
+
+        // Arr integration models — managed via Filament form schemas and explicit
+        // service-layer assignments. Model::unguard() is called in AppServiceProvider.
+        '0f3dc97aaced', // ArrIntegration
+        'f19a8a24ad42', // ArrQueueEvent
+        '057e992825e3', // PlaylistRequestSetting
+        '9a065d722be9', // QueueMonitor
+
         '0113919ad8de', // EpgMapCandidate
     ],
 

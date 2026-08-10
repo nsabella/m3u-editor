@@ -1,10 +1,23 @@
 <?php
 
+use App\Http\Controllers\Api\DeviceAuthorizationController;
 use App\Http\Controllers\Api\DispatcharrController;
 use App\Http\Controllers\Api\EpgApiController;
 use App\Http\Controllers\Api\M3uProxyApiController;
 use App\Http\Controllers\Api\TvApiController;
+use App\Http\Controllers\ArrWebhookController;
+use App\Http\Controllers\DvrCallbackController;
+use Illuminate\Cookie\Middleware\EncryptCookies;
+use Illuminate\Session\Middleware\StartSession;
 use Illuminate\Support\Facades\Route;
+
+/*
+ * Arr (Sonarr/Radarr) webhook receiver.
+ * Routed by the integration's unique webhook_secret so no additional auth header is needed.
+ */
+Route::post('webhooks/arr/{integration:webhook_secret}', [ArrWebhookController::class, 'receive'])
+    ->middleware('throttle:120,1')
+    ->name('webhooks.arr');
 
 /*
  * EPG API routes
@@ -27,21 +40,33 @@ Route::middleware(['throttle:60,1'])->prefix('epg')->group(function () {
  * m3u-proxy API routes
  */
 Route::prefix('m3u-proxy')->group(function () {
-    // Failover resolver - called by m3u-proxy to validate failover URLs
+    // Failover resolver - called by m3u-proxy to validate failover URLs.
+    // Authenticated by VerifyM3uProxyCallback (see routes below and M3uProxyService,
+    // which embeds the shared token in the URL it hands to the proxy).
     Route::post('failover-resolver', [M3uProxyApiController::class, 'resolveFailoverUrl'])
+        ->middleware(['m3u-proxy.callback', 'throttle:120,1'])
         ->name('m3u-proxy.failover-resolver');
 
-    // Player stream stop - called via sendBeacon when in-app player is closed
+    // Player stream stop - called via sendBeacon when in-app player is closed.
+    // sendBeacon cannot attach custom headers (no CSRF token), so only the session
+    // middleware is added here rather than the full 'web' group, to authenticate the
+    // caller via the panel's session cookie without requiring a CSRF token.
     Route::post('player-stream/stop', [M3uProxyApiController::class, 'stopPlayerStream'])
+        ->middleware([
+            EncryptCookies::class,
+            StartSession::class,
+        ])
         ->name('m3u-proxy.player-stream.stop');
 
-    // Proxy webhook endpoint - called by m3u-proxy to notify of events
-    // Relies on `m3u-proxy:register-webhook` to register this endpoint with the proxy
+    // Proxy webhook endpoint - called by m3u-proxy to notify of events.
+    // Relies on `m3u-proxy:register-webhook` to register this endpoint with the proxy.
     Route::post('webhooks', [M3uProxyApiController::class, 'handleWebhook'])
+        ->middleware(['m3u-proxy.callback', 'throttle:120,1'])
         ->name('m3u-proxy.webhook');
 
     // Network broadcast callback - called by proxy when broadcast FFmpeg process exits
     Route::post('broadcast/callback', [M3uProxyApiController::class, 'handleBroadcastCallback'])
+        ->middleware(['m3u-proxy.callback', 'throttle:120,1'])
         ->name('m3u-proxy.broadcast.callback');
 });
 
@@ -72,7 +97,29 @@ Route::prefix('vod')->middleware('dispatcharr.auth')->group(function () {
 });
 
 /*
- * TV app API routes (authenticated via Xtream credentials in URL path — no Sanctum)
+ * DVR callback - called by the m3u-proxy when a recording completes or fails.
+ * Must live in api.php (not web.php) to avoid CSRF verification.
+ */
+Route::post('dvr/callback', [DvrCallbackController::class, 'handle'])
+    ->middleware(['m3u-proxy.callback', 'throttle:120,1'])
+    ->name('dvr.callback');
+
+/*
+ * Device authorization (Trakt-style pairing) - lets the TV app request a
+ * short-lived pairing code and poll for approval from the admin panel,
+ * instead of requiring Xtream credentials to be typed on the TV remote.
+ */
+Route::prefix('device')->group(function () {
+    Route::post('code', [DeviceAuthorizationController::class, 'requestCode'])
+        ->middleware('throttle:20,1')
+        ->name('device.code');
+    Route::post('token', [DeviceAuthorizationController::class, 'poll'])
+        ->middleware('throttle:60,1')
+        ->name('device.token');
+});
+
+/*
+ * TV app API routes (authenticated via Xtream credentials in URL path - no Sanctum)
  */
 Route::prefix('tv/{username}/{password}')->middleware('throttle:60,1')->group(function () {
     Route::get('notifications', [TvApiController::class, 'notifications'])
@@ -83,4 +130,8 @@ Route::prefix('tv/{username}/{password}')->middleware('throttle:60,1')->group(fu
         ->name('tv.broadcasting.auth');
     Route::post('push/subscribe', [TvApiController::class, 'registerPushToken'])
         ->name('tv.push.subscribe');
+    Route::delete('push/unsubscribe', [TvApiController::class, 'unregisterPushToken'])
+        ->name('tv.push.unsubscribe');
+    Route::post('player-stream/stop', [TvApiController::class, 'stopPlayerStream'])
+        ->name('tv.player-stream.stop');
 });

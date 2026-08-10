@@ -14,6 +14,7 @@ use App\Filament\Resources\Playlists\Pages\CreatePlaylist;
 use App\Filament\Resources\Playlists\Pages\EditPlaylist;
 use App\Filament\Resources\Playlists\Pages\ListPlaylists;
 use App\Filament\Resources\Playlists\Pages\ViewPlaylist;
+use App\Filament\Support\DvrRequestsAiostreamsTabs;
 use App\Filament\Tables\SourceCategoriesTable;
 use App\Filament\Tables\SourceGroupsTable;
 use App\Jobs\CopyAttributesToPlaylist;
@@ -42,6 +43,7 @@ use App\Models\StreamProfile;
 use App\Rules\CheckIfUrlOrLocalPath;
 use App\Rules\Cron;
 use App\Rules\UrlIsAllowed;
+use App\Rules\ValidRegexPattern;
 use App\Services\DateFormatService;
 use App\Services\EpgCacheService;
 use App\Services\M3uProxyService;
@@ -194,6 +196,16 @@ class PlaylistResource extends Resource implements CopilotResource
                             $integration = MediaServerIntegration::where('playlist_id', $record->id)->first();
                             $integrationLink = MediaServerIntegrationResource::getUrl('edit', ['record' => $integration]);
 
+                            if ($integration->type === 'webdav') {
+                                return new HtmlString('
+                                <div class="flex items-center gap-1">
+                                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="size-4">
+                                        <path d="M3 3.5A1.5 1.5 0 0 1 4.5 2h1.879a1.5 1.5 0 0 1 1.06.44l1.122 1.12A1.5 1.5 0 0 0 9.62 4H11.5A1.5 1.5 0 0 1 13 5.5v1H3v-3ZM3.081 8a1.5 1.5 0 0 0-1.423 1.974l1 3A1.5 1.5 0 0 0 4.081 14h7.838a1.5 1.5 0 0 0 1.423-1.026l1-3A1.5 1.5 0 0 0 12.919 8H3.081Z" />
+                                    </svg>
+                                    WebDav: '.$integration->name.'
+                                </div>');
+                            }
+
                             return new HtmlString('
                             <div class="flex items-center gap-1">
                                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="size-4">
@@ -202,7 +214,7 @@ class PlaylistResource extends Resource implements CopilotResource
                                 Local Media: '.$integration->name.'
                             </div>');
                         }
-                        if (in_array($record->source_type, [PlaylistSourceType::Emby, PlaylistSourceType::Jellyfin])) {
+                        if (in_array($record->source_type, [PlaylistSourceType::Emby, PlaylistSourceType::Jellyfin, PlaylistSourceType::AIOStreams])) {
                             $integration = MediaServerIntegration::where('playlist_id', $record->id)->first();
                             $integrationLink = MediaServerIntegrationResource::getUrl('edit', ['record' => $integration]);
 
@@ -403,7 +415,7 @@ class PlaylistResource extends Resource implements CopilotResource
                         ->action(function (Collection $records): void {
                             foreach ($records as $record) {
                                 // For media server playlists, dispatch the media server sync job
-                                if (in_array($record->source_type, [PlaylistSourceType::Emby, PlaylistSourceType::Jellyfin])) {
+                                if (in_array($record->source_type, [PlaylistSourceType::Emby, PlaylistSourceType::Jellyfin, PlaylistSourceType::AIOStreams])) {
                                     $integration = MediaServerIntegration::where('playlist_id', $record->id)->first();
                                     if ($integration) {
                                         app('Illuminate\Contracts\Bus\Dispatcher')
@@ -505,7 +517,7 @@ class PlaylistResource extends Resource implements CopilotResource
                     ->icon('heroicon-o-arrow-path')
                     ->action(function ($record) {
                         // For media server playlists, dispatch the media server sync job
-                        if (in_array($record->source_type, [PlaylistSourceType::Emby, PlaylistSourceType::Jellyfin])) {
+                        if (in_array($record->source_type, [PlaylistSourceType::Emby, PlaylistSourceType::Jellyfin, PlaylistSourceType::AIOStreams])) {
                             $integration = MediaServerIntegration::where('playlist_id', $record->id)->first();
                             if ($integration) {
                                 app('Illuminate\Contracts\Bus\Dispatcher')
@@ -524,7 +536,7 @@ class PlaylistResource extends Resource implements CopilotResource
                         app('Illuminate\Contracts\Bus\Dispatcher')
                             ->dispatch(new ProcessM3uImport($record, force: true, syncRunId: $syncRun->id));
                     })->after(function ($record) {
-                        $isMediaServer = in_array($record->source_type, [PlaylistSourceType::Emby, PlaylistSourceType::Jellyfin]);
+                        $isMediaServer = in_array($record->source_type, [PlaylistSourceType::Emby, PlaylistSourceType::Jellyfin, PlaylistSourceType::AIOStreams]);
                         $message = $isMediaServer
                             ? 'Media server content is being synced in the background. Depending on the size of your library, this may take several minutes. You will be notified on completion.'
                             : 'Playlist is being processed in the background. Depending on the size of your playlist, this may take a while. You will be notified on completion.';
@@ -541,7 +553,7 @@ class PlaylistResource extends Resource implements CopilotResource
                     ->icon('heroicon-o-arrow-path')
                     ->modalIcon('heroicon-o-arrow-path')
                     ->modalDescription(function ($record) {
-                        $isMediaServer = in_array($record->source_type, [PlaylistSourceType::Emby, PlaylistSourceType::Jellyfin]);
+                        $isMediaServer = in_array($record->source_type, [PlaylistSourceType::Emby, PlaylistSourceType::Jellyfin, PlaylistSourceType::AIOStreams]);
 
                         return $isMediaServer
                             ? 'Sync content from the media server now? This will fetch all movies, series, and episodes from your media server library.'
@@ -1612,9 +1624,10 @@ class PlaylistResource extends Resource implements CopilotResource
                                 ->columnSpan(1)
                                 ->multiple()
                                 ->helperText(__('NOTE: If the list is empty, sync the playlist and check again once complete.'))
-                                ->tableArguments(fn ($record): array => [
+                                ->tableArguments(fn ($record, Get $get): array => [
                                     'playlist_id' => $record?->id,
                                     'type' => 'live',
+                                    'selected' => $get('import_prefs.selected_groups') ?? [],
                                 ])
                                 ->selectAction(
                                     fn (Action $action) => $action
@@ -1691,6 +1704,7 @@ class PlaylistResource extends Resource implements CopilotResource
                                     '\[.*\]',
                                 ])
                                 ->splitKeys(['Tab', 'Return'])
+                                ->rules(fn (Get $get): array => $get('import_prefs.use_regex') ? [new ValidRegexPattern] : [])
                                 ->hintAction(
                                     RegexTesterAction::make(name: 'test-live-groups', flags: 'u', samplesContext: 'groups')
                                         ->visible(fn (Get $get): bool => (bool) $get('import_prefs.use_regex'))
@@ -1705,9 +1719,10 @@ class PlaylistResource extends Resource implements CopilotResource
                                 ->columnSpan(1)
                                 ->multiple()
                                 ->helperText(__('NOTE: If the list is empty, sync the playlist and check again once complete.'))
-                                ->tableArguments(fn ($record): array => [
+                                ->tableArguments(fn ($record, Get $get): array => [
                                     'playlist_id' => $record?->id,
                                     'type' => 'vod',
+                                    'selected' => $get('import_prefs.selected_vod_groups') ?? [],
                                 ])
                                 ->selectAction(
                                     fn (Action $action) => $action
@@ -1784,6 +1799,7 @@ class PlaylistResource extends Resource implements CopilotResource
                                     '\[.*\]',
                                 ])
                                 ->splitKeys(['Tab', 'Return'])
+                                ->rules(fn (Get $get): array => $get('import_prefs.use_regex') ? [new ValidRegexPattern] : [])
                                 ->hintAction(
                                     RegexTesterAction::make(name: 'test-vod-groups', flags: 'u', samplesContext: 'vod_groups')
                                         ->visible(fn (Get $get): bool => (bool) $get('import_prefs.use_regex'))
@@ -1798,8 +1814,9 @@ class PlaylistResource extends Resource implements CopilotResource
                                 ->columnSpan(1)
                                 ->multiple()
                                 ->helperText(__('NOTE: If the list is empty, sync the playlist and check again once complete.'))
-                                ->tableArguments(fn ($record): array => [
+                                ->tableArguments(fn ($record, Get $get): array => [
                                     'playlist_id' => $record?->id,
+                                    'selected' => $get('import_prefs.selected_categories') ?? [],
                                 ])
                                 ->selectAction(
                                     fn (Action $action) => $action
@@ -1873,6 +1890,7 @@ class PlaylistResource extends Resource implements CopilotResource
                                     '\[.*\]',
                                 ])
                                 ->splitKeys(['Tab', 'Return'])
+                                ->rules(fn (Get $get): array => $get('import_prefs.use_regex') ? [new ValidRegexPattern] : [])
                                 ->hintAction(
                                     RegexTesterAction::make(name: 'test-categories', flags: 'u', samplesContext: 'categories')
                                         ->visible(fn (Get $get): bool => (bool) $get('import_prefs.use_regex'))
@@ -3289,6 +3307,18 @@ class PlaylistResource extends Resource implements CopilotResource
                 ->schema($fields);
         }
 
+        // DVR / Requests / AIOStreams tabs — settings for the dvrSetting/requestSetting
+        // HasOne relationships and the aiostreams_integration_id column. Shared with
+        // CustomPlaylistResource/MergedPlaylistResource; fields are hydrated/dehydrated
+        // via the HasDvrAndRequestFormHooks trait on each resource's Edit page.
+        if ($dvrTab = DvrRequestsAiostreamsTabs::dvrTab()) {
+            $tabs[] = $dvrTab;
+        }
+
+        $tabs[] = DvrRequestsAiostreamsTabs::requestsTab();
+
+        $tabs[] = DvrRequestsAiostreamsTabs::aiostreamsTab();
+
         // Compose the form with tabs and sections
         return [
             Grid::make()
@@ -3411,7 +3441,12 @@ class PlaylistResource extends Resource implements CopilotResource
                     ->icon('heroicon-o-arrow-path')
                     ->action(function ($record) {
                         // For media server playlists, dispatch the media server sync job
-                        if (in_array($record->source_type, [PlaylistSourceType::Emby, PlaylistSourceType::Jellyfin, PlaylistSourceType::Plex])) {
+                        if (in_array($record->source_type, [
+                            PlaylistSourceType::Emby,
+                            PlaylistSourceType::Jellyfin,
+                            PlaylistSourceType::Plex,
+                            PlaylistSourceType::AIOStreams,
+                        ])) {
                             $integration = MediaServerIntegration::where('playlist_id', $record->id)->first();
                             if ($integration) {
                                 app('Illuminate\Contracts\Bus\Dispatcher')
@@ -3431,7 +3466,11 @@ class PlaylistResource extends Resource implements CopilotResource
                         app('Illuminate\Contracts\Bus\Dispatcher')
                             ->dispatch(new ProcessM3uImport($record, force: true, syncRunId: $syncRun->id));
                     })->after(function ($record) {
-                        $isMediaServer = in_array($record->source_type, [PlaylistSourceType::Emby, PlaylistSourceType::Jellyfin]);
+                        $isMediaServer = in_array($record->source_type, [
+                            PlaylistSourceType::Emby,
+                            PlaylistSourceType::Jellyfin,
+                            PlaylistSourceType::AIOStreams,
+                        ]);
                         $message = $isMediaServer
                             ? 'Media server content is being synced in the background. Depending on the size of your library, this may take several minutes. You will be notified on completion.'
                             : 'Playlist is being processed in the background. Depending on the size of your playlist, this may take a while. You will be notified on completion.';
@@ -3448,7 +3487,12 @@ class PlaylistResource extends Resource implements CopilotResource
                     ->icon('heroicon-o-arrow-path')
                     ->modalIcon('heroicon-o-arrow-path')
                     ->modalDescription(function ($record) {
-                        $isMediaServer = in_array($record->source_type, [PlaylistSourceType::Emby, PlaylistSourceType::Jellyfin]);
+                        $isMediaServer = in_array($record->source_type, [
+                            PlaylistSourceType::Emby,
+                            PlaylistSourceType::Jellyfin,
+                            PlaylistSourceType::Plex,
+                            PlaylistSourceType::AIOStreams,
+                        ]);
 
                         return $isMediaServer
                             ? 'Sync content from the media server now? This will fetch all movies, series, and episodes from your media server library.'
@@ -3539,20 +3583,23 @@ class PlaylistResource extends Resource implements CopilotResource
                     ->label(__('Download M3U'))
                     ->icon('heroicon-o-arrow-down-tray')
                     ->url(fn ($record) => PlaylistFacade::getUrls($record)['m3u'])
-                    ->openUrlInNewTab(),
+                    ->openUrlInNewTab()
+                    ->hidden(fn ($record): bool => $record->source_type === PlaylistSourceType::AIOStreams),
                 EpgCacheService::getEpgTableAction()
-                    ->cancelParentActions(),
+                    ->cancelParentActions()
+                    ->hidden(fn ($record): bool => $record->source_type === PlaylistSourceType::AIOStreams),
                 Action::make('HDHomeRun URL')
                     ->label(__('HDHomeRun URL'))
                     ->icon('heroicon-o-arrow-top-right-on-square')
                     ->url(fn ($record) => PlaylistFacade::getUrls($record)['hdhr'])
                     ->openUrlInNewTab()
-                    ->hidden(fn ($record): bool => $record->is_network_playlist),
+                    ->hidden(fn ($record): bool => $record->is_network_playlist || $record->source_type === PlaylistSourceType::AIOStreams),
                 Action::make('Public URL')
                     ->label(__('Public URL'))
                     ->icon('heroicon-o-arrow-top-right-on-square')
                     ->url(fn ($record) => '/playlist/v/'.$record->uuid)
-                    ->openUrlInNewTab(),
+                    ->openUrlInNewTab()
+                    ->hidden(fn ($record): bool => $record->source_type === PlaylistSourceType::AIOStreams),
             ]),
 
             // -- MediaFlow Proxy --

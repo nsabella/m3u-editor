@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
@@ -22,6 +23,7 @@ class ViewerWatchProgress extends Model
         'series_id' => 'integer',
         'season_number' => 'integer',
         'episode_number' => 'integer',
+        'aio_integration_id' => 'integer',
     ];
 
     public function viewer(): BelongsTo
@@ -48,10 +50,23 @@ class ViewerWatchProgress extends Model
     }
 
     /**
+     * Get the DvrRecording associated with this progress record (dvr_recording type).
+     * stream_id in viewer_watch_progress = DvrRecording.id
+     */
+    public function dvrRecording(): BelongsTo
+    {
+        return $this->belongsTo(DvrRecording::class, 'stream_id');
+    }
+
+    /**
      * Get the display title for this progress record.
      */
     public function getContentTitleAttribute(): string
     {
+        if ($this->content_type === 'aiostreams') {
+            return $this->title ?? $this->aio_item_id ?? 'Unknown';
+        }
+
         if ($this->content_type === 'episode') {
             $episode = $this->episode;
             if ($episode) {
@@ -82,22 +97,32 @@ class ViewerWatchProgress extends Model
         return $this->channel?->logo ?? null;
     }
 
-    public function scopeLive($query)
+    public function scopeLive(Builder $query): Builder
     {
         return $query->where('content_type', 'live');
     }
 
-    public function scopeVod($query)
+    public function scopeVod(Builder $query): Builder
     {
         return $query->where('content_type', 'vod');
     }
 
-    public function scopeEpisode($query)
+    public function scopeEpisode(Builder $query): Builder
     {
         return $query->where('content_type', 'episode');
     }
 
-    public function scopeCompleted($query)
+    public function scopeDvrRecording(Builder $query): Builder
+    {
+        return $query->where('content_type', 'dvr_recording');
+    }
+
+    public function scopeAiostreams(Builder $query): Builder
+    {
+        return $query->where('content_type', 'aiostreams');
+    }
+
+    public function scopeCompleted(Builder $query): Builder
     {
         return $query->where('completed', true);
     }

@@ -4,10 +4,12 @@ namespace App\Filament\Resources\PlaylistAuths;
 
 use App\Filament\Actions\GeneratePasswordAction;
 use App\Filament\Concerns\HasCopilotSupport;
+use App\Filament\Resources\DvrRecordings\DvrRecordingResource;
 use App\Filament\Resources\PlaylistAuthResource\Pages;
 use App\Filament\Resources\PlaylistAuthResource\RelationManagers;
 use App\Filament\Resources\PlaylistAuths\Pages\ListPlaylistAuths;
 use App\Models\CustomPlaylist;
+use App\Models\MediaServerIntegration;
 use App\Models\MergedPlaylist;
 use App\Models\Playlist;
 use App\Models\PlaylistAlias;
@@ -102,6 +104,28 @@ class PlaylistAuthResource extends Resource implements CopilotResource
                 TextColumn::make('assigned_model_name')
                     ->label(__('Assigned To'))
                     ->toggleable(),
+                TextColumn::make('dvr_recordings_count')
+                    ->label(__('Recordings'))
+                    ->counts('dvrRecordings')
+                    ->badge()
+                    ->color('gray')
+                    ->toggleable(),
+                TextColumn::make('storage_used_bytes')
+                    ->label(__('DVR Storage'))
+                    ->toggleable()
+                    ->formatStateUsing(function (PlaylistAuth $record): string {
+                        if (! $record->dvr_enabled) {
+                            return 'N/A';
+                        }
+                        $used = $record->storage_used_bytes > 0
+                            ? DvrRecordingResource::formatFileSize($record->storage_used_bytes)
+                            : 'N/A';
+                        if ($record->dvr_storage_quota_gb === null) {
+                            return "{$used} / ∞";
+                        }
+
+                        return "{$used} / {$record->dvr_storage_quota_gb} GB";
+                    }),
                 ToggleColumn::make('enabled')
                     ->toggleable()
                     ->tooltip(__('Toggle auth status'))
@@ -197,6 +221,86 @@ class PlaylistAuthResource extends Resource implements CopilotResource
                 ->collapsed(fn ($record) => ! ($record?->proxy_enabled))
             : null;
 
+        $dvrSection = Section::make(__('DVR Access'))
+            ->description(__('Control whether this user can schedule and manage DVR recordings.'))
+            ->compact()
+            ->hidden(fn () => ! (config('dvr.dvr_enabled', true) && config('proxy.proxy_integration_enabled', true)))
+            ->schema([
+                Toggle::make('dvr_enabled')
+                    ->label(__('Enable DVR'))
+                    ->helperText(__('Allow this user to view and schedule recordings when the assigned playlist also has DVR enabled.'))
+                    ->default(false)
+                    ->live()
+                    ->columnSpan(2),
+                TextInput::make('dvr_max_concurrent_recordings')
+                    ->label(__('Max Concurrent Recordings'))
+                    ->numeric()
+                    ->minValue(1)
+                    ->maxValue(99)
+                    ->nullable()
+                    ->placeholder(__('Inherit from DVR settings'))
+                    ->helperText(__('Override the maximum number of simultaneous recordings for this user. Leave empty to use the playlist\'s DVR setting.'))
+                    ->visible(fn ($get) => $get('dvr_enabled'))
+                    ->columnSpan(1),
+                TextInput::make('dvr_storage_quota_gb')
+                    ->label(__('Storage Quota (GB)'))
+                    ->numeric()
+                    ->minValue(1)
+                    ->nullable()
+                    ->placeholder(__('No quota'))
+                    ->helperText(__('Maximum total disk space this user\'s recordings may use. Leave empty for unlimited.'))
+                    ->visible(fn ($get) => $get('dvr_enabled'))
+                    ->columnSpan(1),
+            ])
+            ->columns(2)
+            ->collapsible()
+            ->collapsed(fn ($record) => ! ($record?->dvr_enabled));
+
+        $requestsSection = Section::make(__('Content Requests'))
+            ->description(__('Control whether this user can browse and request content from Sonarr and Radarr.'))
+            ->compact()
+            ->schema([
+                Toggle::make('request_enabled')
+                    ->label(__('Enable Content Requests'))
+                    ->helperText(__('Allow this user to request content when the assigned playlist and ARR integration also allow user requests.'))
+                    ->default(false)
+                    ->live()
+                    ->columnSpan(2),
+                Toggle::make('auto_approve_requests')
+                    ->label(__('Auto-approve Content Requests'))
+                    ->helperText(__('Disable to require admin approval before media is added to Sonarr/Radarr.'))
+                    ->hintIcon(
+                        'heroicon-m-question-mark-circle',
+                        tooltip: __('When enabled, content requests from this user are sent directly to Sonarr/Radarr. When disabled, requests are held for admin approval in the Download Queue.')
+                    )
+                    ->visible(fn ($get) => $get('request_enabled'))
+                    ->default(false)
+                    ->columnSpan(2),
+            ])
+            ->columns(2)
+            ->collapsible()
+            ->collapsed(fn ($record) => ! ($record?->request_enabled));
+
+        $aiostreamsSection = Section::make(__('AIOStreams Access'))
+            ->description(__('Control whether this user can access AIOStreams content from the assigned playlist.'))
+            ->compact()
+            ->hidden(fn () => MediaServerIntegration::where('user_id', auth()->id())
+                ->where('type', 'aiostreams')
+                ->where('enabled', true)
+                ->doesntExist()
+            )
+            ->schema([
+                Toggle::make('aiostreams_enabled')
+                    ->label(__('Enable AIOStreams'))
+                    ->helperText(__('Allow this user to browse and stream AIOStreams catalogs when the assigned playlist also has AIOStreams enabled.'))
+                    ->default(false)
+                    ->live()
+                    ->columnSpan(2),
+            ])
+            ->columns(2)
+            ->collapsible()
+            ->collapsed(fn ($record) => ! ($record?->aiostreams_enabled));
+
         return [
             Grid::make()
                 ->schema([
@@ -241,27 +345,29 @@ class PlaylistAuthResource extends Resource implements CopilotResource
                                 ->nullable()
                                 ->columnSpan(1),
                         ]),
-                    TextInput::make('max_connections')
-                        ->label(__('Max Connections'))
-                        ->hintIcon(
-                            'heroicon-m-question-mark-circle',
-                            tooltip: __('Leave blank for unlimited. Only enforced when the assigned playlist has the proxy enabled.')
-                        )
-                        ->helperText(__('Maximum number of concurrent streams for this auth user.'))
-                        ->numeric()
-                        ->minValue(1)
-                        ->nullable()
-                        ->columnSpan(1),
-                    Toggle::make('stop_oldest_on_limit')
-                        ->label(__('Stop Oldest Stream on Limit'))
-                        ->inline(false)
-                        ->hintIcon(
-                            'heroicon-m-question-mark-circle',
-                            tooltip: __('Leave unchecked to use the global setting. Only applies when the assigned playlist has the proxy enabled.')
-                        )
-                        ->helperText(__('When at max connections, stop the oldest stream to allow the new one. When off, use the global setting.'))
-                        ->nullable()
-                        ->columnSpan(1),
+                    Grid::make()
+                        ->columns(2)
+                        ->schema([
+                            TextInput::make('max_connections')
+                                ->label(__('Max Connections'))
+                                ->hintIcon(
+                                    'heroicon-m-question-mark-circle',
+                                    tooltip: __('Leave blank for unlimited. Only enforced when the assigned playlist has the proxy enabled.')
+                                )
+                                ->helperText(__('Maximum number of concurrent streams for this auth user.'))
+                                ->numeric()
+                                ->minValue(1)
+                                ->nullable(),
+                            Toggle::make('stop_oldest_on_limit')
+                                ->label(__('Stop Oldest Stream on Limit'))
+                                ->inline(false)
+                                ->hintIcon(
+                                    'heroicon-m-question-mark-circle',
+                                    tooltip: __('Leave unchecked to use the global setting. Only applies when the assigned playlist has the proxy enabled.')
+                                )
+                                ->helperText(__('When at max connections, stop the oldest stream to allow the new one. When off, use the global setting.'))
+                                ->nullable(),
+                        ]),
                     Select::make('assigned_playlist')
                         ->label(__('Assigned to Playlist'))
                         ->options(function ($record) {
@@ -366,6 +472,9 @@ class PlaylistAuthResource extends Resource implements CopilotResource
                 ])
                 ->columns(2),
             $proxySection,
+            $requestsSection,
+            $dvrSection,
+            $aiostreamsSection,
         ];
     }
 }

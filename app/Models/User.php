@@ -180,6 +180,11 @@ class User extends Authenticatable implements FilamentUser, HasAppAuthentication
         return $this->hasMany(Series::class);
     }
 
+    public function tableColumnPreferences()
+    {
+        return $this->hasMany(TableColumnPreference::class);
+    }
+
     /**
      * Check if the user was created via OIDC authentication.
      */
@@ -282,6 +287,16 @@ class User extends Authenticatable implements FilamentUser, HasAppAuthentication
         return $this->hasPermission('use_ai_copilot');
     }
 
+    public function canUseDvr(): bool
+    {
+        // If proxy integration and/or DVR features are globally disabled, then no users can use DVR features regardless of their permissions.
+        if (! (config('dvr.dvr_enabled', true) && config('proxy.proxy_integration_enabled', true))) {
+            return false;
+        }
+
+        return $this->hasPermission('use_dvr');
+    }
+
     /**
      * Get all available permissions.
      */
@@ -295,6 +310,7 @@ class User extends Authenticatable implements FilamentUser, HasAppAuthentication
             'use_scrubber' => 'Use Scrubber',
             'view_release_logs' => 'View Release Logs',
             'use_ai_copilot' => 'Use AI Copilot',
+            'use_dvr' => 'Use DVR',
         ];
     }
 }

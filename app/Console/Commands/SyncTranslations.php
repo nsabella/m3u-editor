@@ -14,7 +14,7 @@ use Illuminate\Support\Facades\File;
  * In PHP single-quoted strings, \" is NOT an escape sequence — it is a literal
  * backslash + quote, which never matches the JSON key "has "quotes"".
  *
- * Run this after app:extract-translations and before app:generate-translations:
+ * Run this after app:extract-translations:
  *   php artisan app:sync-translations
  *   php artisan app:sync-translations --dry-run
  *   php artisan app:sync-translations --fix-escapes   (also fix \" in __() calls)
@@ -65,8 +65,10 @@ class SyncTranslations extends Command
 
         $before = count($existing);
 
-        // New keys get identity values; existing keys are preserved unchanged
-        $merged = array_merge($this->newKeys, $existing);
+        // New keys get identity values; existing keys are preserved unchanged.
+        // array_merge() would renumber purely-numeric-string keys (e.g. "9", "10")
+        // instead of treating them as translation keys, corrupting their values.
+        $merged = $existing + $this->newKeys;
         ksort($merged);
         $after = count($merged);
         $addedCount = $after - $before;
@@ -101,7 +103,6 @@ class SyncTranslations extends Command
             );
             $this->newLine();
             $this->info("en.json updated: {$after} total keys (+{$addedCount} new).");
-            $this->line('Run <comment>php artisan app:generate-translations</comment> to produce DE/FR/ES files.');
         }
 
         return self::SUCCESS;

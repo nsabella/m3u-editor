@@ -33,6 +33,14 @@ class SeriesRelationManager extends RelationManager
         return true;
     }
 
+    public static function canViewForRecord(Model $ownerRecord, string $pageClass): bool
+    {
+        // AIOStreams content is added on-demand rather than synced from a real media
+        // server library, so it doesn't fit this Series-resource-oriented, read-only
+        // view — see AioStreamsSeriesRelationManager instead.
+        return $ownerRecord->type !== 'aiostreams';
+    }
+
     public static function getTabComponent(Model $ownerRecord, string $pageClass): Tab
     {
         return Tab::make(__('Series'))

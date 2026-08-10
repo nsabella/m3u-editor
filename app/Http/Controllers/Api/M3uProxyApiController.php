@@ -18,6 +18,7 @@ use App\Settings\GeneralSettings;
 use Exception;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Log;
 use Symfony\Component\HttpFoundation\RedirectResponse;
 use Symfony\Component\HttpFoundation\Response;
@@ -255,9 +256,14 @@ class M3uProxyApiController extends Controller
      *   "current_url": "http://example.com/stream",
      *   "metadata": {
      *      "id": 123,
+     *      "type": "channel",
      *      "playlist_uuid": "abc-def-ghi",
      *   }
      * }
+     *
+     * "type" is "channel" (default, for backward compatibility) or "episode" —
+     * routes to the matching Channel/ChannelFailover or Episode/EpisodeFailover
+     * resolution path on M3uProxyService.
      *
      * @return JsonResponse
      */
@@ -268,20 +274,29 @@ class M3uProxyApiController extends Controller
             $metadata = $request->input('metadata', []);
             $failoverCount = $request->input('current_failover_index', 0);
             $statusCode = $request->input('status_code');
-            $channelId = $metadata['id'] ?? null;
+            $id = $metadata['id'] ?? null;
+            $type = $metadata['type'] ?? 'channel';
             $playlistUuid = $metadata['playlist_uuid'] ?? null;
 
-            if (! ($channelId && $currentUrl)) {
+            if (! ($id && $currentUrl)) {
                 return response()->json([
                     'next_url' => null,
-                    'error' => 'Missing channel_id or current_url',
+                    'error' => 'Missing metadata id or current_url',
                 ], 400);
             }
 
             // Use the M3uProxyService to validate the failover URLs
-            $result = app(M3uProxyService::class)
-                ->resolveFailoverUrl(
-                    $channelId,
+            $service = app(M3uProxyService::class);
+            $result = $type === 'episode'
+                ? $service->resolveEpisodeFailoverUrl(
+                    $id,
+                    $playlistUuid,
+                    $currentUrl,
+                    index: $failoverCount,
+                    statusCode: $statusCode ? (int) $statusCode : null,
+                )
+                : $service->resolveFailoverUrl(
+                    $id,
                     $playlistUuid,
                     $currentUrl,
                     index: $failoverCount,
@@ -290,7 +305,16 @@ class M3uProxyApiController extends Controller
 
             return response()->json($result);
         } catch (Exception $e) {
-            Log::error('Error resolving failover: '.$e->getMessage(), $request->all());
+            Log::error('Error resolving failover', [
+                'id' => $id ?? null,
+                'type' => $type ?? null,
+                'playlist_uuid' => $playlistUuid ?? null,
+                'failover_index' => $failoverCount ?? null,
+                'status_code' => $statusCode ?? null,
+                'trace_id' => $request->input('trace_id', $request->header('X-Request-ID')),
+                'exception_class' => $e::class,
+                'exception_code' => $e->getCode(),
+            ]);
 
             return response()->json([
                 'next_url' => null,
@@ -313,7 +337,14 @@ class M3uProxyApiController extends Controller
         Log::info('Received m3u-proxy webhook', [
             'event_type' => $eventType,
             'stream_id' => $streamId,
-            'data' => $data,
+            'type' => $data['type'] ?? $metadata['type'] ?? null,
+            'channel_id' => $data['channel_id'] ?? $metadata['channel_id'] ?? $metadata['id'] ?? null,
+            'episode_id' => $data['episode_id'] ?? $metadata['episode_id'] ?? null,
+            'playlist_uuid' => $data['playlist_uuid'] ?? $metadata['playlist_uuid'] ?? null,
+            'profile_id' => $metadata['profile_id'] ?? null,
+            'provider_profile_id' => $metadata['provider_profile_id'] ?? null,
+            'status' => $data['status'] ?? null,
+            'trace_id' => $data['trace_id'] ?? $request->header('X-Request-ID'),
         ]);
 
         // Handle profile connection tracking if provider_profile_id is present
@@ -347,7 +378,12 @@ class M3uProxyApiController extends Controller
             // We might also want to invalidate specific channel caches?
         }
 
-        Log::info('Cache invalidated for m3u-proxy event', $data);
+        Log::info('Cache invalidated for m3u-proxy event', [
+            'type' => $data['type'] ?? null,
+            'id' => $data['id'] ?? null,
+            'playlist_uuid' => $data['playlist_uuid'] ?? null,
+            'trace_id' => $data['trace_id'] ?? null,
+        ]);
     }
 
     /**
@@ -388,7 +424,8 @@ class M3uProxyApiController extends Controller
                 'profile_id' => $profileId,
                 'stream_id' => $streamId,
                 'event_type' => $eventType,
-                'exception' => $e->getMessage(),
+                'exception_class' => $e::class,
+                'exception_code' => $e->getCode(),
             ]);
         }
     }
@@ -421,7 +458,13 @@ class M3uProxyApiController extends Controller
         Log::info('Received broadcast callback from proxy', [
             'network_id' => $networkId,
             'event' => $event,
-            'data' => $data,
+            'status' => $data['status'] ?? null,
+            'exit_code' => $data['exit_code'] ?? null,
+            'error_type' => $data['error_type'] ?? null,
+            'final_segment_number' => $data['final_segment_number'] ?? null,
+            'duration_streamed' => $data['duration_streamed'] ?? null,
+            'auto_transitioned' => $data['auto_transitioned'] ?? null,
+            'trace_id' => $data['trace_id'] ?? $request->header('X-Request-ID'),
         ]);
 
         if (! $networkId) {
@@ -463,10 +506,12 @@ class M3uProxyApiController extends Controller
             Log::error('Error handling broadcast callback', [
                 'network_id' => $networkId,
                 'event' => $event,
-                'exception' => $e->getMessage(),
+                'trace_id' => $data['trace_id'] ?? $request->header('X-Request-ID'),
+                'exception_class' => $e::class,
+                'exception_code' => $e->getCode(),
             ]);
 
-            return response()->json(['error' => $e->getMessage()], 500);
+            return response()->json(['error' => 'Failed to handle broadcast callback'], 500);
         }
     }
 
@@ -488,7 +533,6 @@ class M3uProxyApiController extends Controller
 
         Log::info('Programme completed via proxy', [
             'network_id' => $network->id,
-            'network_name' => $network->name,
             'final_segment' => $finalSegment,
             'duration_streamed' => $durationStreamed,
             'auto_transitioned' => $autoTransitioned,
@@ -532,7 +576,6 @@ class M3uProxyApiController extends Controller
                 'network_id' => $network->id,
                 'new_pid' => $newPid,
                 'next_programme_id' => $nextProgramme?->id,
-                'next_programme_title' => $nextProgramme?->title,
             ]);
 
             return;
@@ -565,7 +608,6 @@ class M3uProxyApiController extends Controller
                 Log::info('Starting next programme via proxy', [
                     'network_id' => $network->id,
                     'programme_id' => $nextProgramme->id,
-                    'programme_title' => $nextProgramme->title,
                 ]);
 
                 $service->start($network);
@@ -616,8 +658,6 @@ class M3uProxyApiController extends Controller
 
         Log::warning('Broadcast failed via proxy', [
             'network_id' => $network->id,
-            'network_name' => $network->name,
-            'error' => $error,
             'exit_code' => $exitCode,
             'fatal' => $isFatal,
             'final_segment' => $finalSegment,
@@ -698,7 +738,6 @@ class M3uProxyApiController extends Controller
             Log::error('Broadcast failed with fatal exit code — stopping retries', [
                 'network_id' => $network->id,
                 'exit_code' => $exitCode,
-                'error' => $error,
             ]);
 
             $network->update([
@@ -801,6 +840,12 @@ class M3uProxyApiController extends Controller
      * Called via sendBeacon from the browser when a floating/popout player is closed
      * or when the user navigates away. This is a best-effort signal; the proxy will
      * also detect the TCP connection drop independently.
+     *
+     * Requires an authenticated panel session (see routes/api.php) and verifies the
+     * requested channel/episode belongs to that user before touching proxy state, so
+     * one user cannot stop another user's stream. Always responds 204 - whether the
+     * caller is unauthenticated, the ID is out of scope, or the stop actually
+     * happened - so the response can't be used to probe ownership of another ID.
      */
     public function stopPlayerStream(Request $request): Response
     {
@@ -821,10 +866,17 @@ class M3uProxyApiController extends Controller
             return response()->noContent(422);
         }
 
-        try {
-            M3uProxyService::stopStreamsByMetadata($field, (string) $id, force: false, clientId: $request->input('client_id'));
-        } catch (Exception $e) {
-            Log::warning("Failed to stop player stream ({$type}:{$id}): ".$e->getMessage());
+        // Ownership (and the caller being authenticated at all) is checked here, but
+        // deliberately doesn't change the response - always 204 - so it can't be used
+        // to probe whether an ID exists or belongs to someone else.
+        $user = Auth::user();
+        $model = match ($field) {
+            'channel_id' => $user ? Channel::find($id) : null,
+            'episode_id' => $user ? Episode::find($id) : null,
+        };
+
+        if ($model && $user->can('view', $model)) {
+            M3uProxyService::stopStreamSafely($field, (string) $id, $request->input('client_id'));
         }
 
         return response()->noContent();

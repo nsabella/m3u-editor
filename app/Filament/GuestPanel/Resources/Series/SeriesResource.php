@@ -29,19 +29,23 @@ class SeriesResource extends Resource
 
     protected static ?string $slug = 'series';
 
-    public static function canViewAny(): bool
+    public static function canAccess(): bool
     {
-        return true;
+        return static::getCurrentAuth() !== null;
     }
 
     public static function getNavigationBadge(): ?string
     {
+        if (! static::getCurrentAuth()) {
+            return null;
+        }
+
         $playlist = PlaylistFacade::resolvePlaylistByUuid(static::getCurrentUuid());
         if ($playlist) {
             return (string) $playlist->series()->where('enabled', true)->count();
         }
 
-        return '';
+        return null;
     }
 
     public static function getUrl(
@@ -103,12 +107,20 @@ class SeriesResource extends Resource
 
             // Alias backed by a custom playlist
             if ($playlist->custom_playlist_id) {
-                return parent::getEloquentQuery()
+                $query = parent::getEloquentQuery()
                     ->with('customPlaylists')
                     ->whereHas('customPlaylists', function ($query) use ($playlist) {
                         $query->where('custom_playlists.id', $playlist->custom_playlist_id);
                     })
                     ->where('enabled', true);
+
+                // Apply series category filter if configured on the alias
+                $allowedCategoryNames = $playlist->getAllowedCategoryNames();
+                if (! empty($allowedCategoryNames)) {
+                    $query->where(fn ($query) => $playlist->constrainSeriesToCustomCategories($query, $allowedCategoryNames));
+                }
+
+                return $query;
             }
         }
 

@@ -2,18 +2,29 @@
 
 namespace App\Models;
 
+use App\Enums\DvrRecordingStatus;
 use App\Pivots\PlaylistAuthPivot;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\HasOne;
+use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Validation\ValidationException;
 use InvalidArgumentException;
 
 class PlaylistAuth extends Model
 {
     use HasFactory;
+
+    protected static function booted(): void
+    {
+        static::deleting(function (PlaylistAuth $playlistAuth): void {
+            TvNotification::where('playlist_auth_id', $playlistAuth->id)->delete();
+            PushDeviceToken::where('playlist_auth_id', $playlistAuth->id)->delete();
+        });
+    }
 
     /**
      * The attributes that should be cast to native types.
@@ -23,10 +34,16 @@ class PlaylistAuth extends Model
     protected $casts = [
         'id' => 'integer',
         'enabled' => 'boolean',
+        'dvr_enabled' => 'boolean',
+        'dvr_max_concurrent_recordings' => 'integer',
+        'dvr_storage_quota_gb' => 'integer',
         'user_id' => 'integer',
         'expires_at' => 'datetime',
         'max_connections' => 'integer',
         'stop_oldest_on_limit' => 'boolean',
+        'request_enabled' => 'boolean',
+        'auto_approve_requests' => 'boolean',
+        'aiostreams_enabled' => 'boolean',
         'proxy_enabled' => 'boolean',
         'proxy_stream_profile_ids' => 'array',
     ];
@@ -39,6 +56,71 @@ class PlaylistAuth extends Model
     public function viewer(): HasOne
     {
         return $this->hasOne(PlaylistViewer::class);
+    }
+
+    public function dvrRecordings(): HasMany
+    {
+        return $this->hasMany(DvrRecording::class);
+    }
+
+    public function dvrRules(): HasMany
+    {
+        return $this->hasMany(DvrRecordingRule::class);
+    }
+
+    public function tvNotificationReads(): HasMany
+    {
+        return $this->hasMany(TvNotificationRead::class);
+    }
+
+    /**
+     * Whether this auth has reached its per-guest concurrent recording cap.
+     * Returns false when no cap is configured (null = unlimited).
+     *
+     * @param  int  $pendingInTick  Recordings already counted as started for this auth
+     *                              earlier in the same scheduler tick but not yet
+     *                              reflected in the database — see DvrSetting::isAtCapacity().
+     */
+    public function hasReachedConcurrentLimit(int $pendingInTick = 0): bool
+    {
+        if ($this->dvr_max_concurrent_recordings === null) {
+            return false;
+        }
+
+        $active = $this->dvrRecordings()
+            ->whereIn('status', [DvrRecordingStatus::Recording, DvrRecordingStatus::PostProcessing])
+            ->count();
+
+        return ($active + $pendingInTick) >= $this->dvr_max_concurrent_recordings;
+    }
+
+    /**
+     * Whether this auth has exhausted its per-guest storage quota.
+     * Returns false when no quota is configured (null = unlimited).
+     */
+    public function hasReachedStorageQuota(): bool
+    {
+        if ($this->dvr_storage_quota_gb === null) {
+            return false;
+        }
+
+        $usedBytes = $this->dvrRecordings()
+            ->whereNotNull('file_size_bytes')
+            ->sum('file_size_bytes');
+
+        $quotaBytes = $this->dvr_storage_quota_gb * 1024 * 1024 * 1024;
+
+        return $usedBytes >= $quotaBytes;
+    }
+
+    /**
+     * Total storage used by recordings attributed to this auth, in bytes.
+     */
+    public function getStorageUsedBytesAttribute(): int
+    {
+        return (int) $this->dvrRecordings()
+            ->whereNotNull('file_size_bytes')
+            ->sum('file_size_bytes');
     }
 
     /**
@@ -90,6 +172,46 @@ class PlaylistAuth extends Model
     public function assignedPlaylist(): HasOne
     {
         return $this->hasOne(PlaylistAuthPivot::class, 'playlist_auth_id');
+    }
+
+    /**
+     * Entitled credentials for a broadcast fired on ($notifiableType, $notifiableId) include
+     * both directly-assigned auths and auths assigned to a PlaylistAlias whose effective
+     * playlist is the same model — a DVR/global notification is raised against the
+     * underlying Playlist/CustomPlaylist, but an alias-assigned guest never subscribes to
+     * that model's own channel, only to their alias's.
+     */
+    public function scopeEntitledToNotificationRecipient(Builder $query, string $notifiableType, int|string $notifiableId): Builder
+    {
+        $aliasColumn = match ($notifiableType) {
+            Relation::getMorphAlias(Playlist::class) => 'playlist_id',
+            Relation::getMorphAlias(CustomPlaylist::class) => 'custom_playlist_id',
+            default => null,
+        };
+
+        $aliasIds = $aliasColumn !== null
+            ? PlaylistAlias::query()->where($aliasColumn, $notifiableId)->pluck('id')
+            : collect();
+
+        return $query
+            ->where('enabled', true)
+            ->where(function (Builder $query): void {
+                $query->whereNull('expires_at')
+                    ->orWhere('expires_at', '>', now());
+            })
+            ->whereHas('assignedPlaylist', function (Builder $query) use ($notifiableType, $notifiableId, $aliasIds): void {
+                $query->where(function (Builder $query) use ($notifiableType, $notifiableId): void {
+                    $query->where('authenticatable_type', $notifiableType)
+                        ->where('authenticatable_id', $notifiableId);
+                });
+
+                if ($aliasIds->isNotEmpty()) {
+                    $query->orWhere(function (Builder $query) use ($aliasIds): void {
+                        $query->where('authenticatable_type', Relation::getMorphAlias(PlaylistAlias::class))
+                            ->whereIn('authenticatable_id', $aliasIds);
+                    });
+                }
+            });
     }
 
     /**

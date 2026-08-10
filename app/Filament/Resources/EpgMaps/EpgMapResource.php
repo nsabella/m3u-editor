@@ -13,6 +13,7 @@ use App\Models\Epg;
 use App\Models\EpgMap;
 use App\Models\Group;
 use App\Models\Playlist;
+use App\Services\SimilaritySearchService;
 use App\Tables\Columns\ProgressColumn;
 use App\Traits\HasUserFiltering;
 use EslamRedaDiv\FilamentCopilot\Contracts\CopilotResource;
@@ -163,6 +164,7 @@ class EpgMapResource extends Resource implements CopilotResource
                         $record->update([
                             'status' => Status::Processing,
                             'progress' => 0,
+                            'processing' => false,
                         ]);
                         app('Illuminate\Contracts\Bus\Dispatcher')
                             ->dispatch(new MapPlaylistChannelsToEpg(
@@ -190,9 +192,17 @@ class EpgMapResource extends Resource implements CopilotResource
                     ->modalDescription(__('Manually restart this EPG mapping? This will restart the existing mapping process.'))
                     ->modalSubmitActionLabel(__('Restart Now'))
                     ->action(function ($record) {
+                        // Clear the `processing` claim flag as well as the visible
+                        // status/progress — if a prior run died without going
+                        // through its own completion/failure handler (e.g. the
+                        // worker was killed mid-run), `processing` is stuck
+                        // `true` forever and the atomic claim in
+                        // MapPlaylistChannelsToEpg::handle() would silently
+                        // refuse to start a new run.
                         $record->update([
                             'status' => Status::Processing,
                             'progress' => 0,
+                            'processing' => false,
                         ]);
                         app('Illuminate\Contracts\Bus\Dispatcher')
                             ->dispatch(new MapPlaylistChannelsToEpg(
@@ -238,6 +248,7 @@ class EpgMapResource extends Resource implements CopilotResource
                                 $record->update([
                                     'status' => Status::Processing,
                                     'progress' => 0,
+                                    'processing' => false,
                                 ]);
                                 app('Illuminate\Contracts\Bus\Dispatcher')
                                     ->dispatch(new MapPlaylistChannelsToEpg(
@@ -398,6 +409,25 @@ class EpgMapResource extends Resource implements CopilotResource
                                 ->suggestions(['hd', 'fhd', 'uhd', '4k', '8k', 'sd', '720p', '1080p', '1080i', '2160p', 'hdraw', 'sdraw', 'hevc', 'h264', 'h265'])
                                 ->splitKeys(['Tab', 'Return'])
                                 ->visible(fn (Get $get): bool => (bool) $get('settings.remove_quality_indicators')),
+                        ]),
+
+                    Fieldset::make(__('Postgres Trigram Matching'))
+                        ->schema([
+                            Toggle::make('settings.trigram_matching_enabled')
+                                ->label(__('Widen matching with pg_trgm similarity (Postgres only)'))
+                                ->columnSpanFull()
+                                ->inline(true)
+                                ->default(false)
+                                ->disabled(fn (): bool => ! app(SimilaritySearchService::class)->trigramMatchingAvailable())
+                                ->helperText(fn (): string => app(SimilaritySearchService::class)->trigramMatchingAvailable()
+                                    ? __('Catches typos and misspellings, but slows down mapping. Off by default.')
+                                    : __('Requires the pg_trgm extension on your Postgres database.'))
+                                ->hintIcon(
+                                    'heroicon-m-question-mark-circle',
+                                    tooltip: fn (): string => app(SimilaritySearchService::class)->trigramMatchingAvailable()
+                                        ? __('Runs an extra similarity check against every candidate (e.g. matches "Soprtsnet" to "Sportsnet"). Only enable this if you\'re missing matches due to spelling variations.')
+                                        : __('Run "php artisan app:configure-pg-trgm" on an external Postgres database to enable this. The embedded database sets this up automatically.'),
+                                ),
                         ]),
 
                     Fieldset::make(__('Matching Thresholds'))

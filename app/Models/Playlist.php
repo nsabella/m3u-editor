@@ -131,6 +131,7 @@ class Playlist extends Model
             PlaylistSourceType::Jellyfin,
             PlaylistSourceType::Plex,
             PlaylistSourceType::LocalMedia,
+            PlaylistSourceType::AIOStreams,
         ]);
     }
 
@@ -145,6 +146,14 @@ class Playlist extends Model
     public function mediaServerIntegration(): HasOne
     {
         return $this->hasOne(MediaServerIntegration::class);
+    }
+
+    /**
+     * The AIOStreams integration that this playlist is permitted to access.
+     */
+    public function aiostreamsIntegration(): BelongsTo
+    {
+        return $this->belongsTo(MediaServerIntegration::class, 'aiostreams_integration_id');
     }
 
     /**
@@ -256,6 +265,16 @@ class Playlist extends Model
     public function epgMaps(): HasMany
     {
         return $this->hasMany(EpgMap::class);
+    }
+
+    public function dvrSetting(): HasOne
+    {
+        return $this->hasOne(DvrSetting::class);
+    }
+
+    public function requestSetting(): HasOne
+    {
+        return $this->hasOne(PlaylistRequestSetting::class);
     }
 
     public function channelScrubbers(): HasMany

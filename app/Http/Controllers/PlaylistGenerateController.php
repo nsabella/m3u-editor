@@ -730,14 +730,50 @@ class PlaylistGenerateController extends Controller
             // Select the first custom group name as a fallback (used when no tags are loaded).
             // Multi-group emission is handled in PHP by iterating through $channel->tags,
             // so no LEFT JOIN to taggables/tags is needed here.
-            $query->selectRaw(
-                '(SELECT t.name FROM taggables tb INNER JOIN tags t ON t.id = tb.tag_id WHERE tb.taggable_id = channels.id AND tb.taggable_type = ? AND t.type = ? ORDER BY t.order_column ASC LIMIT 1) as custom_group_name',
-                [Channel::class, $playlistUuid]
-            )
+            $orderSubquery = '(SELECT MIN(t.order_column) FROM taggables tb INNER JOIN tags t ON t.id = tb.tag_id WHERE tb.taggable_id = channels.id AND tb.taggable_type = ? AND t.type = ?)';
+
+            $query->selectRaw("{$orderSubquery} as custom_order", [Channel::class, $playlistUuid])
+                ->selectRaw(
+                    '(SELECT t.name FROM taggables tb INNER JOIN tags t ON t.id = tb.tag_id WHERE tb.taggable_id = channels.id AND tb.taggable_type = ? AND t.type = ? ORDER BY t.order_column ASC LIMIT 1) as custom_group_name',
+                    [Channel::class, $playlistUuid]
+                )
                 // Pivot sort (per-playlist channel position) is the primary ordering key.
                 // This ensures channels appear at their saved position regardless of group membership.
-                ->selectRaw('channel_custom_playlist.sort as ccp_sort')
-                ->orderByRaw('COALESCE(channel_custom_playlist.sort, channels.sort)')
+                ->selectRaw('channel_custom_playlist.sort as ccp_sort');
+
+            // Per-alias custom live group ordering (optional), ranked by the group the
+            // client is actually shown: the channel's custom tag, or the provider group
+            // name it falls back to when untagged. Groups outside the saved order (and
+            // VOD groups) fall through to the playlist's own ordering below.
+            if ($playlist instanceof PlaylistAlias && $playlist->hasCustomLiveGroupSort()) {
+                $order = array_values($playlist->getLiveGroupSortOrder());
+                $grammar = $playlist->getConnection()->getQueryGrammar();
+
+                // Tag names are translatable JSON, so let the grammar emit the driver's
+                // own extraction (json_extract on SQLite, ->> on PostgreSQL).
+                $effectiveGroupName = sprintf(
+                    'COALESCE((SELECT %s FROM taggables tb INNER JOIN tags t ON t.id = tb.tag_id WHERE tb.taggable_id = channels.id AND tb.taggable_type = ? AND t.type = ? ORDER BY t.order_column ASC LIMIT 1), %s)',
+                    $grammar->wrap('t.name->en'),
+                    $grammar->wrap('channels.group'),
+                );
+
+                $whenClauses = [];
+                foreach ($order as $index => $groupName) {
+                    $whenClauses[] = "WHEN ? THEN {$index}";
+                }
+                $elseValue = count($order);
+
+                $query->orderByRaw(
+                    "CASE {$effectiveGroupName} ".implode(' ', $whenClauses)." ELSE {$elseValue} END",
+                    array_merge([Channel::class, $playlistUuid], $order)
+                );
+            }
+
+            // Primary ordering: per-playlist channel position, falling back to channel sort.
+            $query->orderByRaw('COALESCE(channel_custom_playlist.sort, channels.sort)')
+                // Tag order / source-group sort order, demoted to tiebreakers by the
+                // pivot-sort primary key above.
+                ->orderByRaw("COALESCE({$orderSubquery}, groups.sort_order)", [Channel::class, $playlistUuid])
                 ->orderBy('channels.channel')
                 ->orderBy('channels.title');
 

@@ -261,8 +261,13 @@ class AppServiceProvider extends ServiceProvider
 
         $configuredPort = config('app.port');
         $hasPortInUrl = parse_url($baseUrl, PHP_URL_PORT) !== null;
+        $scheme = parse_url($baseUrl, PHP_URL_SCHEME);
 
-        if ($configuredPort && ! $hasPortInUrl) {
+        // Only append the port for HTTP URLs. HTTPS URLs are assumed to be
+        // behind a reverse proxy terminating TLS at port 443, so appending
+        // APP_PORT would produce incorrect external URLs (e.g. https://host:36400).
+        // This mirrors the guard in PlaylistService::getBaseUrl().
+        if ($configuredPort && ! $hasPortInUrl && $scheme !== 'https') {
             $baseUrl .= ':'.$configuredPort;
         }
 
@@ -538,6 +543,11 @@ class AppServiceProvider extends ServiceProvider
                     Storage::disk('local')->delete($playlist->uploads);
                 }
 
+                // Delete DVR recordings through Eloquent (not just the FK cascade) so each
+                // recording's deleting hook runs and cleans up its file on the DVR disk —
+                // a raw DB cascade would remove the rows but leave the files orphaned.
+                $playlist->dvrSetting?->recordings->each->delete();
+
                 // Delete associated viewers (watch progress cascades via FK)
                 PlaylistViewer::where('viewerable_type', $playlist->getMorphClass())
                     ->where('viewerable_id', $playlist->id)
@@ -612,6 +622,11 @@ class AppServiceProvider extends ServiceProvider
                 // Remove short URLs
                 $mergedPlaylist->removeShortUrls();
 
+                // Delete DVR recordings through Eloquent so each recording's deleting hook
+                // runs and cleans up its file on the DVR disk (a raw DB cascade would
+                // remove the rows but leave the files orphaned).
+                $mergedPlaylist->dvrSetting?->recordings->each->delete();
+
                 // Delete associated viewers (watch progress cascades via FK)
                 PlaylistViewer::where('viewerable_type', $mergedPlaylist->getMorphClass())
                     ->where('viewerable_id', $mergedPlaylist->id)
@@ -656,6 +671,11 @@ class AppServiceProvider extends ServiceProvider
             CustomPlaylist::deleting(function (CustomPlaylist $customPlaylist) {
                 // Remove short URLs
                 $customPlaylist->removeShortUrls();
+
+                // Delete DVR recordings through Eloquent so each recording's deleting hook
+                // runs and cleans up its file on the DVR disk (a raw DB cascade would
+                // remove the rows but leave the files orphaned).
+                $customPlaylist->dvrSetting?->recordings->each->delete();
 
                 // Cleanup tags
                 Tag::query()
@@ -778,6 +798,23 @@ class AppServiceProvider extends ServiceProvider
             Network::creating(function (Network $network) {
                 if (empty($network->uuid)) {
                     $network->uuid = Str::uuid()->toString();
+                }
+
+                if (! in_array($network->schedule_type, ['sequential', 'shuffle', 'manual'], true)) {
+                    Log::warning('Network created with invalid schedule_type, defaulting to sequential', [
+                        'schedule_type' => $network->schedule_type,
+                    ]);
+
+                    $network->schedule_type = 'sequential';
+                }
+            });
+            Network::updating(function (Network $network) {
+                if ($network->isDirty('schedule_type') && ! in_array($network->schedule_type, ['sequential', 'shuffle', 'manual'], true)) {
+                    Log::warning('Network updated with invalid schedule_type, defaulting to sequential', [
+                        'schedule_type' => $network->schedule_type,
+                    ]);
+
+                    $network->schedule_type = 'sequential';
                 }
             });
             Network::updated(function (Network $network) {

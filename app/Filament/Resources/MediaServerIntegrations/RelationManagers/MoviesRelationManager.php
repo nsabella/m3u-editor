@@ -34,6 +34,14 @@ class MoviesRelationManager extends RelationManager
         return true;
     }
 
+    public static function canViewForRecord(Model $ownerRecord, string $pageClass): bool
+    {
+        // AIOStreams content is added on-demand rather than synced from a real media
+        // server library, so it doesn't fit this VOD-resource-oriented, read-only view
+        // — see AioStreamsMoviesRelationManager instead.
+        return $ownerRecord->type !== 'aiostreams';
+    }
+
     public static function getTabComponent(Model $ownerRecord, string $pageClass): Tab
     {
         return Tab::make(__('Movies'))

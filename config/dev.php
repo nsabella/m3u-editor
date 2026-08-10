@@ -2,13 +2,15 @@
 
 return [
     'author' => 'Shaun Parkison',
-    'version' => '0.11.69',
-    'dev_version' => '0.11.69-dev',
-    'experimental_version' => '0.11.69-exp',
+    'version' => '0.12.47',
+    'dev_version' => '0.12.47-dev',
+    'experimental_version' => '0.12.47-exp',
     'repo' => 'm3ue/m3u-editor',
     'docs_url' => 'https://m3ue.sparkison.dev',
     'donate' => 'https://buymeacoffee.com/shparkison',
     'discord_url' => 'https://discord.gg/rS3abJ5dz7',
+    'tv_repo' => 'm3ue/m3u-tv',
+    'tv_releases_url' => 'https://github.com/m3ue/m3u-tv/releases',
     'paypal' => 'https://www.paypal.com/donate/?hosted_button_id=ULJRPVWJNBSSG',
     'kofi' => 'https://ko-fi.com/sparkison',
     'admin_emails' => ['admin@test.com'],
@@ -34,4 +36,10 @@ return [
 
     // restrict playlists to specific domains (comma separated list, supports wildcards, e.g. *.example.com)
     'allowed_playlist_domains' => env('ALLOWED_PLAYLIST_DOMAINS', null),
+
+    // Timeout (seconds) for downloading the playlist file itself from the provider. Large
+    // playlists (many VOD entries) on throttled/slow connections can take a while to fully
+    // transfer; this covers the whole request (connect + transfer), not just the connect phase.
+    'playlist_download_timeout' => env('PLAYLIST_DOWNLOAD_TIMEOUT', 900),
+    'epg_download_timeout' => env('EPG_DOWNLOAD_TIMEOUT', 900),
 ];

@@ -80,6 +80,8 @@ class BuildEpgMapCandidatesJob implements ShouldQueue
             ->where('playlist_id', $map->playlist_id)
             ->eligibleForEpgMapping()
             ->whereNull('epg_channel_id')
+            ->when($map->channels, fn ($query) => $query->whereIn('id', $map->channels))
+            ->when(! $map->channels && $map->group_ids, fn ($query) => $query->whereIn('group_id', $map->group_ids))
             ->orderBy('name')
             ->get(['id', 'name', 'name_custom', 'title', 'title_custom']);
 
@@ -107,7 +109,8 @@ class BuildEpgMapCandidatesJob implements ShouldQueue
                 cleanedName: $matcher->cleanNameForMatching($channel->name_custom ?? $channel->name, $settings),
             ),
         )->unique()->values()->all();
-        $prefetched = $matcher->loadEpgCandidates($epg, $unionTerms);
+        $trigramMatchingEnabled = $settings['trigram_matching_enabled'] ?? false;
+        $prefetched = $matcher->loadEpgCandidates($epg, $unionTerms, $trigramMatchingEnabled);
 
         $processed = 0;
         $rows = [];
@@ -126,6 +129,7 @@ class BuildEpgMapCandidatesJob implements ShouldQueue
                 cleanedTitle: $cleanedTitle,
                 cleanedName: $cleanedName,
                 prefetchedCandidates: $prefetched,
+                trigramMatchingEnabled: $trigramMatchingEnabled,
             );
 
             $top = $result['candidates'][0] ?? null;

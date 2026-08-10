@@ -2,7 +2,6 @@
 
 namespace App\Jobs;
 
-use App\Enums\PlaylistSourceType;
 use App\Enums\Status;
 use App\Interfaces\MediaServer;
 use App\Models\Category;
@@ -135,6 +134,35 @@ class SyncMediaServer implements ShouldBeUnique, ShouldQueue
                 throw new Exception('Connection failed: '.$connectionTest['message']);
             }
 
+            // AIOStreams is on-demand only — no content to sync after connection is verified.
+            if ($integration->isAioStreams()) {
+                $integration->update([
+                    'status' => 'completed',
+                    'progress' => 100,
+                    'movie_progress' => 100,
+                    'series_progress' => 100,
+                    'last_synced_at' => now(),
+                    'aiostreams_catalogs' => $integration->aiostreams_catalogs,
+                    'aiostreams_logo' => $integration->aiostreams_logo,
+                    'aiostreams_selected_catalog_ids' => $integration->aiostreams_selected_catalog_ids,
+                ]);
+
+                $playlist->update([
+                    'status' => Status::Completed,
+                    'processing' => [],
+                    'synced' => now(),
+                ]);
+
+                Notification::make()
+                    ->success()
+                    ->title(__('AIOStreams Connected'))
+                    ->body($connectionTest['message'] ?? "Connected to {$integration->name}.")
+                    ->broadcast($integration->user)
+                    ->sendToDatabase($integration->user);
+
+                return;
+            }
+
             // Validate selected libraries still exist
             $this->validateSelectedLibraries($integration, $service);
 
@@ -161,7 +189,7 @@ class SyncMediaServer implements ShouldBeUnique, ShouldQueue
                 'movie_progress' => 100,
                 'series_progress' => 100,
                 'last_synced_at' => now(),
-                'sync_stats' => $this->stats,
+                'sync_stats' => $this->sanitizeForJson($this->stats),
             ]);
 
             // Update playlist status
@@ -203,7 +231,7 @@ class SyncMediaServer implements ShouldBeUnique, ShouldQueue
             // Update integration with error
             $integration->update([
                 'status' => 'failed',
-                'sync_stats' => $this->stats,
+                'sync_stats' => $this->sanitizeForJson($this->stats),
             ]);
 
             // Update playlist status if it exists
@@ -236,41 +264,7 @@ class SyncMediaServer implements ShouldBeUnique, ShouldQueue
      */
     protected function ensurePlaylist(MediaServerIntegration $integration): Playlist
     {
-        if ($integration->playlist_id && $integration->playlist) {
-            return $integration->playlist;
-        }
-
-        // Determine source type based on integration type
-        $sourceType = match ($integration->type) {
-            'emby' => PlaylistSourceType::Emby,
-            'jellyfin' => PlaylistSourceType::Jellyfin,
-            'plex' => PlaylistSourceType::Plex,
-            'local', 'webdav' => PlaylistSourceType::LocalMedia,
-            default => PlaylistSourceType::M3u,
-        };
-
-        // Determine URL for reference
-        $url = $integration->usesLocalPathConfig()
-            ? 'local://'.$integration->name
-            : $integration->base_url;
-
-        // Create a new playlist for this integration
-        $playlist = Playlist::createQuietly([
-            'uuid' => Str::orderedUuid()->toString(),
-            'name' => $integration->name,
-            'url' => $url,
-            'user_id' => $integration->user_id,
-            'source_type' => $sourceType,
-            'status' => Status::Processing,
-            'auto_sync' => false, // Sync is managed by the integration, not the playlist
-            'user_agent' => 'M3U-Editor-MediaServer-Sync/1.0', // required value for playlist, set to something meaningful
-            'id_channel_by' => 'stream_id', // Required field for playlist, set to stream_id to ensure consistent channel matching based on source_id
-        ]);
-
-        // Link the playlist to the integration
-        $integration->update(['playlist_id' => $playlist->id]);
-
-        return $playlist;
+        return $integration->getOrCreatePlaylist();
     }
 
     /**
@@ -281,6 +275,23 @@ class SyncMediaServer implements ShouldBeUnique, ShouldQueue
         Playlist $playlist,
         MediaServer $service
     ): void {
+        // Show that scanning has started (scan phase: 0→40%)
+        $integration->update(['movie_progress' => 5]);
+
+        // Hook into WebDAV's scan phase to show incremental progress while directories are scanned.
+        if (method_exists($service, 'setScanProgressCallback')) {
+            $scanCount = 0;
+            $service->setScanProgressCallback(function (int $found) use ($integration, &$scanCount): void {
+                // Throttle: update DB only every 10 items to avoid excessive writes during scanning.
+                if ($found - $scanCount >= 10) {
+                    $scanCount = $found;
+                    // Scan phase reports 5–40%; capped so we never overshoot into sync territory.
+                    $scanProgress = min(40, 5 + (int) ($found / 2));
+                    $integration->update(['movie_progress' => $scanProgress]);
+                }
+            });
+        }
+
         $movies = $service->fetchMovies();
 
         Log::info('SyncMediaServer: Fetched movies', [
@@ -289,31 +300,20 @@ class SyncMediaServer implements ShouldBeUnique, ShouldQueue
         ]);
 
         $totalMovies = $movies->count();
-        $integration->update(['total_movies' => $totalMovies]);
+        $integration->update([
+            'total_movies' => $totalMovies,
+            'movie_progress' => 40, // scan complete; sync phase starts at 40%
+        ]);
 
         foreach ($movies as $index => $movie) {
             try {
                 $this->syncMovie($integration, $playlist, $service, $movie);
                 $this->stats['movies_synced']++;
 
-                // Update progress every 10 movies or on last movie
-                if (($index + 1) % 10 === 0 || ($index + 1) === $totalMovies) {
-                    $progress = $totalMovies > 0 ? (int) ((($index + 1) / $totalMovies) * 100) : 100;
-
-                    // Read current DB value and only update if computed progress is greater
-                    $currentDbProgress = MediaServerIntegration::find($integration->id)->movie_progress;
-
-                    if ($progress > $currentDbProgress) {
-                        $integration->update(['movie_progress' => $progress]);
-                    } else {
-                        // Sparse debug log for unexpected regressions
-                        Log::debug('SyncMediaServer: Skipping movie_progress update because computed progress <= current DB value', [
-                            'integration_id' => $integration->id,
-                            'computed' => $progress,
-                            'current_db' => $currentDbProgress,
-                        ]);
-                    }
-                }
+                // Update after every movie (sync phase: 40→100%).
+                // DB writes are cheap; frequent updates give smooth progress.
+                $syncFraction = $totalMovies > 0 ? ($index + 1) / $totalMovies : 1;
+                $integration->update(['movie_progress' => 40 + (int) ($syncFraction * 60)]);
             } catch (Exception $e) {
                 $this->stats['errors'][] = "Movie '{$movie['Name']}': {$e->getMessage()}";
                 Log::warning('SyncMediaServer: Failed to sync movie', [
@@ -499,6 +499,20 @@ class SyncMediaServer implements ShouldBeUnique, ShouldQueue
         Playlist $playlist,
         MediaServer $service
     ): void {
+        // Show that series scanning has started (scan phase: 0→40%)
+        $integration->update(['series_progress' => 5]);
+
+        if (method_exists($service, 'setScanProgressCallback')) {
+            $scanCount = 0;
+            $service->setScanProgressCallback(function (int $found) use ($integration, &$scanCount): void {
+                if ($found - $scanCount >= 5) {
+                    $scanCount = $found;
+                    $scanProgress = min(40, 5 + (int) ($found / 2));
+                    $integration->update(['series_progress' => $scanProgress]);
+                }
+            });
+        }
+
         $seriesList = $service->fetchSeries();
 
         Log::info('SyncMediaServer: Fetched series', [
@@ -507,31 +521,20 @@ class SyncMediaServer implements ShouldBeUnique, ShouldQueue
         ]);
 
         $totalSeries = $seriesList->count();
-        $integration->update(['total_series' => $totalSeries]);
+        $integration->update([
+            'total_series' => $totalSeries,
+            'series_progress' => 40, // scan complete; sync phase starts at 40%
+        ]);
 
         foreach ($seriesList as $index => $seriesData) {
+            // Optimistic progress update BEFORE processing — syncOneSeries() involves
+            // multiple slow WebDAV requests, so advance the bar at start, not end.
+            $syncFraction = $totalSeries > 0 ? $index / $totalSeries : 0;
+            $integration->update(['series_progress' => 40 + (int) ($syncFraction * 60)]);
+
             try {
                 $this->syncOneSeries($integration, $playlist, $service, $seriesData);
                 $this->stats['series_synced']++;
-
-                // Update progress every 5 series or on last series
-                if (($index + 1) % 5 === 0 || ($index + 1) === $totalSeries) {
-                    $progress = $totalSeries > 0 ? (int) ((($index + 1) / $totalSeries) * 100) : 100;
-
-                    // Read current DB value and only update if computed progress is greater
-                    $currentDbProgress = MediaServerIntegration::find($integration->id)->series_progress;
-
-                    if ($progress > $currentDbProgress) {
-                        $integration->update(['series_progress' => $progress]);
-                    } else {
-                        // Keep a single sparse debug log for unexpected regressions
-                        Log::debug('SyncMediaServer: Skipping series_progress update because computed progress <= current DB value', [
-                            'integration_id' => $integration->id,
-                            'computed' => $progress,
-                            'current_db' => $currentDbProgress,
-                        ]);
-                    }
-                }
             } catch (Exception $e) {
                 $this->stats['errors'][] = "Series '{$seriesData['Name']}': {$e->getMessage()}";
                 Log::warning('SyncMediaServer: Failed to sync series', [
@@ -540,6 +543,8 @@ class SyncMediaServer implements ShouldBeUnique, ShouldQueue
                 ]);
             }
         }
+
+        $integration->update(['series_progress' => 100]);
     }
 
     /**
@@ -817,18 +822,21 @@ class SyncMediaServer implements ShouldBeUnique, ShouldQueue
         // Remove stale episodes (must be deleted before seasons/series to avoid FK issues)
         if ($integration->import_series) {
             $staleEpisodes = Episode::where('playlist_id', $playlist->id)
+                ->where('is_custom', false)
                 ->where('import_batch_no', '!=', $this->batchNo);
             $this->stats['episodes_removed'] = $staleEpisodes->count();
             $staleEpisodes->delete();
 
             // Remove stale seasons
             $staleSeasons = Season::where('playlist_id', $playlist->id)
+                ->where('is_custom', false)
                 ->where('import_batch_no', '!=', $this->batchNo);
             $this->stats['seasons_removed'] = $staleSeasons->count();
             $staleSeasons->delete();
 
             // Remove stale series
             $staleSeries = Series::where('playlist_id', $playlist->id)
+                ->where('is_custom', false)
                 ->where('import_batch_no', '!=', $this->batchNo);
             $this->stats['series_removed'] = $staleSeries->count();
             $staleSeries->delete();
@@ -996,6 +1004,24 @@ class SyncMediaServer implements ShouldBeUnique, ShouldQueue
             overwriteExisting: false,
             user: $integration->user
         );
+    }
+
+    /**
+     * Recursively sanitize an array so every string is valid UTF-8.
+     * Filenames from remote WebDAV servers (e.g. TorBox) can contain
+     * non-UTF-8 byte sequences that break JSON encoding when stored in sync_stats.
+     */
+    protected function sanitizeForJson(mixed $value): mixed
+    {
+        if (is_string($value)) {
+            return mb_scrub($value, 'UTF-8');
+        }
+
+        if (is_array($value)) {
+            return array_map(fn ($v) => $this->sanitizeForJson($v), $value);
+        }
+
+        return $value;
     }
 
     public function failed(\Throwable $exception): void

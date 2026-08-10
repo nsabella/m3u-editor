@@ -4,12 +4,17 @@ namespace App\Filament\Pages;
 
 use App\Filament\Actions\CronHelperAction;
 use App\Filament\Actions\RegexTesterAction;
+use App\Filament\CopilotTools\DvrOverviewTool;
+use App\Filament\CopilotTools\DvrScheduleTool;
 use App\Filament\CopilotTools\EpgChannelMatcherTool;
 use App\Filament\CopilotTools\EpgMappingApplyTool;
 use App\Filament\CopilotTools\EpgMappingStateTool;
 use App\Filament\CopilotTools\ExecuteDatabaseQueryTool;
 use App\Filament\CopilotTools\GetDatabaseSchemaTool;
+use App\Filament\CopilotTools\NetworkContentBulkAddTool;
+use App\Filament\CopilotTools\NetworkContentPinTool;
 use App\Filament\CopilotTools\SearchDocsTool;
+use App\Filament\CopilotTools\VodContentSearchTool;
 use App\Filament\Resources\Assets\AssetResource;
 use App\Filament\Resources\PushDeviceTokens\PushDeviceTokenResource;
 use App\Jobs\RestartQueue;
@@ -1029,7 +1034,7 @@ class Preferences extends SettingsPage
                                                     ->send();
                                             }),
                                         Action::make('get_tv_app')
-                                            ->label(__('Download the app'))
+                                            ->label(__('Get the app'))
                                             ->color('gray')
                                             ->icon('heroicon-o-arrow-top-right-on-square')
                                             ->url('https://github.com/m3ue/m3u-tv/releases')
@@ -1045,6 +1050,11 @@ class Preferences extends SettingsPage
                                     ->description(__('Deliver TV notifications to phone/tablet devices when the app is backgrounded or closed.'))
                                     ->icon('heroicon-m-device-phone-mobile')
                                     ->headerActions([
+                                        Action::make(__('Manage Devices'))
+                                            ->label(__('Manage Devices'))
+                                            ->icon('heroicon-o-device-phone-mobile')
+                                            ->url(PushDeviceTokenResource::getUrl())
+                                            ->hidden(fn (Get $get): bool => ! (bool) $get('push_relay_enabled')),
                                         Action::make('test_push_relay')
                                             ->label(__('Send Push Notification'))
                                             ->icon('heroicon-o-paper-airplane')
@@ -1112,16 +1122,34 @@ class Preferences extends SettingsPage
                                             ->label(__('Enable push relay'))
                                             ->helperText(__('When enabled, TV notifications are also forwarded to registered mobile devices through the public relay.'))
                                             ->live(),
-                                        Action::make(__('Manage Devices'))
-                                            ->label(__('Manage Devices'))
-                                            ->icon('heroicon-o-device-phone-mobile')
-                                            ->url(PushDeviceTokenResource::getUrl())
-                                            ->hidden(fn (Get $get): bool => ! (bool) $get('push_relay_enabled')),
+                                    ]),
+
+                                Section::make(__('Device Pairing'))
+                                    ->description(__('Let M3U TV request a short pairing code instead of typing a password on the remote. The admin enters the code here and picks which credential to sign the TV in with.'))
+                                    ->icon('heroicon-m-qr-code')
+                                    ->headerActions([
+                                        Action::make(__('Pair a Device'))
+                                            ->label(__('Pair a Device'))
+                                            ->icon('heroicon-o-qr-code')
+                                            ->url(PushDeviceTokenResource::getUrl(parameters: ['tab' => 'pairing']))
+                                            ->hidden(fn (Get $get): bool => ! (bool) $get('device_pairing_enabled') || ! (bool) $get('app_output_enabled')),
+                                    ])
+                                    ->schema([
+                                        Callout::make()
+                                            ->warning()
+                                            ->description(__('Device pairing requires enhanced Xtream API output, since every M3U TV feature depends on it. Enable "Enhanced output enabled" above to use pairing.'))
+                                            ->hidden(fn (Get $get): bool => (bool) $get('app_output_enabled')),
+                                        Toggle::make('device_pairing_enabled')
+                                            ->label(__('Enable device pairing'))
+                                            ->helperText(__('When enabled, M3U TV can request a pairing code and the "Device Pairing" tab is available under Devices. Disabling this hides the tab and rejects any in-flight pairing requests.'))
+                                            ->disabled(fn (Get $get): bool => ! (bool) $get('app_output_enabled'))
+                                            ->live(),
                                     ]),
 
                                 Section::make(__('Notification Channels'))
                                     ->description(__('Define the notification channels available in the TV app. Users can subscribe to specific channels so they only receive relevant notifications. Channels not listed here are still usable — they appear automatically once a notification arrives on that channel.'))
                                     ->icon('heroicon-m-tag')
+                                    ->collapsed()
                                     ->schema([
                                         Repeater::make('tv_notification_channels')
                                             ->label(__('Default Notification Channels'))
@@ -1750,6 +1778,35 @@ class Preferences extends SettingsPage
                                             ]),
                                     ]),
 
+                                Section::make(__('AIOStreams Integration'))
+                                    ->description(__('Tune how aggressively m3u-editor calls your AIOStreams addon instance(s) when browsing catalogs and resolving streams.'))
+                                    ->columnSpanFull()
+                                    ->icon('heroicon-m-signal')
+                                    ->collapsible()
+                                    ->columns(2)
+                                    ->schema([
+                                        TextInput::make('aiostreams_rate_limit')
+                                            ->label(__('Rate Limit (requests/minute)'))
+                                            ->placeholder(__('20'))
+                                            ->numeric()
+                                            ->minValue(1)
+                                            ->maxValue(120)
+                                            ->default(20)
+                                            ->hintIcon(
+                                                'heroicon-m-question-mark-circle',
+                                                tooltip: 'Applies to every request m3u-editor makes to an AIOStreams instance (manifest, catalog, stream, and meta lookups combined), per integration. Keep this low if you use a shared/hosted AIOStreams instance you don\'t control the server-side rate limits for — AIOStreams\' own defaults for the addon endpoints it exposes range from ~40 to ~360 requests/minute depending on endpoint, so the default here is still well below the strictest of those.'
+                                            )
+                                            ->helperText(__('Maximum combined AIOStreams requests per minute, per integration. Lower is safer for hosted/shared instances.')),
+                                        TextInput::make('aiostreams_max_failover_candidates')
+                                            ->label(__('Max Failover Candidates'))
+                                            ->placeholder(__('3'))
+                                            ->numeric()
+                                            ->minValue(1)
+                                            ->maxValue(10)
+                                            ->default(3)
+                                            ->helperText(__('Number of ranked stream candidates to keep per resolved movie/episode (1 primary + failovers). Higher values mean more resilience to dead links but more streams fetched per resolve.')),
+                                    ]),
+
                                 Section::make(__('MediaFlow Proxy'))
                                     ->description(__('Connect MediaFlow Proxy to route your playlists, EPG, and Xtream API through it. Once configured, proxied URLs are auto-generated on each playlist\'s detail page.'))
                                     ->columnSpan('full')
@@ -1931,6 +1988,11 @@ class Preferences extends SettingsPage
                                                 EpgMappingApplyTool::class => __('EPG Mapper: Apply Mappings'),
                                                 GetDatabaseSchemaTool::class => __('Database: Get Schema'),
                                                 ExecuteDatabaseQueryTool::class => __('Database: Execute Query'),
+                                                DvrOverviewTool::class => __('DVR: Overview'),
+                                                DvrScheduleTool::class => __('DVR: Schedule'),
+                                                VodContentSearchTool::class => __('Content: VOD Search'),
+                                                NetworkContentBulkAddTool::class => __('Content: Network Bulk Add'),
+                                                NetworkContentPinTool::class => __('Content: Pin to Timeslot'),
                                             ])
                                             ->afterStateHydrated(function ($component, $state) {
                                                 // Strip built-in tools that were saved by older versions.
@@ -1947,6 +2009,7 @@ class Preferences extends SettingsPage
                                             ->columns(2)
                                             ->default([
                                                 SearchDocsTool::class,
+                                                DvrScheduleTool::class,
                                             ])
                                             ->helperText(__('Select which additional tools the AI assistant can use. Core tools (navigation, memory) are always available.')),
                                     ]),

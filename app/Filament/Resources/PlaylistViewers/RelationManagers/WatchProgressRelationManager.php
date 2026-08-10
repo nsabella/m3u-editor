@@ -48,6 +48,16 @@ class WatchProgressRelationManager extends RelationManager
                 ->icon('heroicon-s-play')
                 ->badge(fn () => $this->ownerRecord->watchProgress()->where('content_type', 'episode')->count())
                 ->query(fn ($query) => $query->where('content_type', 'episode')),
+
+            'dvr_recording' => Tab::make(__('DVR'))
+                ->icon('heroicon-s-circle-stack')
+                ->badge(fn () => $this->ownerRecord->watchProgress()->where('content_type', 'dvr_recording')->count())
+                ->query(fn ($query) => $query->where('content_type', 'dvr_recording')),
+
+            'aiostreams' => Tab::make(__('AIOStreams'))
+                ->icon('heroicon-s-play')
+                ->badge(fn () => $this->ownerRecord->watchProgress()->where('content_type', 'aiostreams')->count())
+                ->query(fn ($query) => $query->where('content_type', 'aiostreams')),
         ];
     }
 
@@ -64,6 +74,8 @@ class WatchProgressRelationManager extends RelationManager
             ->deferLoading()
             ->modifyQueryUsing(fn ($query) => match ($this->activeTab ?? 'live') {
                 'episode' => $query->with(['episode', 'episode.series', 'episode.playlist']),
+                'dvr_recording' => $query->with(['dvrRecording', 'dvrRecording.dvrSetting.playlist', 'dvrRecording.user']),
+                'aiostreams' => $query,
                 default => $query->with(['channel', 'channel.epgChannel', 'channel.playlist']),
             })
             ->paginated([10, 25, 50, 100])
@@ -93,7 +105,8 @@ class WatchProgressRelationManager extends RelationManager
                         ],
                         default => [],
                     })
-                    ->checkFileExistence(false),
+                    ->checkFileExistence(false)
+                    ->visible(fn () => ($this->activeTab ?? 'live') !== 'aiostreams'),
 
                 // ── Live TV ───────────────────────────────────────────────
                 TextColumn::make('live_channel_name')
@@ -182,6 +195,57 @@ class WatchProgressRelationManager extends RelationManager
                     })
                     ->visible(fn () => ($this->activeTab ?? 'live') === 'episode'),
 
+                // ── AIOStreams ─────────────────────────────────────────────
+                ImageColumn::make('thumbnail_url')
+                    ->label(__('Thumbnail'))
+                    ->width(48)
+                    ->height(68)
+                    ->checkFileExistence(false)
+                    ->visible(fn () => ($this->activeTab ?? 'live') === 'aiostreams'),
+
+                TextColumn::make('aio_title')
+                    ->label(__('Title'))
+                    ->getStateUsing(fn (ViewerWatchProgress $record): string => $record->title ?? $record->aio_item_id ?? "Item #{$record->aio_item_id}")
+                    ->description(fn (ViewerWatchProgress $record): ?string => $record->episode_title)
+                    ->wrap()
+                    ->searchable(query: function (Builder $query, string $search): Builder {
+                        if (($this->activeTab ?? 'live') !== 'aiostreams') {
+                            return $query;
+                        }
+                        $term = mb_strtolower($search);
+
+                        return $query->whereRaw('LOWER(title) LIKE ?', ["%{$term}%"])
+                            ->orWhereRaw('LOWER(aio_item_id) LIKE ?', ["%{$term}%"]);
+                    })
+                    ->visible(fn () => ($this->activeTab ?? 'live') === 'aiostreams'),
+
+                TextColumn::make('aio_season_episode')
+                    ->label(__('S/E'))
+                    ->getStateUsing(function (ViewerWatchProgress $record): ?string {
+                        if ($record->season_number && $record->episode_number) {
+                            return "S{$record->season_number}E{$record->episode_number}";
+                        }
+
+                        return null;
+                    })
+                    ->sortable(false)
+                    ->visible(fn () => ($this->activeTab ?? 'live') === 'aiostreams'),
+
+                // ── DVR Recordings ────────────────────────────────────────
+                TextColumn::make('dvr_title')
+                    ->label(__('Recording'))
+                    ->getStateUsing(fn (ViewerWatchProgress $record): string => $record->dvrRecording?->display_title ?? "Recording #{$record->stream_id}")
+                    ->wrap()
+                    ->searchable(query: function (Builder $query, string $search): Builder {
+                        if (($this->activeTab ?? 'live') !== 'dvr_recording') {
+                            return $query;
+                        }
+                        $term = mb_strtolower($search);
+
+                        return $query->whereHas('dvrRecording', fn (Builder $q) => $q->whereRaw('LOWER(title) LIKE ?', ["%{$term}%"]));
+                    })
+                    ->visible(fn () => ($this->activeTab ?? 'live') === 'dvr_recording'),
+
                 // ── VOD + Series ──────────────────────────────────────────
                 ProgressColumn::make('progress')
                     ->width('120px')
@@ -193,7 +257,7 @@ class WatchProgressRelationManager extends RelationManager
 
                         return min(100, (int) round($record->position_seconds / $record->duration_seconds * 100));
                     })
-                    ->visible(fn () => in_array($this->activeTab ?? 'live', ['vod', 'episode']))
+                    ->visible(fn () => in_array($this->activeTab ?? 'live', ['vod', 'episode', 'dvr_recording', 'aiostreams']))
                     ->toggleable(),
 
                 TextColumn::make('duration')
@@ -202,11 +266,10 @@ class WatchProgressRelationManager extends RelationManager
                         if (! $record->duration_seconds || $record->duration_seconds <= 0) {
                             return $this->formatSeconds($record->position_seconds);
                         }
-                        $pct = min(100, (int) round($record->position_seconds / $record->duration_seconds * 100));
 
                         return "{$this->formatSeconds($record->position_seconds)} / {$this->formatSeconds($record->duration_seconds)}";
                     })
-                    ->visible(fn () => in_array($this->activeTab ?? 'live', ['vod', 'episode'])),
+                    ->visible(fn () => in_array($this->activeTab ?? 'live', ['vod', 'episode', 'dvr_recording', 'aiostreams'])),
 
                 IconColumn::make('completed')
                     ->label(__('Done'))
@@ -216,12 +279,12 @@ class WatchProgressRelationManager extends RelationManager
                     ->trueColor('success')
                     ->falseColor('gray')
                     ->sortable()
-                    ->visible(fn () => in_array($this->activeTab ?? 'live', ['vod', 'episode'])),
+                    ->visible(fn () => in_array($this->activeTab ?? 'live', ['vod', 'episode', 'dvr_recording', 'aiostreams'])),
 
                 TextColumn::make('watch_count')
                     ->label(__('Plays'))
                     ->sortable()
-                    ->visible(fn () => in_array($this->activeTab ?? 'live', ['vod', 'episode'])),
+                    ->visible(fn () => in_array($this->activeTab ?? 'live', ['vod', 'episode', 'dvr_recording', 'aiostreams'])),
 
                 // ── Shared ────────────────────────────────────────────────
                 TextColumn::make('last_watched_at')
@@ -235,13 +298,17 @@ class WatchProgressRelationManager extends RelationManager
                     ->button()->hiddenLabel()->size('sm'),
                 Action::make('play')
                     ->tooltip(__('Play'))
-                    ->action(function ($record, $livewire) {
-                        $livewire->dispatch(
-                            'openFloatingStream',
-                            ($this->activeTab ?? 'live') === 'episode'
-                                ? $record->episode?->getFloatingPlayerAttributes()
-                                : $record->channel?->getFloatingPlayerAttributes()
-                        );
+                    ->hidden(fn () => ($this->activeTab ?? 'live') === 'aiostreams')
+                    ->action(function (ViewerWatchProgress $record, $livewire): void {
+                        $attributes = match ($this->activeTab ?? 'live') {
+                            'episode' => $record->episode?->getFloatingPlayerAttributes(),
+                            'dvr_recording' => $record->dvrRecording?->getFloatingPlayerAttributes(),
+                            default => $record->channel?->getFloatingPlayerAttributes(),
+                        };
+
+                        if ($attributes) {
+                            $livewire->dispatch('openFloatingStream', $attributes);
+                        }
                     })
                     ->icon('heroicon-s-play-circle')
                     ->button()

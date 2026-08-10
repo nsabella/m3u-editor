@@ -228,6 +228,11 @@ class GeneralSettings extends Settings
 
     public ?int $tmdb_rate_limit = 40;
 
+    // AIOStreams integration settings
+    public ?int $aiostreams_rate_limit = 20;
+
+    public ?int $aiostreams_max_failover_candidates = 3;
+
     public ?string $tmdb_language = 'en-US';
 
     public ?int $tmdb_confidence_threshold = 80;
@@ -300,6 +305,11 @@ class GeneralSettings extends Settings
     // App output toggle for xAPI integration
     // This setting allows users to enable or disable the app output for xAPI integration.
     public ?bool $app_output_enabled = true;
+
+    // Trakt-style device pairing (M3U TV onboarding without typing a password
+    // on the remote). Also requires app_output_enabled, since all M3U TV
+    // features depend on the enhanced Xtream API output.
+    public ?bool $device_pairing_enabled = true;
 
     public static function group(): string
     {

@@ -36,13 +36,17 @@ class VodResource extends Resource
 
     protected static ?string $slug = 'vod';
 
-    public static function canViewAny(): bool
+    public static function canAccess(): bool
     {
-        return true;
+        return static::getCurrentAuth() !== null;
     }
 
     public static function getNavigationBadge(): ?string
     {
+        if (! static::getCurrentAuth()) {
+            return null;
+        }
+
         $playlist = PlaylistFacade::resolvePlaylistByUuid(static::getCurrentUuid());
         if ($playlist) {
             return (string) $playlist->channels()->where([
@@ -51,7 +55,7 @@ class VodResource extends Resource
             ])->count();
         }
 
-        return '';
+        return null;
     }
 
     public static function getUrl(
@@ -114,13 +118,21 @@ class VodResource extends Resource
 
             // Alias backed by a custom playlist
             if ($playlist->custom_playlist_id) {
-                return parent::getEloquentQuery()
+                $query = parent::getEloquentQuery()
                     ->with(['epgChannel', 'customPlaylists'])
                     ->whereHas('customPlaylists', function ($query) use ($playlist) {
                         $query->where('custom_playlists.id', $playlist->custom_playlist_id);
                     })
                     ->where('enabled', true)
                     ->where('is_vod', true);
+
+                // Apply VOD group filter if configured on the alias
+                $allowedVodGroups = $playlist->getAllowedVodGroupNames();
+                if (! empty($allowedVodGroups)) {
+                    $query->where(fn ($query) => $playlist->constrainChannelsToCustomGroups($query, $allowedVodGroups));
+                }
+
+                return $query;
             }
         }
 
@@ -149,11 +161,9 @@ class VodResource extends Resource
             ->columns([
                 Tables\Columns\ImageColumn::make('logo')
                     ->label(__('Cover'))
+                    ->width(80)
+                    ->height(120)
                     ->checkFileExistence(false)
-                    ->size('inherit', 'inherit')
-                    ->extraImgAttributes(fn ($record): array => [
-                        'style' => 'width:80px; height:120px;', // VOD channel style
-                    ])
                     ->getStateUsing(fn ($record) => LogoFacade::getChannelLogoUrl($record))
                     ->toggleable(),
                 Tables\Columns\TextColumn::make('info')

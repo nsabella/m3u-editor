@@ -6,6 +6,7 @@ use App\Filament\Auth\EditProfile;
 use App\Filament\Auth\Login;
 use App\Filament\CopilotTools\EpgMappingStateTool;
 use App\Filament\Pages\Backups;
+use App\Filament\Pages\BrowseShows;
 use App\Filament\Pages\CreatePlugin;
 use App\Filament\Pages\CustomDashboard;
 use App\Filament\Pages\LogViewer;
@@ -13,12 +14,15 @@ use App\Filament\Pages\M3uProxyStreamMonitor;
 use App\Filament\Pages\PluginsDashboard;
 use App\Filament\Pages\Preferences;
 use App\Filament\Pages\ReleaseLogs;
+use App\Filament\Pages\RequestContent;
 use App\Filament\Resources\AedProfiles\AedProfileResource;
 use App\Filament\Resources\Assets\AssetResource;
 use App\Filament\Resources\Categories\CategoryResource;
 use App\Filament\Resources\Channels\ChannelResource;
 use App\Filament\Resources\ChannelScrubbers\ChannelScrubberResource;
 use App\Filament\Resources\CustomPlaylists\CustomPlaylistResource;
+use App\Filament\Resources\DvrRecordingRules\DvrRecordingRuleResource;
+use App\Filament\Resources\DvrRecordings\DvrRecordingResource;
 use App\Filament\Resources\EpgChannels\EpgChannelResource;
 use App\Filament\Resources\EpgMaps\EpgMapResource;
 use App\Filament\Resources\Epgs\EpgResource;
@@ -46,7 +50,9 @@ use App\Filament\Resources\Vods\VodResource;
 use App\Filament\Widgets\DiscordWidget;
 use App\Filament\Widgets\DocumentsWidget;
 use App\Filament\Widgets\DonateCrypto;
+use App\Filament\Widgets\DvrStorageOverviewWidget;
 use App\Filament\Widgets\KoFiWidget;
+use App\Filament\Widgets\M3uTvWidget;
 use App\Filament\Widgets\PluginsOverviewWidget;
 use App\Filament\Widgets\QueueDashboardWidget;
 use App\Filament\Widgets\SharedStreamStatsWidget;
@@ -56,6 +62,7 @@ use App\Filament\Widgets\UpdateNoticeWidget;
 use App\Http\Middleware\DashboardMiddleware;
 // use App\Filament\Widgets\PayPalDonateWidget;
 use App\Http\Middleware\SeedLocaleFromUser;
+use App\Http\Middleware\SyncTableColumnPreferences;
 use App\Settings\GeneralSettings;
 use App\Support\CopilotProvider;
 use CraftForge\FilamentLanguageSwitcher\FilamentLanguageSwitcherPlugin;
@@ -115,6 +122,7 @@ class AdminPanelProvider extends PanelProvider
             'copilot_quick_actions' => [],
             'copilot_url' => null,
             'push_relay_enabled' => true,
+            'device_pairing_enabled' => true,
         ];
         try {
             $envShowWan = config('dev.show_wan_details', false);
@@ -136,6 +144,7 @@ class AdminPanelProvider extends PanelProvider
                 'copilot_quick_actions' => $userPreferences->copilot_quick_actions ?? $settings['copilot_quick_actions'],
                 'copilot_url' => $userPreferences->copilot_url ?? $settings['copilot_url'],
                 'push_relay_enabled' => $userPreferences->push_relay_enabled ?? $settings['push_relay_enabled'],
+                'device_pairing_enabled' => $userPreferences->device_pairing_enabled ?? $settings['device_pairing_enabled'],
             ];
         } catch (Exception $e) {
             // Ignore
@@ -160,7 +169,7 @@ class AdminPanelProvider extends PanelProvider
             ->favicon('/favicon.png')
             ->brandLogoHeight('2.5rem')
             ->databaseNotifications()
-            // ->databaseNotificationsPolling('10s')
+            ->databaseNotificationsPolling('30s')
             ->colors([
                 'primary' => Color::Indigo,
                 'info' => Color::Sky,
@@ -188,7 +197,7 @@ class AdminPanelProvider extends PanelProvider
                                 ->icon('heroicon-s-shield-check')
                                 ->items([
                                     ...(config('auth.auto_login') ? [] : UserResource::getNavigationItems()),
-                                    ...($settings['push_relay_enabled'] ? PushDeviceTokenResource::getNavigationItems() : []),
+                                    ...(($settings['push_relay_enabled'] || $settings['device_pairing_enabled']) ? PushDeviceTokenResource::getNavigationItems() : []),
                                     ...Preferences::getNavigationItems(),
                                 ]),
                         ] : []),
@@ -204,10 +213,20 @@ class AdminPanelProvider extends PanelProvider
                                 ...StreamFileSettingResource::getNavigationItems(),
                                 ...ChannelScrubberResource::getNavigationItems(),
                             ]),
+                        ...(auth()->user()?->canUseDvr() ? [
+                            NavigationGroup::make(fn () => __('DVR'))
+                                ->icon('heroicon-m-video-camera')
+                                ->items([
+                                    ...DvrRecordingResource::getNavigationItems(),
+                                    ...DvrRecordingRuleResource::getNavigationItems(),
+                                    ...BrowseShows::getNavigationItems(),
+                                ]),
+                        ] : []),
                         NavigationGroup::make(fn () => __('Integrations'))
                             ->icon('heroicon-m-server-stack')
                             ->items([
                                 ...MediaServerIntegrationResource::getNavigationItems(),
+                                ...RequestContent::getNavigationItems(),
                                 ...(config('proxy.proxy_integration_enabled', true) ? NetworkResource::getNavigationItems() : []),
                             ]),
                         NavigationGroup::make(fn () => __('Live Channels'))
@@ -279,10 +298,12 @@ class AdminPanelProvider extends PanelProvider
                 AccountWidget::class,
                 DocumentsWidget::class,
                 DiscordWidget::class,
+                M3uTvWidget::class,
                 // PayPalDonateWidget::class,
                 KoFiWidget::class,
                 QueueDashboardWidget::class,
                 PluginsOverviewWidget::class,
+                DvrStorageOverviewWidget::class,
                 // DonateCrypto::class,
                 StatsOverview::class,
                 // SharedStreamStatsWidget::class,
@@ -328,6 +349,7 @@ class AdminPanelProvider extends PanelProvider
                 DisableBladeIconComponents::class,
                 DispatchServingFilamentEvent::class,
                 SeedLocaleFromUser::class, // Seeds session from DB locale (runs before plugin's SetLocale)
+                SyncTableColumnPreferences::class, // Bridges Filament's table column manager session state to the DB, per user
             ])
             ->authMiddleware([
                 Authenticate::class,
@@ -436,10 +458,12 @@ class AdminPanelProvider extends PanelProvider
                 config(["ai.providers.{$provider}.url" => $s['copilot_url']]);
             }
 
+            $defaultPrompt = $this->defaultCopilotSystemPrompt();
+
             return FilamentCopilotPlugin::make()
                 ->provider($provider)
                 ->model($model)
-                ->systemPrompt($s['copilot_system_prompt'] ?: 'You are a helpful AI assistant integrated into m3u editor. You help users manage playlists, EPG data, streams, channels, and other media features. Be concise and accurate.')
+                ->systemPrompt($s['copilot_system_prompt'] ?: $defaultPrompt)
                 ->globalTools($this->filterBuiltInTools($s['copilot_global_tools'] ?? []))
                 ->quickActions($this->buildQuickActions($s))
                 ->managementEnabled($s['copilot_mgmt_enabled'] ?? false)
@@ -450,6 +474,70 @@ class AdminPanelProvider extends PanelProvider
 
             return null;
         }
+    }
+
+    private function defaultCopilotSystemPrompt(): string
+    {
+        $year = (int) date('Y');
+        $recentYear = $year - 2;
+        $fiveYearsAgo = $year - 5;
+
+        return <<<PROMPT
+You are a helpful AI assistant integrated into m3u editor. You help users manage playlists, EPG data, streams, channels, and other media features. Be concise and accurate.
+
+## Live TV Guide
+You can look up the live TV guide for the user's mapped channels: what is on right now, what is on later today/tomorrow/this week, what is airing around a specific show, and full channel schedules.
+
+## VOD Playlist Building
+When building a media network playlist with VOD content, follow this workflow:
+1. Use VodContentSearchTool to discover matching content.
+2. Show the results to the user and get their confirmation.
+3. Ask which network/playlist to add the content to (use Search/List tools on the Network resource if needed).
+4. Call NetworkContentBulkAddTool with the approved channel IDs.
+
+## Resource Tools (ListRecordsTool, CreateRecordTool, EditRecordTool, etc.)
+These are never called by name directly. Call GetToolsTool with the resource's `source_class` first, then call RunToolTool with `source_class`, the exact `tool_class` string GetToolsTool returned (a fully-qualified class name, e.g. `App\Filament\CopilotTools\CreateRecordTool` — not the short name), and `arguments`. Do not guess a short tool_class name; it will be rejected as "not registered" and wastes a round trip.
+
+## Creating Networks
+Before creating a network, always list available media server integrations first to get the correct ID:
+1. Call ListRecordsTool on the MediaServerIntegration resource to get available integrations and their IDs.
+2. Ask the user which media server to use if there are multiple, or confirm the only one available.
+3. Call CreateRecordTool on the Network resource with `media_server_integration_id` set to the chosen integration's ID plus any other fields (name, etc.). `schedule_type` must be one of: `sequential` (play in order), `shuffle` (randomized), `manual` (schedule builder) — there is no "random" or "weighted" option.
+4. After creation, use NetworkContentBulkAddTool to populate the network with content.
+
+### Genre Expansion Rules
+Never limit a genre search to a single keyword. Expand by theme:
+- "Family-friendly": genres ["Family", "Animation", "Adventure", "Comedy"], exclude_genres ["Horror", "Thriller", "War", "Crime"]
+- "Kids" or "Children's": genres ["Animation", "Family"], exclude_genres ["Horror", "Thriller", "War", "Crime"]
+- "Animated": genres ["Animation"]
+- "Action-adventure": genres ["Action", "Adventure"]
+- "Sci-fi": genres ["Science Fiction", "Sci-Fi"]
+- "Rom-com" or "Romantic comedy": genres ["Romance", "Comedy"]
+- "Holiday specials": keyword "Christmas" or "Holiday", genres ["Comedy", "Family", "Animation"]
+- "Director spotlight": use keyword for the director name
+
+### Temporal Language (current year: {$year})
+- "recent", "new", "latest": year_min {$recentYear}
+- "last 2 years": year_min {$recentYear}
+- "last 5 years": year_min {$fiveYearsAgo}
+- "classic" or "old": year_max 1990
+- "90s": year_min 1990, year_max 1999
+
+### Rating Guidance (TMDB numeric 0-10)
+- "good" or "decent": min_rating 6
+- "well-rated" or "quality": min_rating 7
+- "top-rated" or "highly rated": min_rating 8
+
+## Network Content Scheduling (Time Pins)
+You can pin specific content in a network playlist to a recurring weekly timeslot — for example, "play The Wild Robot every Friday at 8pm":
+1. List the network's content items to find the network_content_id for the title the user wants to pin.
+2. Call NetworkContentPinTool with the network_content_id, pin_day_of_week (e.g. "friday"), and pin_time_of_day (e.g. "20:00").
+3. The schedule regenerates automatically — pinned content will always air at that day/time each week.
+4. To remove a pin, call NetworkContentPinTool with only the network_content_id (omit day and time).
+
+## Tools Guidance
+If the user asks for something you cannot do, call Get Available Tools to see which tools are currently enabled, identify the missing capability, and tell the user the exact tool to enable in Preferences → AI Copilot → Global Tools (for example: "I do not have the TV schedule tool enabled. Enable DVR: Schedule in Preferences → AI Copilot → Global Tools and try again.").
+PROMPT;
     }
 
     /**
