@@ -774,7 +774,7 @@ class PlaylistGenerateController extends Controller
                 // Tag order / source-group sort order, demoted to tiebreakers by the
                 // pivot-sort primary key above.
                 ->orderByRaw("COALESCE({$orderSubquery}, groups.sort_order)", [Channel::class, $playlistUuid])
-                ->orderBy('channels.channel')
+                ->orderByRaw('COALESCE(channel_custom_playlist.channel_number, channels.channel)')
                 ->orderBy('channels.title');
 
             // Eager load all group tags for this playlist (for multi-group output).
