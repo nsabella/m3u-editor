@@ -2,6 +2,8 @@
 
 namespace App\Filament\Resources\CustomPlaylists\RelationManagers\Concerns;
 
+use App\Models\Channel;
+use App\Services\EpgCacheService;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
@@ -22,17 +24,41 @@ trait ReordersCustomPlaylistPivotSort
         if ($activeTagId) {
             $this->getTable()->callBeforeReordering($order);
             \DB::transaction(function () use ($order, $activeTagId): void {
+                // Collect existing sort values for this group's channels, sorted ascending.
+                // This mirrors how getCustomPlaylistPivotSortSlots() works for the "All" tab —
+                // we keep the existing sort "slots" and just reassign which channel gets which value.
+                $existingSorts = \DB::table('taggables')
+                    ->where('tag_id', $activeTagId)
+                    ->where('taggable_type', Channel::class)
+                    ->whereIn('taggable_id', array_values($order))
+                    ->pluck('sort')
+                    ->sort()
+                    ->values()
+                    ->toArray();
+
+                // Fill any NULL slots with sequential values after the max
+                $maxSort = collect($existingSorts)->filter(fn ($v) => $v !== null)->max() ?? 0;
+                $nextNew = $maxSort + 1;
+                $existingSorts = array_map(function ($v) use (&$nextNew) {
+                    if ($v === null) {
+                        return $nextNew++;
+                    }
+
+                    return $v;
+                }, $existingSorts);
+
                 foreach (array_values($order) as $index => $recordKey) {
                     \DB::table('taggables')
                         ->where('tag_id', $activeTagId)
                         ->where('taggable_id', $recordKey)
-                        ->where('taggable_type', \App\Models\Channel::class)
-                        ->update(['sort' => ($index + 1) * 10]);
+                        ->where('taggable_type', Channel::class)
+                        ->update(['sort' => $existingSorts[$index] ?? ($nextNew++)]);
                 }
             });
             // Clear EPG cache after reorder
-            \App\Services\EpgCacheService::clearForCustomPlaylistId($this->getOwnerRecord()->id);
+            EpgCacheService::clearForCustomPlaylistId($this->getOwnerRecord()->id);
             $this->getTable()->callAfterReordering($order);
+
             return;
         }
 

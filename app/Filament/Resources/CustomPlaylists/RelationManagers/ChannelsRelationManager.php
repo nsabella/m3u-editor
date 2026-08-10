@@ -29,6 +29,7 @@ use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\DB;
+use Spatie\Tags\Tag;
 
 class ChannelsRelationManager extends RelationManager
 {
@@ -166,7 +167,7 @@ class ChannelsRelationManager extends RelationManager
                         ? \DB::table('taggables')
                             ->where('tag_id', $this->getActiveGroupTagId())
                             ->where('taggable_id', $record->id)
-                            ->where('taggable_type', \App\Models\Channel::class)
+                            ->where('taggable_type', Channel::class)
                             ->value('sort')
                         : $record->pivot?->sort))
                     ->getStateUsing(function ($record) {
@@ -175,9 +176,10 @@ class ChannelsRelationManager extends RelationManager
                             return \DB::table('taggables')
                                 ->where('tag_id', $activeTagId)
                                 ->where('taggable_id', $record->id)
-                                ->where('taggable_type', \App\Models\Channel::class)
+                                ->where('taggable_type', Channel::class)
                                 ->value('sort');
                         }
+
                         return $record->pivot?->sort ?? null;
                     })
                     ->updateStateUsing(function ($record, $state) use ($ownerRecord): void {
@@ -187,9 +189,9 @@ class ChannelsRelationManager extends RelationManager
                             \DB::table('taggables')
                                 ->where('tag_id', $activeTagId)
                                 ->where('taggable_id', $record->id)
-                                ->where('taggable_type', \App\Models\Channel::class)
+                                ->where('taggable_type', Channel::class)
                                 ->update(['sort' => $sortValue]);
-                            \App\Services\EpgCacheService::clearForCustomPlaylistId($ownerRecord->id);
+                            EpgCacheService::clearForCustomPlaylistId($ownerRecord->id);
                         } else {
                             $ownerRecord->channels()->updateExistingPivot(
                                 $record->id,
@@ -201,10 +203,11 @@ class ChannelsRelationManager extends RelationManager
                         $activeTagId = $this->getActiveGroupTagId();
                         if ($activeTagId) {
                             return $query->orderByRaw(
-                                'COALESCE((SELECT sort FROM taggables WHERE tag_id = ? AND taggable_id = channels.id AND taggable_type = ?), 999999) ' . $direction,
-                                [$activeTagId, \App\Models\Channel::class]
+                                'COALESCE((SELECT sort FROM taggables WHERE tag_id = ? AND taggable_id = channels.id AND taggable_type = ?), 999999) '.$direction,
+                                [$activeTagId, Channel::class]
                             );
                         }
+
                         return $query->orderBy('channel_custom_playlist.sort', $direction);
                     });
             }
@@ -542,7 +545,7 @@ class ChannelsRelationManager extends RelationManager
                     // Sort by this tag's taggables.sort (NULLs last via COALESCE for SQLite)
                     $query->orderByRaw(
                         'COALESCE((SELECT sort FROM taggables WHERE tag_id = ? AND taggable_id = channels.id AND taggable_type = ?), 999999) ASC',
-                        [$tag->id, \App\Models\Channel::class]
+                        [$tag->id, Channel::class]
                     );
                 })
                 ->badge($ownerRecord->channels()->where('is_vod', false)->withAnyTags([$tag], $tag->type)->count())
@@ -578,24 +581,36 @@ class ChannelsRelationManager extends RelationManager
      */
     private function getActiveGroupTagId(): ?int
     {
-        $tabSlug = $this->getTableTab();
-        if (empty($tabSlug)) {
+        $tabIndex = $this->activeTab;
+
+        // Index '0' or empty = "All" tab (no group filter)
+        if (empty($tabIndex) || $tabIndex === '0') {
             return null;
         }
 
-        // Get all tags for this playlist and find the one matching the tab slug.
-        // Tab slugs are auto-generated from Tab::make('name') using Str::slug().
+        // Tab indices: 0=All, 1=first group, 2=second group, etc.
+        // Get tags in the same order as getTabs() builds them
         $ownerRecord = $this->getOwnerRecord();
-        $tags = \Spatie\Tags\Tag::where('type', $ownerRecord->uuid)->get();
+        $liveChannelIds = $ownerRecord->channels()
+            ->where('is_vod', false)
+            ->pluck('channels.id');
 
-        foreach ($tags as $tag) {
-            // Tag names may be JSON ({"en": "Sports"}) or plain strings.
-            $tagName = is_array($tag->name) ? ($tag->name['en'] ?? reset($tag->name)) : $tag->name;
-            if (\Str::slug($tagName) === $tabSlug) {
-                return $tag->id;
-            }
+        $tags = Tag::where('type', $ownerRecord->uuid)
+            ->whereIn('id', function ($query) use ($liveChannelIds) {
+                $query->select('tag_id')->from('taggables')
+                    ->where('taggable_type', Channel::class)
+                    ->whereIn('taggable_id', $liveChannelIds);
+            })
+            ->orderBy('order_column')
+            ->get();
+
+        // Convert index to zero-based array offset (index 1 = array position 0)
+        $arrayIndex = (int) $tabIndex - 1;
+
+        if ($arrayIndex < 0 || $arrayIndex >= $tags->count()) {
+            return null;
         }
 
-        return null;
+        return $tags->values()->get($arrayIndex)?->id;
     }
 }
