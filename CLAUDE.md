@@ -429,6 +429,26 @@ rewrites content inside <laravel-boost-guidelines>...</laravel-boost-guidelines>
 - If several files are plausibly affected, run each of those specific files/filters — do not fall back to a bare `php artisan test` / `vendor/bin/pest` with no scoping.
 - Only run the full suite if the user explicitly asks for one (e.g. before a release, or to confirm a broad refactor didn't regress anything elsewhere).
 
+## Multi-Group Channels & Per-Group Sorting
+
+Custom playlists use **Spatie Tags** for group membership: a channel can have many group tags whose `type` is the custom playlist's UUID (categories for series use `{uuid}-category`). The M3U output emits **one `#EXTINF` line per group tag**, and the Xtream API emits **one stream entry per category** — a multi-group channel appears N times. `channels.group_id` is untouched and remains the source playlist's single group.
+
+Per-group sorting stores a per channel-in-group position in `taggables.sort` (nullable decimal), falling back to `channel_custom_playlist.sort` → `channels.sort`. A shared PHP helper, `PlaylistGenerateController::buildSortedEmissionList()`, is the single ordering path for both M3U and Xtream output — do not add a separate sorting path.
+
+**Gotchas when touching this area (full doc: `docs/multi-group-channels.md`):**
+
+- Spatie's `attachTags()`/`syncTags()` **strip pivot data** — to set `sort`, use `$model->tags()->attach($tagId, ['sort' => $value])`.
+- `tags()` is overridden on `Channel` and `Series` with `->withPivot('sort')` — trait overrides must redefine the relationship (`parent::tags()` does not work).
+- Tag `type` stores a **UUID string** while `channel_custom_playlist.custom_playlist_id` is an **integer FK** — bridge them through `custom_playlists`, never directly.
+- For raw `taggables` inserts on a CustomPlaylist, use `$playlist->getMorphClass()` (morph alias `custom_playlist`), not `CustomPlaylist::class`.
+- Tag `name` may be JSON (`{"en": "..."}`) or a plain string — use the `is_array()` guard before `array_key_first()`.
+- Auto-sync modes differ: `original` replaces tags and **resets** per-group sort to NULL; `select`/`create` append and **preserve** it (attach only if not already attached).
+- Tags must be attached to **both** the Channel and the CustomPlaylist for `get_live_categories` to work.
+- Clear `EpgCacheService::clearForCustomPlaylistId()` after any tag or sort change.
+- `channels.group` is a **string column** (not the `group_id` FK) — M3U no-tag fallback reads it directly; tests must set it explicitly.
+- `SortService::bulkSortAlphaCustomPlaylistChannels()` and `bulkRecountCustomPlaylistChannels()` write the **shared pivot sort**, bypassing `taggables.sort` — they are not tab-aware.
+- These features live only on the `feature/group-sort` branch (superset of `feature/multi_group` and `multi_group_backup`, both ancestors). This repo does **not** merge feature branches to master — features are maintained by merging `m3ue/master` upstream into the feature branch.
+
 ## Pre-PR Checklist (project-specific, not covered by Boost)
 
 Before opening or finalizing a pull request in `m3u-editor`, both of the following are **required**, not optional:
