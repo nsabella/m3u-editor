@@ -446,3 +446,5 @@ Per-group sorting stores a per channel-in-group position in `taggables.sort` (nu
 - Tags must be attached to **both** the Channel and the CustomPlaylist for `get_live_categories` to work.
 - Clear `EpgCacheService::clearForCustomPlaylistId()` after any tag or sort change.
 - `channels.group` is a **string column** (not the `group_id` FK) — M3U no-tag fallback reads it directly; tests must set it explicitly.
+- `SortService::bulkSortAlphaCustomPlaylistChannels()` and `bulkRecountCustomPlaylistChannels()` write the **shared pivot sort**, bypassing `taggables.sort` — they are not tab-aware.
+- These features live only on the `feature/group-sort` branch (superset of `feature/multi_group` and `multi_group_backup`, both ancestors). This repo does **not** merge feature branches to master — features are maintained by merging `m3ue/master` upstream into the feature branch.

@@ -1,5 +1,17 @@
 # Multi-Group Channels & Per-Group Sorting
 
+## Contents
+
+- Branch Topology — which branch has these features and why they never merge to master
+- Data Model — tags vs `group_id`, `taggables.sort` fallback chain, ID/UUID mismatch
+- Code Paths — model layer, query layer, `buildSortedEmissionList()`, Xtream API, Filament UI
+- SortService Interaction — bulk alpha sort & recount bypass `taggables.sort`
+- Xtream Category Filtering Semantics — the untagged-channel fallback branch
+- Auto-Sync Behavior — mode matrix and sort reset/preserve rules
+- Invariants & Known Limitations
+- Design Rationale — why one-EXTINF-per-group and pivot-primary ordering
+- Testing — test files, helper recipes, infrastructure gotchas
+
 ## Overview
 
 These two related features change how channels relate to groups inside **custom playlists**:
@@ -9,7 +21,22 @@ These two related features change how channels relate to groups inside **custom 
 
 Both live entirely on the **Spatie Tags** layer (`tags` / `taggables` tables). They do **not** touch `channels.group_id`, which remains the source playlist's single group.
 
-> **Audience note:** This document describes code on the `feature/group-sort` branch. All file/line references were verified against that branch.
+> **Audience note:** This document describes code on the `feature/group-sort` branch (see Branch Topology below — that branch is the superset containing both features). All file/line references were verified against it.
+
+## Branch Topology
+
+`feature/group-sort` is the **authoritative branch** for both features — it is the superset. The other branches are fully merged into it (ancestor commits) and exist only for history:
+
+| Branch | Contents | Status |
+|---|---|---|
+| `feature/group-sort` | Multi-group + per-group sort, synced with upstream master | **Work here** |
+| `feature/multi_group` | Multi-group only, no per-group sort | Ancestor of `feature/group-sort` — superseded |
+| `multi_group_backup` | Early draft of per-group sort | Ancestor of `feature/group-sort` — superseded |
+| `master` | Tracks the upstream `m3ue/master` | **Does not contain these features** |
+
+**These docs only exist on `feature/group-sort`** (and `origin/feature/group-sort`). An agent landing on `master`, `feature/multi_group`, or `multi_group_backup` will not find this file — if the docs are missing, check out `feature/group-sort`.
+
+This repo does **not** merge feature branches back to master. The workflow is: fetch upstream (`git fetch m3ue master`), merge `m3ue/master` into the feature branch, resolve conflicts. Features live indefinitely on their own branches in the `nsabella/m3u-editor` fork.
 
 ## Data Model
 
@@ -117,6 +144,38 @@ Other invariants:
 - `EpgCacheService::clearForCustomPlaylistId()` runs at the end.
 - `syncMode` can be `full_sync` (adds orphaned-pivot cleanup, ghost-tag pruning, soft-deleted-group config cleanup) or `incremental`.
 
+## SortService Interaction — Bulk Alpha Sort & Recount
+
+`app/Services/SortService.php` has two bulk operations used by the Filament bulk actions `recount_custom` and `sort_alpha_custom` in the RelationManagers:
+
+- **`bulkSortAlphaCustomPlaylistChannels()`** (~line 583) — alphabetically reorders selected channels by writing sequential `ROW_NUMBER()` values into `channel_custom_playlist.sort` (dialect-specific SQL: MySQL `UPDATE...JOIN`, Postgres `UPDATE...FROM`, SQLite, plus a CASE fallback).
+- **`bulkRecountCustomPlaylistChannels()`** (~line 703) — recalculates `channel_custom_playlist.channel_number` per playlist, ordering by `COALESCE(ccp.sort, c.sort), c.channel, c.id`.
+
+**Both bypass `taggables.sort` entirely.** They are *not* tab-aware: running "Sort A–Z" or "Recount" while a group tab is active rewrites the **shared pivot sort**, which affects the channel's position in **every** group (per-group values are left untouched, but the fallback layer they rely on changes). There is no per-group alpha-sort or per-group recount.
+
+If asked to make these tab-aware, follow the pattern already used by the sort column and reorder trait: detect the active tab via `getActiveGroupTagId()` and write `taggables.sort` (batched via a single dialect-aware statement over `taggables` joined to the selected tag) instead of the pivot. `EpgCacheService::clearForCustomPlaylistId()` must be called after either operation.
+
+Also note these are raw `DB::statement()` operations guarded by driver detection — the project's PR review standards flag unguarded DDL/raw SQL, so preserve the driver matrix when modifying.
+
+## Xtream Category Filtering Semantics
+
+When an Xtream client requests a specific `category_id`, the filter for custom playlists is **not** a simple tag match. At `XtreamApiController.php` ~749 (live), ~934 (VOD), ~1081 (series):
+
+```php
+$channelsQuery->where(function ($query) use ($categoryId, $tagUuid) {
+    // Channel has the requested tag in this playlist's scope
+    $query->whereHas('tags', fn ($t) => $t->where('type', $tagUuid)->where('id', $categoryId));
+})->orWhere(function ($subQuery) use ($categoryId, $tagUuid) {
+    // OR channel has NO tags in this playlist but its source group_id matches
+    $subQuery->whereDoesntHave('tags', fn ($t) => $t->where('type', $tagUuid))
+             ->where('group_id', $categoryId);
+});
+```
+
+The second branch is the untagged-channel fallback: a channel with no custom tags appears under the Xtream category matching its **source** `group_id`. Standard/merged playlists filter simply on `channels.group_id`.
+
+This means: (1) a multi-group channel appears in **every** requested category it holds a tag for; (2) changing this filter changes which untagged channels appear per category — treat the fallback branch as behavior to preserve, not an oversight.
+
 ## Invariants & Known Limitations
 
 1. **`channel_number` / `tvg-chno` is shared** across all group instances of a channel (single pivot value). Per-group auto-increment happens only when `auto_channel_increment` is enabled.
@@ -125,6 +184,16 @@ Other invariants:
 4. **MergedPlaylists don't use tags** — each source channel keeps its own group; no dedup across playlists.
 5. **Detaching a tag deletes its `taggables` row** — per-group sort for that pair is permanently lost (re-attach starts at NULL).
 6. **Xtream `category_ids` appears on every entry** and contains all tag IDs, even for single-group channels.
+
+## Design Rationale
+
+Why these shapes were chosen — preserved here because the "obvious simpler" alternatives were evaluated and rejected:
+
+**One `#EXTINF` per group (duplicated entries), not comma-separated `group-title`.** The alternative — one entry with `group-title="Sports,News"` — requires PHP-side aggregation of tag names into a single string, and players have inconsistent support for multi-value group-titles. Duplicated entries are the standard behavior for Xtream-compatible servers, players handle duplicate URLs fine, and each group instance gets its own ordering. The cost is an increased channel count in output, accepted deliberately. The same logic applies to Xtream output: the protocol is fundamentally single-`category_id` per stream, so one entry per category is the only client-compatible way to represent multi-group. (`category_ids` carries the full list as a bonus field, but the per-category entries are what clients actually consume.)
+
+**Pivot sort as the primary SQL ORDER BY.** An earlier approach ordered channels by `MIN(t.order_column)` from the taggables/tags tables via a LEFT JOIN + GROUP BY. That was removed: the LEFT JOIN produced duplicate/broken ordering for multi-tag channels, and tag `order_column` orders the *groups themselves* in the UI, not channels within a group. The fix made `COALESCE(channel_custom_playlist.sort, channels.sort)` the primary key (SQL-level ordering for the one-row-per-channel query) and moved all multi-group emission and per-group ordering into PHP via `buildSortedEmissionList()` — where SQL cannot know about the per-tag expansion, PHP must own the ordering. Confirmed by the full multi-group test suite passing when the JOIN approach was dropped.
+
+**Per-group sort on `taggables.sort` rather than a new table.** The `taggables` pivot already represents the channel↔group relationship; a separate `channel_tags` table would add joins and sync issues, and `tags.order_column` orders groups, not channels-within-groups. Adding a nullable column to Spatie's pivot table is safe — the relationship uses a standard `MorphToMany` with no custom pivot model, so `$tag->pivot->sort` works as soon as `withPivot('sort')` is declared.
 
 ## Testing
 
@@ -139,13 +208,56 @@ Test files (all passing on `feature/group-sort`):
 | `tests/Feature/ChannelCustomGroupTest.php` | Updated: same-type multi-tag test |
 | `tests/Feature/AutoSyncGroupsToCustomPlaylistTest.php` | Auto-sync sort handling |
 
-Test infrastructure gotchas (full list in `research/docker-testing-guide.md` upstream):
+Test infrastructure gotchas:
 
-- `Event::fake()` in `beforeEach()` — prevents Redis connection errors
+- `Event::fake()` (+ `Notification::fake()`) in `beforeEach()` — prevents Redis connection errors
 - `$response->streamedContent()` for M3U stream responses (`getContent()` returns empty)
-- Manual tag slugs (`Str::slug(...)`) — Spatie's HasSlug doesn't fire in tests
 - Set `'group' => 'SourceGroup'` explicitly on channel factories — the no-tag fallback reads the `channels.group` **string column**, which faker randomizes
 - Run scoped: `php artisan test --filter=MultiGroup` (never the full suite — see CLAUDE.md)
+
+### Canonical test helper pattern
+
+Each test file defines its own file-scoped helpers (they cannot be shared across Pest files without a composer autoload touch). The reference implementation is in `tests/Feature/MultiGroupPerGroupSortTest.php` (`perGroupSortCreateTag`, `perGroupSortCreateMultiGroupChannel`, `perGroupSortCreateChannelWithNullSort`); `MultiGroupM3uOutputTest.php` and `MultiGroupEdgeCasesTest.php` have `output*`/`edge*` variants of the same recipe. The pattern:
+
+```php
+// 1. Create tags via raw DB insert — bypasses Spatie's HasSlug trait, which
+//    doesn't fire reliably in tests and leaves tags.slug NOT NULL violated.
+function createTag(CustomPlaylist $playlist, string $name, ?int $orderColumn = null): int
+{
+    $existing = \DB::table('tags')->where('slug', Str::slug($name))->where('type', $playlist->uuid)->first();
+    if ($existing) {
+        return (int) $existing->id;
+    }
+    return \DB::table('tags')->insertGetId([
+        'name' => json_encode(['en' => $name]),
+        'slug' => Str::slug($name),
+        'type' => $playlist->uuid,          // UUID string, NOT the integer ID
+        'order_column' => $orderColumn ?? 999,
+        'created_at' => now(), 'updated_at' => now(),
+    ]);
+}
+
+// 2. Create the channel: source Playlist FK is required on both Group and Channel.
+// 3. Attach the pivot row via the relationship (no model events fired this way).
+// 4. Wipe any existing taggables, then attach raw — attachOrIgnore so re-runs don't duplicate.
+// 5. Attach the tag to BOTH the Channel AND the CustomPlaylist.
+foreach ($tagSorts as $tagName => $sortValue) {
+    $tagId = createTag($customPlaylist, $tagName);
+    \DB::table('taggables')->insertOrIgnore([
+        'tag_id' => $tagId,
+        'taggable_type' => Channel::class,        // Channel has no morph alias — class name is correct
+        'taggable_id' => $channel->id,
+        'sort' => $sortValue,                     // the per-group sort under test
+    ]);
+    \DB::table('taggables')->insertOrIgnore([
+        'tag_id' => $tagId,
+        'taggable_type' => $customPlaylist->getMorphClass(),  // → 'custom_playlist', NOT CustomPlaylist::class
+        'taggable_id' => $customPlaylist->id,
+    ]);
+}
+```
+
+Why raw DB instead of Spatie's API: `Tag::create()` needs a manually-supplied slug (HasSlug skips in tests), `attachTags()` strips pivot data (can't set `sort`), and `findOrCreate()` has side effects. Step 5 exists because `get_live_categories` queries `$playlist->groupTags()` — without the playlist-side row, Xtream categories return only "All".
 
 ## Full Suite Comparison (Aug 2026)
 
