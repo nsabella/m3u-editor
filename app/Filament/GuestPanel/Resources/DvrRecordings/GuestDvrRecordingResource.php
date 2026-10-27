@@ -7,6 +7,7 @@ use App\Filament\GuestPanel\Pages\Concerns\HasGuestDvr;
 use App\Jobs\ProcessComskipOnRecording;
 use App\Jobs\StopDvrRecording;
 use App\Models\DvrRecording;
+use App\Models\PlaylistAuth;
 use App\Tables\Columns\AnimatedStatusColumn;
 use Filament\Actions\Action;
 use Filament\Actions\ActionGroup;
@@ -30,6 +31,58 @@ class GuestDvrRecordingResource extends Resource
     protected static ?string $model = DvrRecording::class;
 
     protected static ?string $slug = 'dvr';
+
+    /**
+     * Whether the given session may play the given recording.
+     *
+     * Single source of truth for the play authorization, deliberately factored
+     * out of the table so it can be asserted directly. The guest panel resolves
+     * its auth from request attributes, and `Livewire::test()` cannot carry
+     * those across synthetic requests (see the note on
+     * setupGuestReleaseDateContext in the guest tests), so the action closures
+     * themselves are not reachable from a test. Keeping the predicate here means
+     * the rule is still covered, and — more importantly — that `visible()` and
+     * the in-action backend guard cannot drift apart, since both call this.
+     */
+    public static function guestCanPlay(DvrRecording $record, ?PlaylistAuth $auth): bool
+    {
+        if (! in_array($record->status, [
+            DvrRecordingStatus::Recording,
+            DvrRecordingStatus::Completed,
+        ], true)) {
+            return false;
+        }
+
+        if (! $record->dvrSetting?->owner()) {
+            return false;
+        }
+
+        return static::sessionOwnsRecord($auth, $record->playlist_auth_id);
+    }
+
+    /**
+     * Whether the given session may cancel the given recording.
+     *
+     * Single source of truth for the cancel authorization, mirroring
+     * guestCanPlay() above: factored out of the table so it can be asserted
+     * directly, and shared between ->visible() and the in-action backend
+     * guard so the two layers cannot drift apart.
+     */
+    public static function guestCanCancel(DvrRecording $record, ?PlaylistAuth $auth): bool
+    {
+        if (! static::guestCanAccessDvr()) {
+            return false;
+        }
+
+        if (! in_array($record->status, [
+            DvrRecordingStatus::Scheduled,
+            DvrRecordingStatus::Recording,
+        ], true)) {
+            return false;
+        }
+
+        return static::sessionOwnsRecord($auth, $record->playlist_auth_id);
+    }
 
     public static function getNavigationLabel(): string
     {
@@ -66,12 +119,10 @@ class GuestDvrRecordingResource extends Resource
             return null;
         }
 
-        $dvrSetting = static::getDvrSetting();
-        if (! $dvrSetting) {
-            return null;
-        }
-
-        $count = $dvrSetting->recordings()
+        // Reuse getEloquentQuery() rather than querying dvrSetting->recordings()
+        // directly, so the badge count gets the same playlist_auth_id
+        // ownership scoping as the list itself.
+        $count = static::getEloquentQuery()
             ->whereIn('status', [DvrRecordingStatus::Scheduled, DvrRecordingStatus::Recording])
             ->count();
 
@@ -105,10 +156,14 @@ class GuestDvrRecordingResource extends Resource
             return parent::getEloquentQuery()->whereRaw('1 = 0');
         }
 
-        return parent::getEloquentQuery()
-            ->with(['channel', 'playlistAuth'])
-            ->where('dvr_setting_id', $dvrSetting->id)
-            ->orderByDesc('scheduled_start');
+        // Guests only see their own recordings — never another guest's, nor
+        // the playlist owner's (null playlist_auth_id).
+        return static::restrictToSessionOwner(
+            parent::getEloquentQuery()
+                ->with(['channel', 'playlistAuth', 'dvrSetting.playlist', 'dvrSetting.customPlaylist', 'dvrSetting.mergedPlaylist'])
+                ->where('dvr_setting_id', $dvrSetting->id)
+                ->orderByDesc('scheduled_start')
+        );
     }
 
     public static function infolist(Schema $schema): Schema
@@ -212,37 +267,16 @@ class GuestDvrRecordingResource extends Resource
                         ->color('danger')
                         ->button()
                         ->hiddenLabel()
-                        ->visible(function (DvrRecording $record) use ($currentAuth): bool {
-                            if (! in_array($record->status, [
-                                DvrRecordingStatus::Scheduled,
-                                DvrRecordingStatus::Recording,
-                            ])) {
-                                return false;
-                            }
-
-                            // Guests can only cancel recordings they created
-                            return $currentAuth && $record->playlist_auth_id === $currentAuth->id;
-                        })
+                        ->visible(fn (DvrRecording $record): bool => static::guestCanCancel($record, $currentAuth))
                         ->requiresConfirmation()
                         ->modalDescription(__('This will stop the recording. Are you sure?'))
                         ->action(function (DvrRecording $record) use ($currentAuth): void {
-                            // Backend guard — prevents forged Livewire calls bypassing ->visible()
-                            if (! $currentAuth || $record->playlist_auth_id !== $currentAuth->id) {
+                            // Backend guard — prevents forged Livewire calls bypassing
+                            // ->visible(). Same predicate, deliberately re-evaluated.
+                            if (! static::guestCanCancel($record, $currentAuth)) {
                                 Notification::make()
                                     ->danger()
                                     ->title(__('Unauthorized'))
-                                    ->send();
-
-                                return;
-                            }
-
-                            if (! in_array($record->status, [
-                                DvrRecordingStatus::Scheduled,
-                                DvrRecordingStatus::Recording,
-                            ])) {
-                                Notification::make()
-                                    ->danger()
-                                    ->title(__('Recording cannot be cancelled'))
                                     ->send();
 
                                 return;
@@ -271,6 +305,29 @@ class GuestDvrRecordingResource extends Resource
                                 ->send();
                         }),
                 ])->button()->hiddenLabel()->size('sm'),
+                Action::make('play')
+                    ->label(__('Watch'))
+                    ->tooltip(__('Watch'))
+                    ->icon('heroicon-s-play-circle')
+                    ->color('success')
+                    ->button()
+                    ->hiddenLabel()
+                    ->size('sm')
+                    ->visible(fn (DvrRecording $record): bool => static::guestCanPlay($record, $currentAuth))
+                    ->action(function (DvrRecording $record, $livewire) use ($currentAuth): void {
+                        // Backend guard — prevents forged Livewire calls bypassing
+                        // ->visible(). Same predicate, deliberately re-evaluated.
+                        if (! static::guestCanPlay($record, $currentAuth)) {
+                            Notification::make()
+                                ->danger()
+                                ->title(__('Unauthorized'))
+                                ->send();
+
+                            return;
+                        }
+
+                        $livewire->dispatch('openFloatingStream', static::playerAttributes($record));
+                    }),
             ], position: RecordActionsPosition::BeforeCells)
             ->toolbarActions([]);
     }

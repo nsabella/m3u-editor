@@ -3,11 +3,15 @@
 namespace App\Filament\Resources\VodGroups\Pages;
 
 use App\Facades\SortFacade;
+use App\Filament\Actions\FetchTmdbIdsForGroupsAction;
 use App\Filament\Resources\VodGroups\VodGroupResource;
 use App\Jobs\ProcessVodChannels;
 use App\Jobs\SyncVodStrmFiles;
 use App\Models\Group;
+use App\Services\GenreGroupReclassifyService;
+use App\Services\GroupChannelStateService;
 use App\Services\PlaylistService;
+use App\Services\TmdbService;
 use Filament\Actions\Action;
 use Filament\Actions\ActionGroup;
 use Filament\Actions\DeleteAction;
@@ -27,6 +31,7 @@ class EditVodGroup extends EditRecord
         return [
             ActionGroup::make([
                 PlaylistService::getAddGroupsToPlaylistAction('add', 'vod'),
+                PlaylistService::getAddGroupsToBouquetAction(type: 'vod'),
                 Action::make('move')
                     ->label(__('Move to Group'))
                     ->schema([
@@ -35,7 +40,7 @@ class EditVodGroup extends EditRecord
                             ->live()
                             ->label(__('Group'))
                             ->helperText(__('Select the group you would like to move the channels to.'))
-                            ->options(fn (Get $get, $record) => Group::where([
+                            ->options(fn (Get $get, $record) => Group::query()->assignableTarget()->where([
                                 'type' => 'vod',
                                 'user_id' => auth()->id(),
                                 'playlist_id' => $record->playlist_id,
@@ -63,7 +68,7 @@ class EditVodGroup extends EditRecord
                     ->modalSubmitActionLabel(__('Move now')),
 
                 Action::make('recount')
-                    ->label(__('Recount This Group'))
+                    ->label(__('Renumber This Group'))
                     ->icon('heroicon-o-hashtag')
                     ->schema([
                         TextInput::make('start')
@@ -83,13 +88,13 @@ class EditVodGroup extends EditRecord
                         $livewire->dispatch('refreshRelation');
                         Notification::make()
                             ->success()
-                            ->title(__('Channels Recounted'))
-                            ->body(__('The channels in this group have been recounted.'))
+                            ->title(__('Channels Renumbered'))
+                            ->body(__('The channels in this group have been renumbered.'))
                             ->send();
                     })
                     ->requiresConfirmation()
                     ->modalIcon('heroicon-o-hashtag')
-                    ->modalDescription(__('Recount channels only in this group sequentially. Channel numbers will be assigned based on the current sort order of this group.')),
+                    ->modalDescription(__('Renumber channels only in this group sequentially. Channel numbers will be assigned based on the current sort order of this group.')),
                 Action::make('sort_alpha')
                     ->label(__('Sort Alpha'))
                     ->icon('heroicon-o-bars-arrow-down')
@@ -138,7 +143,7 @@ class EditVodGroup extends EditRecord
                             ->label(__('Sort Order'))
                             ->options([
                                 'DESC' => 'Newest first (2026 to 1950)',
-                                'ASC' => 'Newest first (1950 to 2026)',
+                                'ASC' => 'Oldest first (1950 to 2026)',
                             ])
                             ->default('DESC')
                             ->required(),
@@ -159,7 +164,7 @@ class EditVodGroup extends EditRecord
                     ->modalDescription(__('Sort all channels in this group by release date? This will update the sort order.')),
 
                 Action::make('process_vod')
-                    ->label(__('Fetch Metadata'))
+                    ->label(__('Fetch Provider Metadata'))
                     ->icon('heroicon-o-arrow-down-tray')
                     ->schema([
                         Toggle::make('overwrite_existing')
@@ -189,6 +194,36 @@ class EditVodGroup extends EditRecord
                     ->modalDescription(__('Fetch and process VOD metadata for the group channels.'))
                     ->modalSubmitActionLabel(__('Yes, process now')),
 
+                FetchTmdbIdsForGroupsAction::make('vod'),
+
+                Action::make('reclassify_tmdb_genres')
+                    ->label(__('Reclassify to TMDB Genres'))
+                    ->icon('heroicon-o-tag')
+                    ->action(function (Group $record, Action $action): void {
+                        if (! app(TmdbService::class)->isConfigured()) {
+                            Notification::make()
+                                ->danger()
+                                ->title(__('TMDB API Key Required'))
+                                ->body(__('Please configure your TMDB API key in Settings > TMDB before using this feature.'))
+                                ->duration(10000)
+                                ->send();
+                            $action->halt();
+                        }
+
+                        GenreGroupReclassifyService::reclassifyVodGroups($record->playlist);
+                    })
+                    ->after(function ($livewire): void {
+                        $livewire->dispatch('refreshRelation');
+                        Notification::make()
+                            ->success()
+                            ->title(__('Groups Reclassified'))
+                            ->body(__('Channels in non-genre-matching groups have been moved to Uncategorized.'))
+                            ->send();
+                    })
+                    ->requiresConfirmation()
+                    ->modalIcon('heroicon-o-tag')
+                    ->modalDescription(__('Reclassify this playlist\'s VOD groups to TMDB genres now? Channels in non-genre-matching groups will be moved to Uncategorized. Groups protected by an Auto-Add to Custom Playlist rule are skipped.')),
+
                 Action::make('sync_vod')
                     ->label(__('Sync VOD .strm file'))
                     ->action(function ($record) {
@@ -217,10 +252,8 @@ class EditVodGroup extends EditRecord
 
                 Action::make('enable')
                     ->label(__('Enable group channels'))
-                    ->action(function ($record): void {
-                        $record->channels()->update([
-                            'enabled' => true,
-                        ]);
+                    ->action(function (Group $record): void {
+                        app(GroupChannelStateService::class)->enable($record);
                     })->after(function ($livewire) {
                         $livewire->dispatch('refreshRelation');
                         Notification::make()
@@ -237,10 +270,8 @@ class EditVodGroup extends EditRecord
                     ->modalSubmitActionLabel(__('Yes, enable now')),
                 Action::make('disable')
                     ->label(__('Disable group channels'))
-                    ->action(function ($record): void {
-                        $record->channels()->update([
-                            'enabled' => false,
-                        ]);
+                    ->action(function (Group $record): void {
+                        app(GroupChannelStateService::class)->disable($record);
                     })->after(function ($livewire) {
                         $livewire->dispatch('refreshRelation');
                         Notification::make()

@@ -75,6 +75,77 @@ it('can copy all attributes from source to target playlist', function () {
     expect($targetChannel->shift)->toBe(2);
 });
 
+it('does not overwrite an existing target custom name when Create Missing is on but Overwrite is off (issue #1699)', function () {
+    $sourcePlaylist = Playlist::factory()->create(['user_id' => $this->user->id]);
+    Channel::factory()->create([
+        'playlist_id' => $sourcePlaylist->id,
+        'user_id' => $this->user->id,
+        'url' => 'http://example.test/stream.ts',
+        'name' => 'Source Name',
+        'name_custom' => 'Source Label',
+    ]);
+
+    $targetPlaylist = Playlist::factory()->create(['user_id' => $this->user->id]);
+    $targetChannel = Channel::factory()->create([
+        'playlist_id' => $targetPlaylist->id,
+        'user_id' => $this->user->id,
+        'url' => 'http://example.test/stream.ts',
+        'name' => 'Target Name',
+        'name_custom' => 'Keep Target Label',
+    ]);
+
+    $job = new CopyAttributesToPlaylist(
+        source: $sourcePlaylist,
+        targetId: $targetPlaylist->id,
+        channelAttributes: ['name'],
+        channelMatchAttributes: ['url'],
+        createIfMissing: true,
+        allAttributes: false,
+        overwrite: false,
+    );
+
+    $job->handle();
+
+    expect($targetChannel->fresh()->name_custom)->toBe('Keep Target Label');
+    expect(Channel::where('playlist_id', $targetPlaylist->id)->count())->toBe(1);
+});
+
+it('does not match different sub-channels when Channel Number matching is selected (issue #1700)', function () {
+    $sourcePlaylist = Playlist::factory()->create(['user_id' => $this->user->id]);
+    Channel::factory()->create([
+        'playlist_id' => $sourcePlaylist->id,
+        'user_id' => $this->user->id,
+        'channel' => 5,
+        'channel_minor' => 1,
+        'enabled' => false,
+    ]);
+
+    $targetPlaylist = Playlist::factory()->create(['user_id' => $this->user->id]);
+    $targetChannel = Channel::factory()->create([
+        'playlist_id' => $targetPlaylist->id,
+        'user_id' => $this->user->id,
+        'channel' => 5,
+        'channel_minor' => 2,
+        'enabled' => true,
+    ]);
+
+    $job = new CopyAttributesToPlaylist(
+        source: $sourcePlaylist,
+        targetId: $targetPlaylist->id,
+        channelAttributes: ['enabled'],
+        channelMatchAttributes: ['channel'],
+        createIfMissing: false,
+        allAttributes: false,
+        overwrite: true,
+    );
+
+    $result = $job->handle();
+
+    expect($result)->toBe(0);
+    expect($targetChannel->fresh()->enabled)->toBeTrue();
+    expect($targetChannel->fresh()->channel_minor)->toBe(2);
+});
+
 it('can copy specific attributes from source to target playlist', function () {
     // Create source playlist with channels
     $sourcePlaylist = Playlist::factory()->create(['user_id' => $this->user->id]);
@@ -234,6 +305,43 @@ it('can match channels by name and title when source_id does not match', functio
 
     // Should match by name/title and copy the logo
     expect($targetChannel->logo)->toBe('https://example.com/fallback-logo.png');
+});
+
+it('matches channels whose match values differ only by case or surrounding whitespace', function () {
+    // Regression: the SQL candidate prefilter is now LOWER(TRIM(...))-normalized to agree
+    // with the normalized PHP match key. Before, case/whitespace-divergent rows were
+    // silently excluded from the candidate set on case-sensitive collations (Postgres).
+    $sourcePlaylist = Playlist::factory()->create(['user_id' => $this->user->id]);
+    $sourceChannel = Channel::factory()->create([
+        'playlist_id' => $sourcePlaylist->id,
+        'user_id' => $this->user->id,
+        'source_id' => 'source-channel-id',
+        'name' => '  Discovery HD  ',
+        'logo_internal' => 'https://example.com/discovery.png',
+    ]);
+
+    $targetPlaylist = Playlist::factory()->create(['user_id' => $this->user->id]);
+    $targetChannel = Channel::factory()->create([
+        'playlist_id' => $targetPlaylist->id,
+        'user_id' => $this->user->id,
+        'source_id' => 'different-channel-id',
+        'name' => 'discovery hd',
+        'logo' => null,
+    ]);
+
+    $job = new CopyAttributesToPlaylist(
+        source: $sourcePlaylist,
+        targetId: $targetPlaylist->id,
+        channelAttributes: ['logo'],
+        channelMatchAttributes: ['name'],
+        createIfMissing: false,
+        allAttributes: false,
+        overwrite: false,
+    );
+
+    $job->handle();
+
+    expect($targetChannel->refresh()->logo)->toBe('https://example.com/discovery.png');
 });
 
 it('handles cases where no matching channels are found', function () {

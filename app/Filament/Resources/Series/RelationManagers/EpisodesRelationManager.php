@@ -2,10 +2,12 @@
 
 namespace App\Filament\Resources\Series\RelationManagers;
 
+use App\Filament\Tables\CacheStateColumn;
 use App\Filament\Tables\ProbeStatusColumn;
 use App\Jobs\ProbeStreamsChunk;
 use App\Jobs\ProbeStreamsComplete;
 use App\Models\Episode;
+use App\Services\CachedContentDispatchService;
 use Filament\Actions;
 use Filament\Actions\Action;
 use Filament\Actions\ViewAction;
@@ -46,7 +48,9 @@ class EpisodesRelationManager extends RelationManager
         return $table
             ->recordTitleAttribute('title')
             ->modifyQueryUsing(function (Builder $query) {
-                $query->with(['season', 'series', 'playlist']);
+                // Drop the relationship's default episode_num ordering so the
+                // season grouping order is applied first (otherwise seasons interleave)
+                $query->reorder()->with(['season', 'series', 'playlist']);
             })
             ->defaultGroup('season')
             ->defaultSort('episode_num', 'asc')
@@ -143,6 +147,7 @@ class EpisodesRelationManager extends RelationManager
                     ->tooltip(fn ($record): ?string => $record->aio_item_id ? __('AIOStreams-added episodes cannot be probed.') : null)
                     ->toggleable()
                     ->sortable(),
+                CacheStateColumn::make(),
 
                 ProbeStatusColumn::make(),
             ])
@@ -167,6 +172,32 @@ class EpisodesRelationManager extends RelationManager
                     ->icon('heroicon-m-information-circle')
                     ->button()
                     ->tooltip(__('Episode Details')),
+                Action::make('cache_now')
+                    ->label(__('Cache Now'))
+                    ->tooltip(__('Cache Now'))
+                    ->icon('heroicon-o-arrow-down-tray')
+                    ->color('gray')
+                    ->button()
+                    ->size('sm')
+                    ->hiddenLabel()
+                    ->visible(function (Episode $record): bool {
+                        $service = app(CachedContentDispatchService::class);
+
+                        return $service->isEnabled() && $service->canCache($record);
+                    })
+                    ->requiresConfirmation()
+                    ->modalHeading(__('Cache this episode?'))
+                    ->modalDescription(fn (Episode $record): string => __('Dispatch a background job to download ":title" to local storage for offline playback, or request it from Sonarr if Sonarr is set up for caching.', [
+                        'title' => $record->title ?: __('Episode :seasonx:episode', [
+                            'season' => (int) ($record->season ?? 0),
+                            'episode' => (int) ($record->episode_num ?? 0),
+                        ]),
+                    ]))
+                    ->modalSubmitActionLabel(__('Cache now'))
+                    ->action(function (Episode $record): void {
+                        $result = app(CachedContentDispatchService::class)->dispatch($record);
+                        CachedContentDispatchService::cacheNowNotification($record, $result)->send();
+                    }),
             ], position: RecordActionsPosition::BeforeCells)
             ->toolbarActions([
                 // @TODO - add download? Would need to generate streamlink files and compress then download...
@@ -396,6 +427,7 @@ class EpisodesRelationManager extends RelationManager
                             }),
 
                         TextEntry::make('url')
+                            ->extraAttributes(['class' => 'privacy-sensitive'])
                             ->label(__('Stream URL'))
                             ->columnSpanFull()
                             ->copyable()

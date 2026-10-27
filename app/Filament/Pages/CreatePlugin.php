@@ -4,13 +4,13 @@ namespace App\Filament\Pages;
 
 use App\Services\PluginScaffoldService;
 use Filament\Forms\Components\CheckboxList;
-use Filament\Forms\Components\Placeholder;
 use Filament\Forms\Components\Radio;
 use Filament\Forms\Components\TagsInput;
 use Filament\Forms\Components\TextInput;
 use Filament\Forms\Components\Toggle;
 use Filament\Notifications\Notification;
 use Filament\Pages\Page;
+use Filament\Schemas\Components\Callout;
 use Filament\Schemas\Components\Section;
 use Filament\Schemas\Components\Wizard;
 use Filament\Schemas\Components\Wizard\Step;
@@ -136,7 +136,7 @@ class CreatePlugin extends Page
                         ->schema([
                             Section::make(__('Data Tables'))
                                 ->compact()
-                                ->description(__('Each table gets a physical schema declaration and a full create / edit / delete UI under the plugin\'s Data tab. Add the base name only — the host prefixes it automatically (e.g. profiles → plugin_{id}_profiles).'))
+                                ->description(__('Each table gets a physical schema declaration and a full create / edit / delete UI under the plugin\'s Data tab. Add the base name only, the host prefixes it automatically (e.g. profiles → plugin_{id}_profiles).'))
                                 ->schema([
                                     TagsInput::make('tables')
                                         ->hiddenLabel()
@@ -165,19 +165,17 @@ class CreatePlugin extends Page
                                 ->helperText(__('Adds an uninstall() method for custom cleanup logic beyond what the manifest declares.')),
                             Toggle::make('bare')
                                 ->label(__('Bare scaffold'))
-                                ->helperText(__('Generate only plugin.json and Plugin.php — skip README, CI workflow, scripts, and AI guidance files.')),
+                                ->helperText(__('Generate only plugin.json and Plugin.php - skip README, CI workflow, scripts, and AI guidance files.')),
                         ]),
 
                     Step::make(__('Generate'))
                         ->icon('heroicon-o-rocket-launch')
                         ->description(__('Review and create your plugin'))
                         ->schema([
-                            Placeholder::make('summary')
-                                ->hiddenLabel()
-                                ->content(fn (): HtmlString => new HtmlString($this->buildSummaryHtml())),
-                            Placeholder::make('actions_placeholder')
-                                ->hiddenLabel()
-                                ->content(new HtmlString('<p class="text-sm text-gray-500 dark:text-gray-400">Choose how to generate your plugin below.</p>')),
+                            Callout::make()
+                                ->description(fn (): HtmlString => new HtmlString($this->buildSummaryHtml())),
+                            Callout::make()
+                                ->description(new HtmlString('<p class="text-sm text-gray-500 dark:text-gray-400">Choose how to generate your plugin below.</p>')),
                         ]),
                 ])
                     ->columnSpanFull()

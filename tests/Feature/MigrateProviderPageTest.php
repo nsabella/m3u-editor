@@ -1,0 +1,319 @@
+<?php
+
+use App\Filament\Resources\Playlists\Pages\MigrateProvider;
+use App\Jobs\CopyAttributesToPlaylist;
+use App\Models\Channel;
+use App\Models\CustomPlaylist;
+use App\Models\Epg;
+use App\Models\EpgChannel;
+use App\Models\Playlist;
+use App\Models\ProviderMigrationPlanRow;
+use App\Models\User;
+use Filament\Actions\Testing\TestAction;
+use Illuminate\Support\Facades\Bus;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Str;
+
+beforeEach(function () {
+    Bus::fake();
+    Http::preventStrayRequests();
+
+    $this->user = User::factory()->create();
+    $this->actingAs($this->user);
+});
+
+/**
+ * @return array{source: Playlist, target: Playlist, sourceZee: Channel, targetZee: Channel}
+ */
+function pageFixture(User $user): array
+{
+    $source = Playlist::factory()->create(['user_id' => $user->id]);
+    $target = Playlist::factory()->create(['user_id' => $user->id]);
+
+    $sourceZee = Channel::factory()->create([
+        'playlist_id' => $source->id, 'user_id' => $user->id, 'is_vod' => false,
+        'name' => 'Zee TV', 'stream_id' => '945', 'stream_id_custom' => null,
+        'name_custom' => null, 'enabled' => true, 'group' => 'Entertainment', 'channel' => 42,
+        'epg_channel_id' => null,
+    ]);
+    $targetZee = Channel::factory()->create([
+        'playlist_id' => $target->id, 'user_id' => $user->id, 'is_vod' => false,
+        'name' => 'Zee TV', 'stream_id' => '117225', 'stream_id_custom' => null,
+        'name_custom' => null, 'enabled' => false, 'group' => 'Uncategorized', 'channel' => 1,
+        'epg_channel_id' => null,
+    ]);
+
+    return compact('source', 'target', 'sourceZee', 'targetZee');
+}
+
+it('renders for the playlist owner', function () {
+    ['source' => $source] = pageFixture($this->user);
+
+    Livewire::test(MigrateProvider::class, ['record' => $source->id])
+        ->assertOk();
+});
+
+it('is not reachable for a user who does not own the playlist', function () {
+    $source = Playlist::factory()->create(['user_id' => User::factory()->create()->id]);
+
+    Livewire::test(MigrateProvider::class, ['record' => $source->id])
+        ->assertNotFound();
+});
+
+it('is not found for a network playlist', function () {
+    $source = Playlist::factory()->create(['user_id' => $this->user->id, 'is_network_playlist' => true]);
+
+    Livewire::test(MigrateProvider::class, ['record' => $source->id])
+        ->assertNotFound();
+});
+
+it('materializes plan rows and dispatches the migration job in migration mode', function () {
+    ['source' => $source, 'target' => $target, 'sourceZee' => $sourceZee, 'targetZee' => $targetZee] = pageFixture($this->user);
+
+    $component = Livewire::test(MigrateProvider::class, ['record' => $source->id])
+        ->set('data.target_playlist_id', $target->id)
+        ->set('data.fields', ['enabled', 'group', 'channel'])
+        ->call('buildPreview');
+
+    $rows = ProviderMigrationPlanRow::query()->where('source_playlist_id', $source->id)->get();
+    expect($rows)->toHaveCount(1);
+
+    $matched = $rows->firstWhere('bucket', 'matched');
+    expect($matched->source_channel_id)->toBe($sourceZee->id)
+        ->and($matched->matched_target_channel_id)->toBe($targetZee->id)
+        ->and($matched->include)->toBeTrue();
+
+    $component->call('apply');
+
+    Bus::assertDispatched(CopyAttributesToPlaylist::class, function (CopyAttributesToPlaylist $job) use ($source, $target, $sourceZee, $targetZee) {
+        return $job->migrationMode === true
+            && $job->source->id === $source->id
+            && $job->targetId === $target->id
+            && $job->planFingerprint !== null
+            && $job->resolvedMap === [[
+                'source_id' => $sourceZee->id,
+                'target_id' => $targetZee->id,
+                'epg_channel_id' => null,
+                'epg_confirmed' => false,
+            ]];
+    });
+
+    // Plan rows are cleared once applied.
+    expect(ProviderMigrationPlanRow::query()->where('source_playlist_id', $source->id)->count())->toBe(0);
+});
+
+it('does not dispatch when every matched row is excluded', function () {
+    ['source' => $source, 'target' => $target] = pageFixture($this->user);
+
+    $component = Livewire::test(MigrateProvider::class, ['record' => $source->id])
+        ->set('data.target_playlist_id', $target->id)
+        ->call('buildPreview');
+
+    ProviderMigrationPlanRow::query()
+        ->where('source_playlist_id', $source->id)
+        ->update(['include' => false]);
+
+    $component->call('apply')->assertNotified();
+
+    Bus::assertNotDispatched(CopyAttributesToPlaylist::class);
+});
+
+it('rebuilding the preview replaces the previous rows for the same pair', function () {
+    ['source' => $source, 'target' => $target] = pageFixture($this->user);
+
+    $component = Livewire::test(MigrateProvider::class, ['record' => $source->id])
+        ->set('data.target_playlist_id', $target->id)
+        ->call('buildPreview');
+
+    $firstCount = ProviderMigrationPlanRow::query()->where('source_playlist_id', $source->id)->count();
+
+    $component->call('buildPreview');
+
+    expect(ProviderMigrationPlanRow::query()->where('source_playlist_id', $source->id)->count())->toBe($firstCount);
+});
+
+it('sweeps stale plan rows and any other previews for the user on build', function () {
+    ['source' => $source, 'target' => $target] = pageFixture($this->user);
+
+    // A stale row from an abandoned preview, plus a row for a different source playlist.
+    $stale = ProviderMigrationPlanRow::query()->create([
+        'session_key' => (string) Str::uuid(), 'user_id' => $this->user->id,
+        'source_playlist_id' => 999, 'target_playlist_id' => 998, 'source_channel_id' => 1,
+        'bucket' => 'matched', 'include' => true,
+    ]);
+    ProviderMigrationPlanRow::query()->whereKey($stale->id)->update(['created_at' => now()->subDays(3)]);
+
+    $otherPreview = ProviderMigrationPlanRow::query()->create([
+        'session_key' => (string) Str::uuid(), 'user_id' => $this->user->id,
+        'source_playlist_id' => 555, 'target_playlist_id' => 556, 'source_channel_id' => 2,
+        'bucket' => 'matched', 'include' => true,
+    ]);
+
+    Livewire::test(MigrateProvider::class, ['record' => $source->id])
+        ->set('data.target_playlist_id', $target->id)
+        ->call('buildPreview');
+
+    expect(ProviderMigrationPlanRow::query()->whereKey($stale->id)->exists())->toBeFalse()
+        ->and(ProviderMigrationPlanRow::query()->whereKey($otherPreview->id)->exists())->toBeFalse()
+        ->and(ProviderMigrationPlanRow::query()->where('source_playlist_id', $source->id)->count())->toBe(1);
+});
+
+it('releases another row when a manual match points at an already-claimed replacement channel', function () {
+    ['source' => $source, 'target' => $target, 'targetZee' => $targetZee] = pageFixture($this->user);
+
+    // A second source channel with no clean auto-match, so we can move it by hand.
+    $sourceOther = Channel::factory()->create([
+        'playlist_id' => $source->id, 'user_id' => $this->user->id, 'is_vod' => false,
+        'name' => 'Some Other Channel', 'stream_id' => '888', 'enabled' => true,
+    ]);
+
+    $component = Livewire::test(MigrateProvider::class, ['record' => $source->id])
+        ->set('data.target_playlist_id', $target->id)
+        ->call('buildPreview');
+
+    $autoMatched = ProviderMigrationPlanRow::query()
+        ->where('session_key', $component->get('sessionKey'))
+        ->where('bucket', 'matched')
+        ->firstOrFail();
+    expect((int) $autoMatched->matched_target_channel_id)->toBe($targetZee->id);
+
+    $otherRow = ProviderMigrationPlanRow::query()
+        ->where('session_key', $component->get('sessionKey'))
+        ->where('source_channel_id', $sourceOther->id)
+        ->firstOrFail();
+
+    // Point the second row at the channel the first row already claimed.
+    $component->callAction(
+        TestAction::make('changeMatch')->table($otherRow),
+        ['matched_target_channel_id' => $targetZee->id],
+    );
+
+    expect($otherRow->refresh()->matched_target_channel_id)->toBe($targetZee->id)
+        ->and($autoMatched->refresh()->matched_target_channel_id)->toBeNull()
+        ->and($autoMatched->bucket)->toBe('unmatched')
+        ->and($autoMatched->include)->toBeFalse();
+});
+
+it('computes the EPG proposal for a row resolved manually via change match', function () {
+    ['source' => $source, 'target' => $target] = pageFixture($this->user);
+
+    $epg = Epg::factory()->create(['user_id' => $this->user->id]);
+    $sourceEpgChannel = EpgChannel::factory()->create(['user_id' => $this->user->id, 'epg_id' => $epg->id]);
+
+    // Names deliberately don't match, so this row starts unmatched - exactly the "manually
+    // resolved after starting unmatched" case #1759 describes.
+    $sourceOther = Channel::factory()->create([
+        'playlist_id' => $source->id, 'user_id' => $this->user->id, 'is_vod' => false,
+        'name' => 'Documentary One', 'stream_id' => '777', 'enabled' => true,
+        'epg_channel_id' => $sourceEpgChannel->id,
+    ]);
+    $targetOther = Channel::factory()->create([
+        'playlist_id' => $target->id, 'user_id' => $this->user->id, 'is_vod' => false,
+        'name' => 'Something Else Entirely', 'stream_id' => '778', 'enabled' => false,
+        'epg_channel_id' => null,
+    ]);
+
+    $component = Livewire::test(MigrateProvider::class, ['record' => $source->id])
+        ->set('data.target_playlist_id', $target->id)
+        ->set('data.preserve_epg', true)
+        ->call('buildPreview');
+
+    $row = ProviderMigrationPlanRow::query()
+        ->where('session_key', $component->get('sessionKey'))
+        ->where('source_channel_id', $sourceOther->id)
+        ->firstOrFail();
+
+    expect($row->bucket)->toBe('unmatched')
+        ->and($row->epg_status)->toBe('none')
+        ->and($row->epg_channel_id)->toBeNull();
+
+    $component->callAction(
+        TestAction::make('changeMatch')->table($row),
+        ['matched_target_channel_id' => $targetOther->id],
+    );
+
+    $row->refresh();
+    expect($row->matched_target_channel_id)->toBe($targetOther->id)
+        ->and($row->bucket)->toBe('matched')
+        ->and($row->epg_status)->toBe('ok')
+        ->and($row->epg_channel_id)->toBe($sourceEpgChannel->id);
+});
+
+it('clears the EPG proposal when a row is unmatched via change match', function () {
+    ['source' => $source, 'target' => $target, 'sourceZee' => $sourceZee] = pageFixture($this->user);
+
+    $epg = Epg::factory()->create(['user_id' => $this->user->id]);
+    $sourceEpgChannel = EpgChannel::factory()->create(['user_id' => $this->user->id, 'epg_id' => $epg->id]);
+    $sourceZee->update(['epg_channel_id' => $sourceEpgChannel->id]);
+
+    $component = Livewire::test(MigrateProvider::class, ['record' => $source->id])
+        ->set('data.target_playlist_id', $target->id)
+        ->set('data.preserve_epg', true)
+        ->call('buildPreview');
+
+    $row = ProviderMigrationPlanRow::query()
+        ->where('session_key', $component->get('sessionKey'))
+        ->where('source_channel_id', $sourceZee->id)
+        ->firstOrFail();
+
+    expect($row->epg_status)->toBe('ok');
+
+    $component->callAction(
+        TestAction::make('changeMatch')->table($row),
+        ['matched_target_channel_id' => null],
+    );
+
+    $row->refresh();
+    expect($row->matched_target_channel_id)->toBeNull()
+        ->and($row->epg_status)->toBe('none')
+        ->and($row->epg_channel_id)->toBeNull();
+});
+
+it('lists which custom playlist each matched channel belongs to, with its custom group tag', function () {
+    ['source' => $source, 'target' => $target, 'sourceZee' => $sourceZee] = pageFixture($this->user);
+
+    $customPlaylist = CustomPlaylist::factory()->create(['user_id' => $this->user->id, 'name' => 'My Bouquet']);
+    $customPlaylist->channels()->attach($sourceZee->id);
+    $sourceZee->attachTag('Favorites', $customPlaylist->uuid);
+
+    Livewire::test(MigrateProvider::class, ['record' => $source->id])
+        ->set('data.target_playlist_id', $target->id)
+        ->call('buildPreview');
+
+    $row = ProviderMigrationPlanRow::query()
+        ->where('source_playlist_id', $source->id)
+        ->where('source_channel_id', $sourceZee->id)
+        ->firstOrFail();
+
+    expect($row->custom_playlist_names)->toBe(['My Bouquet (Favorites)']);
+});
+
+it('leaves custom_playlist_names empty for channels not in any custom playlist', function () {
+    ['source' => $source, 'target' => $target, 'sourceZee' => $sourceZee] = pageFixture($this->user);
+
+    Livewire::test(MigrateProvider::class, ['record' => $source->id])
+        ->set('data.target_playlist_id', $target->id)
+        ->call('buildPreview');
+
+    $row = ProviderMigrationPlanRow::query()
+        ->where('source_playlist_id', $source->id)
+        ->where('source_channel_id', $sourceZee->id)
+        ->firstOrFail();
+
+    expect($row->custom_playlist_names)->toBeNull();
+});
+
+it('prunes stale rows on mount', function () {
+    ['source' => $source] = pageFixture($this->user);
+
+    $stale = ProviderMigrationPlanRow::query()->create([
+        'session_key' => (string) Str::uuid(), 'user_id' => $this->user->id,
+        'source_playlist_id' => 1, 'target_playlist_id' => 2, 'source_channel_id' => 1,
+        'bucket' => 'matched', 'include' => true,
+    ]);
+    ProviderMigrationPlanRow::query()->whereKey($stale->id)->update(['created_at' => now()->subHours(5)]);
+
+    Livewire::test(MigrateProvider::class, ['record' => $source->id]);
+
+    expect(ProviderMigrationPlanRow::query()->whereKey($stale->id)->exists())->toBeFalse();
+});

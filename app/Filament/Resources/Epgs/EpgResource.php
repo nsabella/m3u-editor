@@ -13,6 +13,7 @@ use App\Filament\Resources\Epgs\Pages\ViewEpg;
 use App\Jobs\GenerateEpgCache;
 use App\Jobs\ProcessEpgImport;
 use App\Models\Epg;
+use App\Models\Playlist;
 use App\Rules\CheckIfUrlOrLocalPath;
 use App\Rules\Cron;
 use App\Services\DateFormatService;
@@ -32,7 +33,6 @@ use Filament\Actions\EditAction;
 use Filament\Actions\ViewAction;
 use Filament\Forms;
 use Filament\Forms\Components\FileUpload;
-use Filament\Forms\Components\Placeholder;
 use Filament\Forms\Components\Select;
 use Filament\Forms\Components\TextInput;
 use Filament\Forms\Components\Toggle;
@@ -40,6 +40,7 @@ use Filament\Forms\Components\ToggleButtons;
 use Filament\Notifications\Notification;
 use Filament\Resources\Resource;
 use Filament\Schemas\Components\Actions;
+use Filament\Schemas\Components\Callout;
 use Filament\Schemas\Components\Grid;
 use Filament\Schemas\Components\Section;
 use Filament\Schemas\Components\Utilities\Get;
@@ -115,7 +116,7 @@ class EpgResource extends Resource implements CopilotResource
             ->modifyQueryUsing(function (Builder $query) {
                 $query->withCount([
                     'channels',
-                ]);
+                ])->withHasDvr();
             })
             ->deferLoading()
             ->columns([
@@ -127,6 +128,7 @@ class EpgResource extends Resource implements CopilotResource
                     ->searchable()
                     ->sortable(),
                 TextColumn::make('url')
+                    ->extraAttributes(['class' => 'privacy-sensitive'])
                     ->wrap()
                     ->toggleable(isToggledHiddenByDefault: true)
                     ->searchable(),
@@ -163,6 +165,12 @@ class EpgResource extends Resource implements CopilotResource
                     ->boolean()
                     ->toggleable()
                     ->sortable(),
+                IconColumn::make('has_dvr')
+                    ->label(__('Has DVR'))
+                    ->tooltip(fn (Epg $record) => $record->hasDvrEnabled() ? __('A playlist using this EPG has DVR enabled, so caching also populates DVR programme data') : null)
+                    ->state(fn (Epg $record): bool => $record->hasDvrEnabled())
+                    ->boolean()
+                    ->toggleable(),
                 ToggleColumn::make('auto_sync')
                     ->label(__('Auto Sync'))
                     ->toggleable()
@@ -186,6 +194,11 @@ class EpgResource extends Resource implements CopilotResource
                     ->sortable(),
                 TextColumn::make('sync_time')
                     ->label(__('Sync Time'))
+                    ->formatStateUsing(fn (string $state): string => gmdate('H:i:s', (int) $state))
+                    ->toggleable()
+                    ->sortable(),
+                TextColumn::make('cache_time')
+                    ->label(__('Cache Time'))
                     ->formatStateUsing(fn (string $state): string => gmdate('H:i:s', (int) $state))
                     ->toggleable()
                     ->sortable(),
@@ -296,6 +309,7 @@ class EpgResource extends Resource implements CopilotResource
                         ->modalIcon('heroicon-o-arrow-uturn-left')
                         ->modalDescription(__('Reset EPG status so it can be processed again. Only perform this action if you are having problems with the EPG syncing.'))
                         ->modalSubmitActionLabel(__('Yes, reset now')),
+                    self::getRetrySdLoginAction(),
                     self::getManageSdLineupsAction(),
                     self::getSdDeleteAction(),
                 ])->button()->hiddenLabel()->size('sm'),
@@ -422,10 +436,16 @@ class EpgResource extends Resource implements CopilotResource
                 ])
                 ->visible(fn (Get $get): bool => $get('source_type') === EpgSourceType::SCHEDULES_DIRECT->value)
                 ->schema([
+                    Callout::make(__('SchedulesDirect login rejected'))
+                        ->danger()
+                        ->columnSpanFull()
+                        ->visible(fn (?Epg $record): bool => (bool) $record?->isSchedulesDirectAuthBlocked())
+                        ->description(fn (?Epg $record): ?string => $record?->sd_auth_blocked_message),
                     Grid::make()
                         ->columns(2)
                         ->schema([
                             TextInput::make('sd_username')
+                                ->extraInputAttributes(['class' => 'privacy-sensitive'])
                                 ->label(__('Username'))
                                 ->required(fn (Get $get): bool => $get('source_type') === EpgSourceType::SCHEDULES_DIRECT->value),
                             TextInput::make('sd_password')
@@ -474,9 +494,10 @@ class EpgResource extends Resource implements CopilotResource
                     Grid::make()
                         ->columns(2)
                         ->schema([
-                            Select::make('sd_lineup_id')
-                                ->label(__('Lineup'))
-                                ->helperText(__('Select your SchedulesDirect lineup'))
+                            Select::make('sd_lineup_ids')
+                                ->label(__('Lineups'))
+                                ->helperText(__('Select one or more SchedulesDirect lineups. Lineups not yet on your SchedulesDirect account are added on the next sync.'))
+                                ->multiple()
                                 ->searchable()
                                 ->getSearchResultsUsing(function (string $search, Get $get, SchedulesDirectService $service) {
                                     $country = $get('sd_country');
@@ -517,7 +538,7 @@ class EpgResource extends Resource implements CopilotResource
                                                 if (stripos($lineup['name'], $search) !== false) {
                                                     // Don't duplicate if already in account
                                                     if (! isset($options[$lineup['lineup']])) {
-                                                        $options[$lineup['lineup']] = "{$lineup['name']} — {$lineup['lineup']} ({$headend['transport']})";
+                                                        $options[$lineup['lineup']] = "{$lineup['name']} - {$lineup['lineup']} ({$headend['transport']})";
                                                     }
                                                 }
                                             }
@@ -528,7 +549,9 @@ class EpgResource extends Resource implements CopilotResource
                                         return [];
                                     }
                                 })
-                                ->getOptionLabelUsing(function ($value, Get $get, SchedulesDirectService $service) {
+                                ->getOptionLabelsUsing(function (array $values, Get $get, SchedulesDirectService $service): array {
+                                    $labels = array_combine($values, $values);
+
                                     try {
                                         $country = $get('sd_country');
                                         $postalCode = $get('sd_postal_code');
@@ -536,7 +559,7 @@ class EpgResource extends Resource implements CopilotResource
                                         $password = $get('sd_password');
 
                                         if (! $country || ! $postalCode || ! $username || ! $password) {
-                                            return $value;
+                                            return $labels;
                                         }
 
                                         // Authenticate to get fresh token
@@ -546,15 +569,15 @@ class EpgResource extends Resource implements CopilotResource
                                         $headends = $service->getHeadends($authData['token'], $country, $postalCode);
                                         foreach ($headends as $headend) {
                                             foreach ($headend['lineups'] as $lineup) {
-                                                if ($lineup['lineup'] === $value) {
-                                                    return "{$lineup['name']} — {$lineup['lineup']} ({$headend['transport']})";
+                                                if (isset($labels[$lineup['lineup']])) {
+                                                    $labels[$lineup['lineup']] = "{$lineup['name']} - {$lineup['lineup']} ({$headend['transport']})";
                                                 }
                                             }
                                         }
 
-                                        return $value;
+                                        return $labels;
                                     } catch (Exception $e) {
-                                        return $value;
+                                        return $labels;
                                     }
                                 }),
                             TextInput::make('sd_days_to_import')
@@ -728,6 +751,7 @@ class EpgResource extends Resource implements CopilotResource
                 ->visible(fn (Get $get): bool => $get('source_type') === EpgSourceType::URL->value || ! $get('source_type'))
                 ->schema([
                     TextInput::make('url')
+                        ->extraInputAttributes(['class' => 'privacy-sensitive'])
                         ->label(__('URL or Local file path'))
                         ->prefixIcon('heroicon-m-globe-alt')
                         ->helperText(__('Enter the URL of the XMLTV guide data. If this is a local file, you can enter a full or relative path. If changing URL, the guide data will be re-imported. Use with caution as this could lead to data loss if the new guide differs from the old one.'))
@@ -760,6 +784,25 @@ class EpgResource extends Resource implements CopilotResource
                                 ->inline(false)
                                 ->default(false),
                         ]),
+                ]),
+
+            Section::make(__('Provider'))
+                ->description(__('Optionally tie this EPG to a playlist from the same provider.'))
+                ->visible(fn (Get $get): bool => ($get('source_type') ?: EpgSourceType::URL->value) === EpgSourceType::URL->value)
+                ->schema([
+                    Select::make('playlist_id')
+                        ->label(__('Provider Playlist'))
+                        ->helperText(__('Tie this EPG to a playlist from the same provider so the playlist\'s DNS failover keeps this EPG\'s URL in sync (optional).'))
+                        ->relationship('playlist', 'name')
+                        ->searchable()
+                        ->preload()
+                        ->nullable()
+                        ->live(),
+                    Callout::make()
+                        ->warning()
+                        ->columnSpanFull()
+                        ->visible(fn (Get $get): bool => self::providerHostsMismatch($get('url'), $get('playlist_id')))
+                        ->description(__('This EPG\'s source does not appear to match the selected playlist\'s provider. The link still works, but DNS sync and optimized import are designed for same-provider pairs.')),
                 ]),
 
             Section::make(__('Scheduling'))
@@ -807,10 +850,9 @@ class EpgResource extends Resource implements CopilotResource
                                 ->helperText(__('Number of retry attempts before giving up. Each retry waits attempt × 60 seconds (1 min, 2 min, 3 min…).'))
                                 ->hidden(fn (Get $get): bool => ! $get('auto_resync_on_failure')),
                         ])->hidden(fn (Get $get): bool => ! $get('auto_sync')),
-                    Placeholder::make('synced')
+                    Callout::make(__('Last Synced'))
                         ->columnSpanFull()
-                        ->label(__('Last Synced'))
-                        ->content(fn ($record) => app(DateFormatService::class)->format($record?->synced)),
+                        ->description(fn ($record) => app(DateFormatService::class)->format($record?->synced)),
                 ]),
 
             Section::make(__('Mapping'))
@@ -824,6 +866,78 @@ class EpgResource extends Resource implements CopilotResource
                         ->maxLength(10),
                 ]),
         ];
+    }
+
+    /**
+     * True when a provider playlist is selected but its host(s) don't line up
+     * with the EPG URL's host, so the form can warn that this isn't a
+     * same-provider pair. Non-xtream playlists always count as a mismatch.
+     */
+    public static function providerHostsMismatch(?string $epgUrl, int|string|null $playlistId): bool
+    {
+        if (blank($playlistId) || blank($epgUrl)) {
+            return false;
+        }
+
+        $epgHost = parse_url((string) $epgUrl, PHP_URL_HOST);
+        if (! $epgHost) {
+            return false;
+        }
+
+        $playlist = Playlist::find($playlistId);
+        if (! $playlist) {
+            return false;
+        }
+
+        $providerHosts = collect($playlist->getOrderedXtreamUrls())
+            ->map(fn (string $url): ?string => parse_url($url, PHP_URL_HOST))
+            ->filter()
+            ->values()
+            ->all();
+
+        if (empty($providerHosts)) {
+            return true;
+        }
+
+        return ! in_array($epgHost, $providerHosts, true);
+    }
+
+    /**
+     * Shared "Retry SchedulesDirect Login" action used in the table, edit page, and view page.
+     * Lifts a recorded permanent login rejection (e.g. after the account was renewed)
+     * and runs one sync, which tries the login again.
+     */
+    public static function getRetrySdLoginAction(): Action
+    {
+        return Action::make('retry_sd_login')
+            ->label(__('Retry SchedulesDirect Login'))
+            ->icon('heroicon-o-key')
+            ->color('warning')
+            ->visible(fn (Epg $record): bool => $record->isSchedulesDirect() && $record->isSchedulesDirectAuthBlocked())
+            ->requiresConfirmation()
+            ->modalIcon('heroicon-o-key')
+            ->modalDescription(fn (Epg $record): string => (string) $record->sd_auth_blocked_message)
+            ->modalSubmitActionLabel(__('Yes, retry login'))
+            ->action(function (Epg $record): void {
+                app(SchedulesDirectService::class)->clearAuthBlock($record);
+
+                $record->update([
+                    'status' => Status::Processing,
+                    'progress' => 0,
+                    'sd_progress' => 0,
+                    'cache_progress' => 0,
+                    'resync_attempt' => 0,
+                ]);
+                app('Illuminate\Contracts\Bus\Dispatcher')
+                    ->dispatch(new ProcessEpgImport($record, force: true));
+
+                Notification::make()
+                    ->success()
+                    ->title(__('EPG is processing'))
+                    ->body(__('EPG is being processed in the background. Depending on the size of the guide data, this may take a while. You will be notified on completion.'))
+                    ->duration(10000)
+                    ->send();
+            });
     }
 
     /**
@@ -896,22 +1010,22 @@ class EpgResource extends Resource implements CopilotResource
     {
         return DeleteAction::make()
             ->modalDescription(fn (Epg $record) => $record->isSchedulesDirect() && $record->hasSchedulesDirectLineup()
-                ? __('Delete this EPG? You can optionally also remove the associated lineup from your SchedulesDirect account to free up a lineup slot.')
+                ? __('Delete this EPG? You can optionally also remove its lineups from your SchedulesDirect account to free up lineup slots. Lineups used by another EPG are kept.')
                 : null)
             ->schema(fn (Epg $record): array => $record->isSchedulesDirect() && $record->hasSchedulesDirectLineup() ? [
                 Toggle::make('delete_sd_lineup')
-                    ->label(__('Also delete lineup from SchedulesDirect account'))
+                    ->label(__('Also delete lineups from SchedulesDirect account'))
                     ->helperText(__('Removing unused lineups from your SchedulesDirect account frees up slots for new ones.'))
                     ->default(true),
             ] : [])
             ->before(function (array $data, Epg $record): void {
                 if ($record->isSchedulesDirect() && ($data['delete_sd_lineup'] ?? false) && $record->hasSchedulesDirectLineup()) {
                     try {
-                        app(SchedulesDirectService::class)->removeConfiguredLineup($record);
+                        app(SchedulesDirectService::class)->removeConfiguredLineups($record);
                     } catch (Exception $e) {
-                        Log::warning('Failed to remove SchedulesDirect lineup on EPG delete', [
+                        Log::warning('Failed to remove SchedulesDirect lineups on EPG delete', [
                             'epg_id' => $record->id,
-                            'lineup_id' => $record->sd_lineup_id,
+                            'lineup_ids' => $record->sd_lineup_ids,
                             'error' => $e->getMessage(),
                         ]);
                     }

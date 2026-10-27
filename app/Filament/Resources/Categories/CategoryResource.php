@@ -2,10 +2,12 @@
 
 namespace App\Filament\Resources\Categories;
 
-use App\Facades\SortFacade;
+use App\Filament\Actions\FetchTmdbIdsForGroupsAction;
+use App\Filament\Actions\SortSeriesByDateAction;
 use App\Filament\Concerns\HasCopilotSupport;
 use App\Filament\Resources\Categories\Pages\EditCategory;
 use App\Filament\Resources\Categories\Pages\ListCategories;
+use App\Filament\Resources\Categories\RelationManagers\ChildCategoriesRelationManager;
 use App\Filament\Resources\Categories\RelationManagers\SeriesRelationManager;
 use App\Filament\Resources\CategoryResource\Pages;
 use App\Jobs\CategoryFindAndReplace;
@@ -16,7 +18,10 @@ use App\Models\Category;
 use App\Models\Playlist;
 use App\Services\DateFormatService;
 use App\Services\FindReplaceService;
+use App\Services\GenreGroupReclassifyService;
+use App\Services\MergedGroupService;
 use App\Services\PlaylistService;
+use App\Services\TmdbService;
 use App\Traits\HasUserFiltering;
 use EslamRedaDiv\FilamentCopilot\Contracts\CopilotResource;
 use Filament\Actions\Action;
@@ -33,14 +38,16 @@ use Filament\Schemas\Components\Group as ComponentsGroup;
 use Filament\Schemas\Components\Section;
 use Filament\Schemas\Components\Utilities\Get;
 use Filament\Schemas\Schema;
+use Filament\Tables\Columns\IconColumn;
 use Filament\Tables\Columns\TextColumn;
 use Filament\Tables\Columns\TextInputColumn;
 use Filament\Tables\Columns\ToggleColumn;
 use Filament\Tables\Enums\RecordActionsPosition;
-use Filament\Tables\Filters\SelectFilter;
+use Filament\Tables\Filters\TernaryFilter;
 use Filament\Tables\Table;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Support\Facades\DB;
 
 class CategoryResource extends Resource implements CopilotResource
 {
@@ -92,7 +99,8 @@ class CategoryResource extends Resource implements CopilotResource
                 ->inline(false)
                 ->label(__('Auto Enable New Channels'))
                 ->helperText(__('Automatically enable newly added channels to this group.'))
-                ->default(true),
+                ->default(true)
+                ->hidden(fn (?Category $record): bool => (bool) $record?->is_merged),
             TextInput::make('sort_order')
                 ->label(__('Sort Order'))
                 ->numeric()
@@ -104,7 +112,8 @@ class CategoryResource extends Resource implements CopilotResource
                 ->searchable()
                 ->relationship('streamFileSetting', 'name', fn ($query) => $query->forSeries()->where('user_id', auth()->id()))
                 ->nullable()
-                ->helperText(__('Select a Stream File Setting profile for all series in this category. Series-level settings take priority. Leave empty to use global settings.')),
+                ->helperText(__('Select a Stream File Setting profile for all series in this category. Series-level settings take priority. Leave empty to use global settings.'))
+                ->hidden(fn (?Category $record): bool => (bool) $record?->is_merged),
         ];
 
         return $schema
@@ -128,8 +137,14 @@ class CategoryResource extends Resource implements CopilotResource
         return $table->persistFiltersInSession()
             ->persistSortInSession()
             ->modifyQueryUsing(function (Builder $query) {
-                $query->withCount('series')
-                    ->withCount('enabled_series');
+                $query->with(['parent', 'playlist'])
+                    ->withCount('series')
+                    ->withCount('enabled_series')
+                    ->withCount('children')
+                    ->withCount([
+                        'descendantSeries as descendant_series_count',
+                        'descendantSeries as enabled_descendant_series_count' => fn (Builder $subQuery) => $subQuery->where('series.enabled', true),
+                    ]);
             })
             ->filtersTriggerAction(function ($action) {
                 return $action->button()->label(__('Filters'));
@@ -164,7 +179,9 @@ class CategoryResource extends Resource implements CopilotResource
                 ToggleColumn::make('enabled')
                     ->label(__('Auto Enable'))
                     ->toggleable()
-                    ->tooltip(__('Auto enable newly added category series'))
+                    ->tooltip(fn ($record) => $record->playlist?->enable_series ? __('Playlist "Enable new series" is on, so all new series added to this category will be enabled on sync.') : __('Auto enable newly added category series'))
+                    ->disabled(fn ($record) => (bool) $record->playlist?->enable_series)
+                    ->getStateUsing(fn ($record) => $record->playlist?->enable_series ? true : $record->enabled)
                     ->sortable(),
                 TextColumn::make('name_internal')
                     ->label(__('Default name'))
@@ -172,9 +189,43 @@ class CategoryResource extends Resource implements CopilotResource
                     ->sortable(),
                 TextColumn::make('series_count')
                     ->label(__('Series'))
-                    ->description(fn (Category $record): string => "Enabled: {$record->enabled_series_count}")
+                    ->state(fn (Category $record): int => $record->is_merged
+                        ? (int) $record->descendant_series_count
+                        : (int) $record->series_count)
+                    ->description(fn (Category $record): string => 'Enabled: '.($record->is_merged
+                        ? (int) $record->enabled_descendant_series_count
+                        : (int) $record->enabled_series_count))
                     ->toggleable()
                     ->sortable(),
+                IconColumn::make('is_merged')
+                    ->label(__('Merged Category'))
+                    ->boolean()
+                    ->tooltip(fn (Category $record): ?string => $record->is_merged ? __('This category combines the categories merged into it.') : null)
+                    ->toggleable()
+                    ->sortable(),
+                TextColumn::make('parent.name')
+                    ->label(__('Parent'))
+                    ->placeholder('-')
+                    ->badge()
+                    ->color('gray')
+                    ->searchable()
+                    ->sortable(query: function (Builder $query, string $direction): Builder {
+                        return $query->orderBy(
+                            DB::table('categories as parent_categories')
+                                ->select('parent_categories.name')
+                                ->whereColumn('parent_categories.id', 'categories.parent_id'),
+                            $direction,
+                        );
+                    })
+                    ->toggleable(),
+                TextColumn::make('children_count')
+                    ->label(__('Children'))
+                    ->state(fn (Category $record): ?int => $record->is_merged ? (int) $record->children_count : null)
+                    ->placeholder('-')
+                    ->badge()
+                    ->color('gray')
+                    ->sortable()
+                    ->toggleable(),
                 TextColumn::make('created_at')
                     ->formatStateUsing(fn ($state) => app(DateFormatService::class)->format($state))
                     ->sortable()
@@ -185,15 +236,17 @@ class CategoryResource extends Resource implements CopilotResource
                     ->toggleable(isToggledHiddenByDefault: true),
             ])
             ->filters([
-                // SelectFilter::make('playlist')
-                //     ->relationship('playlist', 'name')
-                //     ->multiple()
-                //     ->preload()
-                //     ->searchable(),
+                TernaryFilter::make('is_merged')
+                    ->label(__('Merged categories'))
+                    ->placeholder(__('All categories'))
+                    ->trueLabel(__('Merged categories only'))
+                    ->falseLabel(__('Exclude merged categories')),
             ])
             ->recordActions([
                 ActionGroup::make([
                     PlaylistService::getAddGroupsToPlaylistAction('add', 'series'),
+                    PlaylistService::getAddGroupsToBouquetAction(type: 'category'),
+                    MergedGroupService::manageCategoryChildrenAction(),
                     Action::make('move')
                         ->label(__('Move Series to Category'))
                         ->schema([
@@ -202,7 +255,7 @@ class CategoryResource extends Resource implements CopilotResource
                                 ->live()
                                 ->label(__('Category'))
                                 ->helperText(__('Select the category you would like to move the series to.'))
-                                ->options(fn (Get $get, $record) => Category::where(['user_id' => auth()->id(), 'playlist_id' => $record->playlist_id])->get(['name', 'id'])->pluck('name', 'id'))
+                                ->options(fn (Get $get, $record) => Category::query()->assignableTarget()->where(['user_id' => auth()->id(), 'playlist_id' => $record->playlist_id])->get(['name', 'id'])->pluck('name', 'id'))
                                 ->searchable(),
                         ])
                         ->action(function ($record, array $data): void {
@@ -222,34 +275,35 @@ class CategoryResource extends Resource implements CopilotResource
                         ->modalIcon('heroicon-o-arrows-right-left')
                         ->modalDescription(__('Move the series to another category.'))
                         ->modalSubmitActionLabel(__('Move now')),
-                    Action::make('sort_release_date')
-                        ->label(__('Sort by Release Date'))
-                        ->icon('heroicon-o-calendar-days')
-                        ->schema([
-                            Select::make('sort')
-                                ->label(__('Sort Order'))
-                                ->options([
-                                    'DESC' => 'Newest first (2026 to 1950)',
-                                    'ASC' => 'Newest first (1950 to 2026)',
-                                ])
-                                ->default('DESC')
-                                ->required(),
-                        ])
-                        ->action(function (Category $record, array $data): void {
-                            SortFacade::bulkSortCategorySeriesByReleaseDate($record, $data['sort'] ?? 'DESC');
+                    SortSeriesByDateAction::forCategory(),
+                    Action::make('reclassify_tmdb_genres')
+                        ->label(__('Reclassify to TMDB Genres'))
+                        ->icon('heroicon-o-tag')
+                        ->action(function (Category $record, Action $action): void {
+                            if (! app(TmdbService::class)->isConfigured()) {
+                                Notification::make()
+                                    ->danger()
+                                    ->title(__('TMDB API Key Required'))
+                                    ->body(__('Please configure your TMDB API key in Settings > TMDB before using this feature.'))
+                                    ->duration(10000)
+                                    ->send();
+                                $action->halt();
+                            }
+
+                            GenreGroupReclassifyService::reclassifyCategories($record->playlist);
                         })
                         ->after(function () {
                             Notification::make()
                                 ->success()
-                                ->title(__('Series Sorted by Release Date'))
-                                ->body(__('The series in this category have been sorted by release date.'))
+                                ->title(__('Categories Reclassified'))
+                                ->body(__('Series in non-genre-matching categories have been moved to Uncategorized.'))
                                 ->send();
                         })
                         ->requiresConfirmation()
-                        ->modalIcon('heroicon-o-calendar-days')
-                        ->modalDescription(__('Sort all series in this category by release date? This will update the sort order.')),
+                        ->modalIcon('heroicon-o-tag')
+                        ->modalDescription(__('Reclassify this playlist\'s Series categories to TMDB genres now? Series in non-genre-matching categories will be moved to Uncategorized. Categories protected by an Auto-Add to Custom Playlist rule are skipped.')),
                     Action::make('process')
-                        ->label(__('Fetch Series Metadata'))
+                        ->label(__('Fetch Provider Metadata'))
                         ->icon('heroicon-o-arrow-down-tray')
                         ->action(function ($record) {
                             foreach ($record->enabled_series as $series) {
@@ -271,6 +325,7 @@ class CategoryResource extends Resource implements CopilotResource
                         ->modalIcon('heroicon-o-arrow-down-tray')
                         ->modalDescription(__('Process series for selected category now? Only enabled series will be processed. This will fetch all episodes and seasons for the category series. This may take a while depending on the number of series in the category.'))
                         ->modalSubmitActionLabel(__('Yes, process now')),
+                    FetchTmdbIdsForGroupsAction::make('series'),
                     Action::make('sync')
                         ->label(__('Sync Series .strm files'))
                         ->action(function ($record) {
@@ -339,6 +394,7 @@ class CategoryResource extends Resource implements CopilotResource
             ->toolbarActions([
                 BulkActionGroup::make([
                     PlaylistService::getAddGroupsToPlaylistBulkAction('add', 'series'),
+                    PlaylistService::getAddGroupsToBouquetBulkAction(type: 'category'),
                     BulkAction::make('move')
                         ->label(__('Move Series to Category'))
                         ->schema([
@@ -349,6 +405,7 @@ class CategoryResource extends Resource implements CopilotResource
                                 ->helperText(__('Select the category you would like to move the series to.'))
                                 ->options(
                                     fn () => Category::query()
+                                        ->assignableTarget()
                                         ->with(['playlist'])
                                         ->where(['user_id' => auth()->id()])
                                         ->get(['name', 'id', 'playlist_id'])
@@ -390,8 +447,43 @@ class CategoryResource extends Resource implements CopilotResource
                         ->modalIcon('heroicon-o-arrows-right-left')
                         ->modalDescription(__('Move the category series to another category.'))
                         ->modalSubmitActionLabel(__('Move now')),
+                    MergedGroupService::addToMergedCategoryBulkAction(),
+                    SortSeriesByDateAction::forCategoriesBulk(),
+                    BulkAction::make('reclassify_tmdb_genres')
+                        ->label(__('Reclassify to TMDB Genres'))
+                        ->icon('heroicon-o-tag')
+                        ->action(function (Collection $records, BulkAction $action): void {
+                            if (! app(TmdbService::class)->isConfigured()) {
+                                Notification::make()
+                                    ->danger()
+                                    ->title(__('TMDB API Key Required'))
+                                    ->body(__('Please configure your TMDB API key in Settings > TMDB before using this feature.'))
+                                    ->duration(10000)
+                                    ->send();
+                                $action->halt();
+                            }
+
+                            // Per-playlist scope: reclassify the whole playlist's categories.
+                            foreach ($records->pluck('playlist_id')->unique() as $playlistId) {
+                                $playlist = Playlist::find($playlistId);
+                                if ($playlist) {
+                                    GenreGroupReclassifyService::reclassifyCategories($playlist);
+                                }
+                            }
+                        })
+                        ->after(function () {
+                            Notification::make()
+                                ->success()
+                                ->title(__('Categories Reclassified'))
+                                ->body(__('Series in non-genre-matching categories have been moved to Uncategorized.'))
+                                ->send();
+                        })
+                        ->deselectRecordsAfterCompletion()
+                        ->requiresConfirmation()
+                        ->modalIcon('heroicon-o-tag')
+                        ->modalDescription(__('Reclassify the selected playlists\' Series categories to TMDB genres now? Series in non-genre-matching categories will be moved to Uncategorized. Categories protected by an Auto-Add to Custom Playlist rule are skipped.')),
                     BulkAction::make('process')
-                        ->label(__('Fetch Series Metadata'))
+                        ->label(__('Fetch Provider Metadata'))
                         ->icon('heroicon-o-arrow-down-tray')
                         ->action(function (Collection $records) {
                             foreach ($records as $record) {
@@ -415,6 +507,7 @@ class CategoryResource extends Resource implements CopilotResource
                         ->modalIcon('heroicon-o-arrow-down-tray')
                         ->modalDescription(__('Process series for selected category now? Only enabled series will be processed. This will fetch all episodes and seasons for the category series. This may take a while depending on the number of series in the category.'))
                         ->modalSubmitActionLabel(__('Yes, process now')),
+                    FetchTmdbIdsForGroupsAction::makeBulk('series'),
                     BulkAction::make('sync')
                         ->label(__('Sync Series .strm files'))
                         ->action(function (Collection $records) {
@@ -576,6 +669,7 @@ class CategoryResource extends Resource implements CopilotResource
     {
         return [
             SeriesRelationManager::class,
+            ChildCategoriesRelationManager::class,
         ];
     }
 

@@ -50,6 +50,14 @@ class IntegrateDvrRecordingToVod implements ShouldQueue
         // Clear the step label now that the full pipeline is done
         $recording->update(['post_processing_step' => null]);
 
+        // Re-broadcast so connected TV clients know the library entry now
+        // exists. DvrPostProcessorService's completion broadcast fires the
+        // instant status flips to Completed — before this queued job creates
+        // the Series/Episode/Channel rows — so clients that refreshed on that
+        // first push saw nothing. Re-broadcasting an unchanged status is
+        // safe (issue #1403).
+        $recording->broadcastStatus();
+
         Log::info("DVR VOD integration complete for recording {$recording->id}", [
             'recording_id' => $recording->id,
         ]);

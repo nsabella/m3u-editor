@@ -4,8 +4,12 @@ namespace App\Models;
 
 use App\Enums\PlaylistChannelId;
 use App\Jobs\UpdateXtreamStats;
+use App\Pivots\BouquetPlaylistAlias;
+use App\Pivots\MergedPlaylistPivot;
+use App\Traits\HasDefaultAuth;
 use App\Traits\ShortUrlTrait;
 use Illuminate\Database\Eloquent\Casts\Attribute;
+use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
@@ -18,6 +22,7 @@ use Spatie\Tags\Tag;
 
 class PlaylistAlias extends Model
 {
+    use HasDefaultAuth;
     use HasFactory;
     use ShortUrlTrait;
 
@@ -26,6 +31,15 @@ class PlaylistAlias extends Model
 
     /** @var array<string, array<string, int>> Memoised custom playlist tag name => id maps, keyed by tag type. */
     private array $resolvedCustomTagIds = [];
+
+    /** @var array{selected_groups: array<string>, selected_vod_groups: array<string>, selected_categories: array<string>}|null Memoised union of attached bouquets' selections, reduced to names. */
+    private ?array $bouquetSelections = null;
+
+    /** @var array{selected_groups: array<int, array{playlist_id: int, name: string}>, selected_vod_groups: array<int, array{playlist_id: int, name: string}>, selected_categories: array<int, array{playlist_id: int, name: string}>}|null Memoised union of attached merged-target bouquets' {playlist_id, name} pairs. */
+    private ?array $bouquetSelectionPairs = null;
+
+    /** @var array<int, array<int>>|null Memoised playlist id => source_category_id list for the merged series() filter. */
+    private ?array $resolvedSourceCategoryIds = null;
 
     protected $casts = [
         'xtream_config' => 'array',
@@ -38,6 +52,10 @@ class PlaylistAlias extends Model
         'custom_headers' => 'array',
         'strict_live_ts' => 'boolean',
         'use_sticky_session' => 'boolean',
+        'hdhr_enabled' => 'boolean',
+        'm3u_enabled' => 'boolean',
+        'xapi_enabled' => 'boolean',
+        'xmltv_enabled' => 'boolean',
     ];
 
     /**
@@ -76,13 +94,105 @@ class PlaylistAlias extends Model
     }
 
     /**
-     * Get the allowed live group names for this alias (empty = no restriction).
+     * The attached bouquets, reusing an eager-loaded relation when there is one and
+     * querying without caching the relation on the model otherwise (the results are
+     * memoised by the callers below either way).
+     *
+     * @return Collection<int, Bouquet>
+     */
+    private function attachedBouquets(): Collection
+    {
+        return $this->relationLoaded('bouquets') ? $this->bouquets : $this->bouquets()->get();
+    }
+
+    /**
+     * The merged selections of every attached bouquet, memoised per instance.
+     *
+     * NEVER surface this through a group_filter attribute accessor/cast: the
+     * Filament alias form binds group_filter.* state paths directly, and an
+     * attribute-level union would be hydrated into the form and persisted into
+     * the manual filter on save (spec R1).
+     *
+     * @return array{selected_groups: array<string>, selected_vod_groups: array<string>, selected_categories: array<string>}
+     */
+    private function bouquetSelections(): array
+    {
+        if ($this->bouquetSelections !== null) {
+            return $this->bouquetSelections;
+        }
+
+        $merged = ['selected_groups' => [], 'selected_vod_groups' => [], 'selected_categories' => []];
+
+        // Orphaned aliases (no target) have no bouquet support - zero queries.
+        if (! $this->playlist_id && ! $this->custom_playlist_id && ! $this->merged_playlist_id) {
+            return $this->bouquetSelections = $merged;
+        }
+
+        // Merged aliases store pairs; reduce them to names so the name accessors
+        // and the has*Filter() predicates stay correct.
+        if ($this->merged_playlist_id) {
+            foreach ($this->bouquetSelectionPairs() as $key => $pairs) {
+                $merged[$key] = self::selectionNames($pairs);
+            }
+
+            return $this->bouquetSelections = $merged;
+        }
+
+        foreach ($this->attachedBouquets() as $bouquet) {
+            foreach ($merged as $key => $existing) {
+                $names = self::selectionNames($bouquet->group_selections[$key] ?? []);
+                if (! empty($names)) {
+                    $merged[$key] = array_merge($existing, $names);
+                }
+            }
+        }
+
+        return $this->bouquetSelections = $merged;
+    }
+
+    /**
+     * The merged {playlist_id, name} pairs of every attached bouquet, for a
+     * merged-playlist alias. Empty for every other target type (their bouquets
+     * carry bare names and are unioned by bouquetSelections()). Memoised.
+     *
+     * @return array{selected_groups: array<int, array{playlist_id: int, name: string}>, selected_vod_groups: array<int, array{playlist_id: int, name: string}>, selected_categories: array<int, array{playlist_id: int, name: string}>}
+     */
+    private function bouquetSelectionPairs(): array
+    {
+        if ($this->bouquetSelectionPairs !== null) {
+            return $this->bouquetSelectionPairs;
+        }
+
+        $merged = ['selected_groups' => [], 'selected_vod_groups' => [], 'selected_categories' => []];
+
+        if (! $this->merged_playlist_id) {
+            return $this->bouquetSelectionPairs = $merged;
+        }
+
+        foreach ($this->attachedBouquets() as $bouquet) {
+            foreach ($merged as $key => $existing) {
+                $merged[$key] = array_merge($existing, self::selectionPairs($bouquet->group_selections[$key] ?? []));
+            }
+        }
+
+        foreach ($merged as $key => $pairs) {
+            $merged[$key] = self::selectionPairs($pairs);
+        }
+
+        return $this->bouquetSelectionPairs = $merged;
+    }
+
+    /**
+     * Get the allowed live group names for this alias: the manual group_filter
+     * selection unioned with every attached bouquet's selection (empty = no
+     * restriction). With no bouquets attached the manual array is returned
+     * unchanged so existing behavior stays bit-for-bit identical.
      *
      * @return array<string>
      */
     public function getAllowedLiveGroupNames(): array
     {
-        return $this->group_filter['selected_groups'] ?? [];
+        return $this->allowedNamesFor('selected_groups');
     }
 
     /**
@@ -92,7 +202,7 @@ class PlaylistAlias extends Model
      */
     public function getAllowedVodGroupNames(): array
     {
-        return $this->group_filter['selected_vod_groups'] ?? [];
+        return $this->allowedNamesFor('selected_vod_groups');
     }
 
     /**
@@ -102,17 +212,193 @@ class PlaylistAlias extends Model
      */
     public function getAllowedCategoryNames(): array
     {
-        return $this->group_filter['selected_categories'] ?? [];
+        return $this->allowedNamesFor('selected_categories');
     }
 
     /**
-     * Whether this alias has any group/category filter applied.
+     * Source-scoped live group selection for merged-playlist aliases: the manual
+     * group_filter pairs unioned with every attached bouquet's pairs, one
+     * {playlist_id, name} per allowed provider group (empty = no restriction).
+     *
+     * @return array<int, array{playlist_id: int, name: string}>
+     */
+    public function getAllowedLiveGroupSelections(): array
+    {
+        return $this->allowedPairsFor('selected_groups');
+    }
+
+    /**
+     * Source-scoped VOD group selection for merged-playlist aliases.
+     *
+     * @return array<int, array{playlist_id: int, name: string}>
+     */
+    public function getAllowedVodGroupSelections(): array
+    {
+        return $this->allowedPairsFor('selected_vod_groups');
+    }
+
+    /**
+     * Source-scoped series category selection for merged-playlist aliases.
+     *
+     * @return array<int, array{playlist_id: int, name: string}>
+     */
+    public function getAllowedCategorySelections(): array
+    {
+        return $this->allowedPairsFor('selected_categories');
+    }
+
+    /**
+     * The manual group_filter pairs for a key unioned with every attached
+     * bouquet's pairs (merged-playlist aliases only; the union is empty for the
+     * other target types).
+     *
+     * @return array<int, array{playlist_id: int, name: string}>
+     */
+    private function allowedPairsFor(string $key): array
+    {
+        $manual = self::selectionPairs($this->group_filter[$key] ?? []);
+        $bouquet = $this->bouquetSelectionPairs()[$key];
+
+        if (empty($bouquet)) {
+            return $manual;
+        }
+
+        return self::selectionPairs(array_merge($manual, $bouquet));
+    }
+
+    /**
+     * Distinct names from a group_filter selection stored either as bare names
+     * (standard and custom playlist aliases) or as {playlist_id, name} pairs
+     * (merged playlist aliases).
+     *
+     * @return array<string>
+     */
+    public static function selectionNames(mixed $selection): array
+    {
+        if (! is_array($selection)) {
+            return [];
+        }
+
+        $names = [];
+        foreach ($selection as $item) {
+            $name = is_array($item) ? ($item['name'] ?? null) : $item;
+            if (is_string($name) && $name !== '') {
+                $names[] = $name;
+            }
+        }
+
+        return array_values(array_unique($names));
+    }
+
+    /**
+     * Well-formed {playlist_id, name} pairs from a merged alias selection. Bare
+     * names carry no source playlist and are dropped.
+     *
+     * @return array<int, array{playlist_id: int, name: string}>
+     */
+    public static function selectionPairs(mixed $selection): array
+    {
+        if (! is_array($selection)) {
+            return [];
+        }
+
+        $pairs = [];
+        foreach ($selection as $item) {
+            if (! is_array($item)) {
+                continue;
+            }
+            $playlistId = $item['playlist_id'] ?? null;
+            $name = $item['name'] ?? null;
+            if (! is_numeric($playlistId) || ! is_string($name) || $name === '') {
+                continue;
+            }
+            $pair = ['playlist_id' => (int) $playlistId, 'name' => $name];
+            $pairs[self::selectionToken($pair)] = $pair;
+        }
+
+        return array_values($pairs);
+    }
+
+    /**
+     * Stable identity of a {playlist_id, name} pair, so selections can be compared
+     * and diffed without nested loops.
+     *
+     * @param  array{playlist_id: int|string, name: string}  $pair
+     */
+    public static function selectionToken(array $pair): string
+    {
+        return ((int) $pair['playlist_id']).':'.$pair['name'];
+    }
+
+    /**
+     * @param  array<int, array{playlist_id: int, name: string}>  $pairs
+     * @return array<int, array<string>> playlist id => allowed names
+     */
+    private static function selectionNamesByPlaylist(array $pairs): array
+    {
+        $byPlaylist = [];
+        foreach ($pairs as $pair) {
+            $byPlaylist[$pair['playlist_id']][] = $pair['name'];
+        }
+
+        return $byPlaylist;
+    }
+
+    /**
+     * Whether a live group selection is in effect for this alias, from its stored
+     * group_filter (whatever its shape) or any attached bouquet. The merged-alias
+     * branches gate on these predicates rather than on the parsed pairs so a
+     * malformed selection fails closed instead of silently allowing every group.
+     */
+    public function hasLiveGroupFilter(): bool
+    {
+        return ! empty($this->group_filter['selected_groups'])
+            || ! empty($this->bouquetSelections()['selected_groups']);
+    }
+
+    /**
+     * Whether a VOD group selection is in effect, from group_filter or a bouquet.
+     */
+    public function hasVodGroupFilter(): bool
+    {
+        return ! empty($this->group_filter['selected_vod_groups'])
+            || ! empty($this->bouquetSelections()['selected_vod_groups']);
+    }
+
+    /**
+     * Whether a series category selection is in effect, from group_filter or a bouquet.
+     */
+    public function hasCategoryFilter(): bool
+    {
+        return ! empty($this->group_filter['selected_categories'])
+            || ! empty($this->bouquetSelections()['selected_categories']);
+    }
+
+    /**
+     * The manual group_filter selection for a key (parsed to names, whatever its
+     * stored shape) unioned with every attached bouquet's selection for that key.
+     *
+     * @return array<string>
+     */
+    private function allowedNamesFor(string $key): array
+    {
+        $manual = self::selectionNames($this->group_filter[$key] ?? []);
+        $bouquet = $this->bouquetSelections()[$key];
+
+        if (empty($bouquet)) {
+            return $manual;
+        }
+
+        return array_values(array_unique(array_merge($manual, $bouquet)));
+    }
+
+    /**
+     * Whether this alias has any group/category filter applied, from its manual
+     * selection or any attached bouquet.
      */
     public function hasGroupFilter(): bool
     {
-        return ! empty($this->group_filter['selected_groups'])
-            || ! empty($this->group_filter['selected_vod_groups'])
-            || ! empty($this->group_filter['selected_categories']);
+        return $this->hasLiveGroupFilter() || $this->hasVodGroupFilter() || $this->hasCategoryFilter();
     }
 
     /**
@@ -188,6 +474,11 @@ class PlaylistAlias extends Model
         return $this->belongsTo(CustomPlaylist::class);
     }
 
+    public function mergedPlaylist(): BelongsTo
+    {
+        return $this->belongsTo(MergedPlaylist::class);
+    }
+
     /**
      * Determine whether this alias auth credential is expired.
      */
@@ -215,7 +506,11 @@ class PlaylistAlias extends Model
             $this->load('customPlaylist');
         }
 
-        return $this->playlist ?? $this->customPlaylist;
+        if (! $this->relationLoaded('mergedPlaylist') && $this->merged_playlist_id) {
+            $this->load('mergedPlaylist');
+        }
+
+        return $this->playlist ?? $this->customPlaylist ?? $this->mergedPlaylist;
     }
 
     /**
@@ -271,6 +566,20 @@ class PlaylistAlias extends Model
         return $effectivePlaylist ? (int) ($effectivePlaylist->channel_start ?? 1) : 1;
     }
 
+    public function getForceChannelNumberingAttribute(): bool
+    {
+        $effectivePlaylist = $this->getEffectivePlaylist();
+
+        return $effectivePlaylist ? (bool) $effectivePlaylist->force_channel_numbering : false;
+    }
+
+    public function getSortByChannelNumberAttribute(): bool
+    {
+        $effectivePlaylist = $this->getEffectivePlaylist();
+
+        return $effectivePlaylist ? (bool) $effectivePlaylist->sort_by_channel_number : false;
+    }
+
     public function getDummyEpgAttribute(): bool
     {
         $effectivePlaylist = $this->getEffectivePlaylist();
@@ -290,6 +599,13 @@ class PlaylistAlias extends Model
         $effectivePlaylist = $this->getEffectivePlaylist();
 
         return $effectivePlaylist ? ($effectivePlaylist->dummy_epg_fallback_order ?? []) : [];
+    }
+
+    public function getDummyEpgDaysAttribute(): int
+    {
+        $effectivePlaylist = $this->getEffectivePlaylist();
+
+        return $effectivePlaylist ? (int) ($effectivePlaylist->dummy_epg_days ?? 5) : 5;
     }
 
     /**
@@ -326,11 +642,43 @@ class PlaylistAlias extends Model
             return collect();
         }
 
-        return $effectivePlaylist->groups();
+        $relation = $effectivePlaylist->groups();
+
+        if ($this->merged_playlist_id) {
+            // A merged alias only exposes the source groups it allows, so a filtered-out
+            // group never surfaces as an empty Xtream category. Each content type is
+            // scoped independently: no selection for a type leaves that type unfiltered,
+            // while a stored selection with no valid pairs fails closed for that type.
+            $liveSelections = $this->getAllowedLiveGroupSelections();
+            $vodSelections = $this->getAllowedVodGroupSelections();
+
+            if ($this->hasLiveGroupFilter() || $this->hasVodGroupFilter()) {
+                $relation->where(function ($query) use ($liveSelections, $vodSelections): void {
+                    $query->where(function ($query) use ($liveSelections): void {
+                        $query->where('groups.type', 'live');
+                        if ($this->hasLiveGroupFilter()) {
+                            $query->where(fn ($query) => $this->constrainGroupsToSourceGroups($query, $liveSelections));
+                        }
+                    })->orWhere(function ($query) use ($vodSelections): void {
+                        $query->where('groups.type', 'vod');
+                        if ($this->hasVodGroupFilter()) {
+                            $query->where(fn ($query) => $this->constrainGroupsToSourceGroups($query, $vodSelections));
+                        }
+                    });
+                });
+            }
+        }
+
+        return $relation;
     }
 
     public function groupTags()
     {
+        // Merged playlists have no per-playlist custom tags; only custom playlists do.
+        if ($this->merged_playlist_id) {
+            return collect();
+        }
+
         $effectivePlaylist = $this->getEffectivePlaylist();
         if (! $effectivePlaylist) {
             return collect();
@@ -344,6 +692,11 @@ class PlaylistAlias extends Model
      */
     public function categories()
     {
+        // MergedPlaylist exposes groups but not a categories() relationship.
+        if ($this->merged_playlist_id) {
+            return collect();
+        }
+
         $effectivePlaylist = $this->getEffectivePlaylist();
         if (! $effectivePlaylist) {
             return collect();
@@ -354,6 +707,10 @@ class PlaylistAlias extends Model
 
     public function categoryTags()
     {
+        if ($this->merged_playlist_id) {
+            return collect();
+        }
+
         $effectivePlaylist = $this->getEffectivePlaylist();
         if (! $effectivePlaylist) {
             return collect();
@@ -364,9 +721,54 @@ class PlaylistAlias extends Model
 
     public function channels(): BelongsToMany|HasManyThrough
     {
+        if ($this->merged_playlist_id) {
+            // Merged playlists pull their channels through the merged_playlist_playlist
+            // pivot, honouring the per-source include_live / include_vod toggles. This
+            // mirrors MergedPlaylist::channels() with the local key pointed at the alias.
+            $relation = $this->hasManyThrough(
+                Channel::class,
+                MergedPlaylistPivot::class,
+                'merged_playlist_id', // Foreign key on merged_playlist_playlist
+                'playlist_id', // Foreign key on Channel table
+                'merged_playlist_id', // Local key on PlaylistAlias table
+                'playlist_id' // Local key on merged_playlist_playlist
+            )->where(function ($query): void {
+                $query->where(function ($q): void {
+                    $q->where('channels.is_vod', false)->where('merged_playlist_playlist.include_live', true);
+                })->orWhere(function ($q): void {
+                    $q->where('channels.is_vod', true)->where('merged_playlist_playlist.include_vod', true);
+                });
+            })->where(MergedPlaylist::onlyUnmatchedChannels());
+
+            // The alias filter is stored as {playlist_id, name} pairs so a group can be
+            // allowed from one source without also allowing a same-named group from
+            // another. Matching mirrors the standard branch below, scoped per source. The
+            // stored selection, not the parsed pairs, gates each filter so a malformed
+            // selection fails closed (the constrain helpers emit 1 = 0) instead of
+            // silently allowing every group.
+            $liveSelections = $this->getAllowedLiveGroupSelections();
+            $vodSelections = $this->getAllowedVodGroupSelections();
+
+            if ($this->hasLiveGroupFilter()) {
+                $relation->where(function ($query) use ($liveSelections): void {
+                    $query->where('channels.is_vod', true)
+                        ->orWhere(fn ($query) => $this->constrainChannelsToSourceGroups($query, $liveSelections));
+                });
+            }
+
+            if ($this->hasVodGroupFilter()) {
+                $relation->where(function ($query) use ($vodSelections): void {
+                    $query->where('channels.is_vod', false)
+                        ->orWhere(fn ($query) => $this->constrainChannelsToSourceGroups($query, $vodSelections));
+                });
+            }
+
+            return $relation;
+        }
+
         if ($this->custom_playlist_id) {
             $relation = $this->belongsToMany(Channel::class, 'channel_custom_playlist', 'custom_playlist_id', 'channel_id', 'custom_playlist_id', 'id')
-                ->withPivot(['channel_number']);
+                ->withPivot(['channel_number', 'channel_minor']);
 
             // Custom playlists group their channels with per-playlist tags rather than
             // provider groups, so the filter is matched against the tag the channel carries
@@ -448,6 +850,25 @@ class PlaylistAlias extends Model
 
     public function series(): BelongsToMany|HasManyThrough
     {
+        if ($this->merged_playlist_id) {
+            $relation = $this->hasManyThrough(
+                Series::class,
+                MergedPlaylistPivot::class,
+                'merged_playlist_id', // Foreign key on merged_playlist_playlist
+                'playlist_id', // Foreign key on Series table
+                'merged_playlist_id', // Local key on PlaylistAlias table
+                'playlist_id' // Local key on merged_playlist_playlist
+            )->where('merged_playlist_playlist.include_series', true)
+                ->where(MergedPlaylist::onlyUnmatchedSeries('series'));
+
+            $categorySelections = $this->getAllowedCategorySelections();
+            if ($this->hasCategoryFilter()) {
+                $relation->where(fn ($query) => $this->constrainSeriesToSourceCategories($query, $categorySelections));
+            }
+
+            return $relation;
+        }
+
         if ($this->custom_playlist_id) {
             $relation = $this->belongsToMany(Series::class, 'series_custom_playlist', 'custom_playlist_id', 'series_id', 'custom_playlist_id', 'id');
 
@@ -548,6 +969,133 @@ class PlaylistAlias extends Model
                     ->whereIn('categories.name', $allowedNames);
             });
         });
+    }
+
+    /**
+     * Restrict a channels query to the source-scoped groups a merged alias allows:
+     * for each source playlist, channels whose provider group (group_internal) is in
+     * that playlist's allowed names. Custom channels follow the same fallback as the
+     * standard alias filter: matched on their user-assigned group name, or passed
+     * through when ungrouped.
+     *
+     * Public so the guest panel can reuse the exact same matching rules against
+     * queries that are not built from the channels() relationship.
+     *
+     * @param  array<int, array{playlist_id: int, name: string}>  $selections
+     */
+    public function constrainChannelsToSourceGroups($query, array $selections): void
+    {
+        $namesByPlaylist = self::selectionNamesByPlaylist($selections);
+
+        if (empty($namesByPlaylist)) {
+            $query->whereRaw('1 = 0');
+
+            return;
+        }
+
+        $query->where(function ($query) use ($namesByPlaylist): void {
+            foreach ($namesByPlaylist as $playlistId => $names) {
+                $query->orWhere(function ($query) use ($playlistId, $names): void {
+                    $query->where('channels.playlist_id', $playlistId)
+                        ->where(function ($query) use ($names): void {
+                            $query->whereIn('channels.group_internal', $names)
+                                ->orWhere(function ($query) use ($names): void {
+                                    $query->where('channels.is_custom', true)
+                                        ->where(function ($query) use ($names): void {
+                                            $query->whereNull('channels.group')
+                                                ->orWhereIn('channels.group', $names);
+                                        });
+                                });
+                        });
+                });
+            }
+        });
+    }
+
+    /**
+     * Restrict a groups query to the source-scoped groups a merged alias allows,
+     * matched on the provider-supplied name_internal within each source playlist.
+     *
+     * @param  array<int, array{playlist_id: int, name: string}>  $selections
+     */
+    public function constrainGroupsToSourceGroups($query, array $selections): void
+    {
+        $namesByPlaylist = self::selectionNamesByPlaylist($selections);
+
+        if (empty($namesByPlaylist)) {
+            $query->whereRaw('1 = 0');
+
+            return;
+        }
+
+        $query->where(function ($query) use ($namesByPlaylist): void {
+            foreach ($namesByPlaylist as $playlistId => $names) {
+                $query->orWhere(function ($query) use ($playlistId, $names): void {
+                    $query->where('groups.playlist_id', $playlistId)
+                        ->whereIn('groups.name_internal', $names);
+                });
+            }
+        });
+    }
+
+    /**
+     * Restrict a series query to the source-scoped categories a merged alias allows.
+     * Names are resolved to each source playlist's own source_category_id so one
+     * provider's numeric category id can never match another provider's.
+     *
+     * @param  array<int, array{playlist_id: int, name: string}>  $selections
+     */
+    public function constrainSeriesToSourceCategories($query, array $selections): void
+    {
+        $idsByPlaylist = $this->resolveSourceCategoryIds($selections);
+
+        if (empty($idsByPlaylist)) {
+            $query->whereRaw('1 = 0');
+
+            return;
+        }
+
+        $query->where(function ($query) use ($idsByPlaylist): void {
+            foreach ($idsByPlaylist as $playlistId => $sourceCategoryIds) {
+                $query->orWhere(function ($query) use ($playlistId, $sourceCategoryIds): void {
+                    $query->where('series.playlist_id', $playlistId)
+                        ->whereIn('series.source_category_id', $sourceCategoryIds);
+                });
+            }
+        });
+    }
+
+    /**
+     * Resolve {playlist_id, name} category selections to playlist id => source
+     * category ids, memoised because the filter is applied per query.
+     *
+     * @param  array<int, array{playlist_id: int, name: string}>  $selections
+     * @return array<int, array<int>>
+     */
+    private function resolveSourceCategoryIds(array $selections): array
+    {
+        if ($this->resolvedSourceCategoryIds !== null) {
+            return $this->resolvedSourceCategoryIds;
+        }
+
+        $namesByPlaylist = self::selectionNamesByPlaylist($selections);
+
+        if (empty($namesByPlaylist)) {
+            return $this->resolvedSourceCategoryIds = [];
+        }
+
+        return $this->resolvedSourceCategoryIds = SourceCategory::query()
+            ->where(function ($query) use ($namesByPlaylist): void {
+                foreach ($namesByPlaylist as $playlistId => $names) {
+                    $query->orWhere(function ($query) use ($playlistId, $names): void {
+                        $query->where('playlist_id', $playlistId)->whereIn('name', $names);
+                    });
+                }
+            })
+            ->get(['playlist_id', 'source_category_id'])
+            ->groupBy('playlist_id')
+            ->map(fn ($rows) => $rows->pluck('source_category_id')->map(fn ($id) => (int) $id)->unique()->values()->all())
+            ->all();
     }
 
     /**
@@ -718,138 +1266,251 @@ class PlaylistAlias extends Model
     }
 
     /**
-     * Transform channel URL to use this alias's provider config.
+     * Transform channel URL using this alias's provider entries.
      *
-     * For M3U-imported playlists that have no stored xtream_config, credentials are
-     * parsed directly from the stream URL. The extracted provider URL must match one
-     * of the alias's configured providers — this is both the selection mechanism for
-     * multi-provider aliases and the guard against rewriting non-Xtream CDN URLs.
+     * Each entry's `url` is the provider URL used to decide which streams the entry
+     * applies to. A matching stream gets the entry's credentials swapped in (when set)
+     * and, when URL replacement is enabled, its provider URL replaced with the entry's
+     * `replace_url`. Streams that match no entry are returned untouched.
      */
     public function transformChannelUrl(Channel $channel): string
     {
         $originalUrl = $channel->url_custom ?: ($channel->url ?? '');
 
-        // We need at least one alias xtream config to do any transformation.
-        $primaryAliasConfig = $this->getPrimaryXtreamConfig();
-        if (! $primaryAliasConfig) {
-            return $originalUrl;
-        }
-
-        $effectivePlaylist = $channel->getEffectivePlaylist();
-        [$sourceConfig, $aliasConfig] = $this->resolveSourceAndAliasConfig(
-            $originalUrl,
-            $effectivePlaylist?->xtream_config,
-            $primaryAliasConfig,
-        );
-
-        if (! $sourceConfig) {
-            return $originalUrl;
-        }
-
-        return $this->transformUrl($originalUrl, $sourceConfig, $aliasConfig);
+        return $this->transformStreamUrl($originalUrl, $channel->getEffectivePlaylist()?->xtream_config);
     }
 
     /**
-     * Transform episode URL to use this alias's provider config.
+     * Transform episode URL using this alias's provider entries.
      *
-     * For M3U-imported playlists that have no stored xtream_config, credentials are
-     * parsed directly from the stream URL. The extracted provider URL must match one
-     * of the alias's configured providers — this is both the selection mechanism for
-     * multi-provider aliases and the guard against rewriting non-Xtream CDN URLs.
+     * See transformChannelUrl() for how entries are matched and applied.
      */
     public function transformEpisodeUrl(Episode $episode): string
     {
-        $originalUrl = $episode->url ?? '';
-
-        // We need at least one alias xtream config to do any transformation.
-        $primaryAliasConfig = $this->getPrimaryXtreamConfig();
-        if (! $primaryAliasConfig) {
-            return $originalUrl;
-        }
-
-        $effectivePlaylist = $episode->getEffectivePlaylist();
-        [$sourceConfig, $aliasConfig] = $this->resolveSourceAndAliasConfig(
-            $originalUrl,
-            $effectivePlaylist?->xtream_config,
-            $primaryAliasConfig,
-        );
-
-        if (! $sourceConfig) {
-            return $originalUrl;
-        }
-
-        return $this->transformUrl($originalUrl, $sourceConfig, $aliasConfig);
+        return $this->transformStreamUrl($episode->url ?? '', $episode->getEffectivePlaylist()?->xtream_config);
     }
 
     /**
-     * Resolve the source config and best-matching alias config for a stream URL.
+     * Apply only this alias's provider URL replacement to an already-resolved stream URL.
      *
-     * For Xtream playlists the stored xtream_config is the source of truth.
-     * For M3U playlists (no stored config) credentials are parsed from the stream URL,
-     * but only if the extracted provider URL is already known to this alias — unknown
-     * URLs are left untouched rather than rewritten with the wrong credentials.
+     * Used by the proxy when a provider profile of the source playlist has already
+     * picked the credentials: the profile's credentials are kept, and the provider URL
+     * is swapped when the matching entry has URL replacement enabled.
      *
      * @param  array<string,mixed>|null  $playlistXtreamConfig
-     * @param  array<string,mixed>  $primaryAliasConfig
-     * @return array{0: array<string,mixed>|null, 1: array<string,mixed>}
      */
-    private function resolveSourceAndAliasConfig(
-        string $streamUrl,
-        ?array $playlistXtreamConfig,
-        array $primaryAliasConfig,
-    ): array {
-        if ($playlistXtreamConfig) {
-            // Xtream playlist: use the stored source config and pick the best alias match.
-            $aliasConfig = $this->findXtreamConfigByUrl((string) ($playlistXtreamConfig['url'] ?? '')) ?? $primaryAliasConfig;
-
-            return [$playlistXtreamConfig, $aliasConfig];
+    public function replaceProviderUrl(string $url, ?array $playlistXtreamConfig): string
+    {
+        $match = $this->matchProviderEntry($url, $playlistXtreamConfig);
+        if (! $match) {
+            return $url;
         }
 
-        // M3U playlist: extract credentials from the stream URL itself.
-        $parsedConfig = self::parseXtreamStreamUrl($streamUrl);
-        if (! $parsedConfig) {
-            return [null, $primaryAliasConfig];
-        }
+        [$entry, $sourceConfig] = $match;
 
-        // The extracted provider URL must match a config the user has explicitly
-        // registered in this alias. This acts as the multi-provider selector and
-        // prevents accidental rewrites of non-Xtream CDN URLs.
-        $aliasConfig = $this->findXtreamConfigByUrl($parsedConfig['url']);
-        if (! $aliasConfig) {
-            return [null, $primaryAliasConfig];
-        }
-
-        return [$parsedConfig, $aliasConfig];
+        return $this->swapProviderBaseUrl($url, (string) ($sourceConfig['url'] ?? ''), $entry) ?? $url;
     }
 
     /**
-     * Transform URL from source config to alias config
+     * Whether a provider entry has its own credentials to swap in.
+     *
+     * @param  array<string,mixed>  $entry
      */
-    private function transformUrl(
-        string $originalUrl,
-        array $sourceConfig,
-        array $aliasConfig
-    ): string {
-        // Extract source provider details safely
-        $sourceBaseUrl = rtrim((string) ($sourceConfig['url'] ?? ''), '/');
-        $sourceUsername = (string) ($sourceConfig['username'] ?? '');
-        $sourcePassword = (string) ($sourceConfig['password'] ?? '');
+    public static function entryHasCredentials(array $entry): bool
+    {
+        return filled($entry['username'] ?? null) && filled($entry['password'] ?? null);
+    }
 
-        // Extract alias provider details safely
-        $aliasBaseUrl = rtrim((string) ($aliasConfig['url'] ?? ''), '/');
-        $aliasUsername = (string) ($aliasConfig['username'] ?? '');
-        $aliasPassword = (string) ($aliasConfig['password'] ?? '');
+    /**
+     * Whether a provider entry replaces the provider URL clients receive.
+     *
+     * @param  array<string,mixed>  $entry
+     */
+    public static function entryReplacesUrl(array $entry): bool
+    {
+        return (bool) ($entry['replace_url_enabled'] ?? false) && filled($entry['replace_url'] ?? null);
+    }
 
-        // If any required value is missing, do not attempt to transform
-        if (
-            $sourceBaseUrl === '' ||
-            $sourceUsername === '' ||
-            $sourcePassword === '' ||
-            $aliasBaseUrl === '' ||
-            $aliasUsername === '' ||
-            $aliasPassword === ''
-        ) {
+    /**
+     * The first provider entry that has its own credentials, for calls that talk to the
+     * provider's Xtream API as this alias (stats, connection info).
+     *
+     * @return array<string,mixed>|null
+     */
+    public function getPrimaryCredentialConfig(): ?array
+    {
+        foreach ($this->xtream_config as $entry) {
+            if (self::entryHasCredentials($entry)) {
+                return $entry;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param  array<string,mixed>|null  $playlistXtreamConfig
+     */
+    private function transformStreamUrl(string $originalUrl, ?array $playlistXtreamConfig): string
+    {
+        $match = $this->matchProviderEntry($originalUrl, $playlistXtreamConfig);
+        if (! $match) {
             return $originalUrl;
+        }
+
+        [$entry, $sourceConfig] = $match;
+
+        return $this->rewriteStreamUrl($originalUrl, $sourceConfig, $entry);
+    }
+
+    /**
+     * Find the provider entry that applies to a stream URL, along with the source config
+     * describing what the URL currently contains.
+     *
+     * For Xtream playlists the stored xtream_config is the source of truth, and the entry
+     * whose provider URL matches it is used. When none matches, a standard-playlist or
+     * single-entry alias falls back to its first entry (e.g. after the playlist's DNS
+     * failover moved it to another URL); a multi-provider alias leaves the stream alone
+     * rather than applying another provider's entry. For M3U playlists (no stored config) the entry
+     * is the one whose provider URL the stream URL starts with; credentials are parsed from
+     * the stream URL when it is Xtream-shaped.
+     *
+     * @param  array<string,mixed>|null  $playlistXtreamConfig
+     * @return array{0: array<string,mixed>, 1: array<string,mixed>}|null
+     */
+    private function matchProviderEntry(string $streamUrl, ?array $playlistXtreamConfig): ?array
+    {
+        $primaryEntry = $this->getPrimaryXtreamConfig();
+        if (! $primaryEntry || $streamUrl === '') {
+            return null;
+        }
+
+        if ($playlistXtreamConfig) {
+            $entry = $this->findXtreamConfigByUrl((string) ($playlistXtreamConfig['url'] ?? ''));
+
+            if (! $entry && ($this->playlist_id !== null || count($this->xtream_config) === 1)) {
+                $entry = $primaryEntry;
+            }
+
+            return $entry ? [$entry, $playlistXtreamConfig] : null;
+        }
+
+        $entry = $this->findEntryForStreamUrl($streamUrl);
+        if (! $entry) {
+            return null;
+        }
+
+        $entryUrl = rtrim((string) $entry['url'], '/');
+        $parsedConfig = self::parseXtreamStreamUrl($streamUrl);
+        $sourceConfig = $parsedConfig && strcasecmp(rtrim($parsedConfig['url'], '/'), $entryUrl) === 0
+            ? $parsedConfig
+            : ['url' => substr($streamUrl, 0, strlen($entryUrl))];
+
+        return [$entry, $sourceConfig];
+    }
+
+    /**
+     * Find the entry whose provider URL the stream URL starts with (longest match wins).
+     *
+     * @return array<string,mixed>|null
+     */
+    private function findEntryForStreamUrl(string $streamUrl): ?array
+    {
+        $bestEntry = null;
+        $bestLength = 0;
+
+        foreach ($this->xtream_config as $entry) {
+            $entryUrl = rtrim((string) ($entry['url'] ?? ''), '/');
+            if ($entryUrl !== '' && strlen($entryUrl) > $bestLength && self::urlStartsWithBase($streamUrl, $entryUrl)) {
+                $bestEntry = $entry;
+                $bestLength = strlen($entryUrl);
+            }
+        }
+
+        return $bestEntry;
+    }
+
+    /**
+     * Rewrite a stream URL from its source config to a provider entry.
+     *
+     * @param  array<string,mixed>  $sourceConfig
+     * @param  array<string,mixed>  $entry
+     */
+    private function rewriteStreamUrl(string $originalUrl, array $sourceConfig, array $entry): string
+    {
+        $sourceBaseUrl = rtrim((string) ($sourceConfig['url'] ?? ''), '/');
+
+        if (self::entryHasCredentials($entry)) {
+            $outputBaseUrl = self::entryReplacesUrl($entry)
+                ? rtrim((string) $entry['replace_url'], '/')
+                : rtrim((string) ($entry['url'] ?? ''), '/');
+
+            $rewritten = $this->swapCredentials(
+                $originalUrl,
+                $sourceBaseUrl,
+                (string) ($sourceConfig['username'] ?? ''),
+                (string) ($sourceConfig['password'] ?? ''),
+                $outputBaseUrl,
+                (string) $entry['username'],
+                (string) $entry['password'],
+            );
+
+            if ($rewritten !== null) {
+                return $rewritten;
+            }
+        }
+
+        return $this->swapProviderBaseUrl($originalUrl, $sourceBaseUrl, $entry) ?? $originalUrl;
+    }
+
+    /**
+     * Replace the provider URL at the start of a stream URL with the entry's replacement
+     * URL, keeping the rest of the URL (path, credentials, stream ID) as it is.
+     *
+     * @param  array<string,mixed>  $entry
+     */
+    private function swapProviderBaseUrl(string $url, string $sourceBaseUrl, array $entry): ?string
+    {
+        if (! self::entryReplacesUrl($entry)) {
+            return null;
+        }
+
+        $replaceUrl = rtrim((string) $entry['replace_url'], '/');
+
+        foreach ([rtrim($sourceBaseUrl, '/'), rtrim((string) ($entry['url'] ?? ''), '/')] as $baseUrl) {
+            if ($baseUrl !== '' && self::urlStartsWithBase($url, $baseUrl)) {
+                return $replaceUrl.substr($url, strlen($baseUrl));
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Whether a URL is the base URL or a path beneath it (case-insensitive).
+     */
+    private static function urlStartsWithBase(string $url, string $baseUrl): bool
+    {
+        return strcasecmp($url, $baseUrl) === 0
+            || str_starts_with(strtolower($url), strtolower($baseUrl).'/');
+    }
+
+    /**
+     * Swap the credentials (and base URL) of an Xtream-style stream URL.
+     *
+     * Returns null when the URL does not carry the source credentials.
+     */
+    private function swapCredentials(
+        string $originalUrl,
+        string $sourceBaseUrl,
+        string $sourceUsername,
+        string $sourcePassword,
+        string $outputBaseUrl,
+        string $outputUsername,
+        string $outputPassword,
+    ): ?string {
+        if ($sourceBaseUrl === '' || $sourceUsername === '' || $sourcePassword === '' || $outputBaseUrl === '') {
+            return null;
         }
 
         // Pattern matches:
@@ -861,10 +1522,7 @@ class PlaylistAlias extends Model
             '/(.+)$#';
 
         if (preg_match($pattern, $originalUrl, $matches)) {
-            $streamType = $matches[1];
-            $streamIdAndExtension = $matches[2];
-
-            return "{$aliasBaseUrl}/{$streamType}/{$aliasUsername}/{$aliasPassword}/{$streamIdAndExtension}";
+            return "{$outputBaseUrl}/{$matches[1]}/{$outputUsername}/{$outputPassword}/{$matches[2]}";
         }
 
         // Prefix-less live form (common in M3U exports):
@@ -876,10 +1534,10 @@ class PlaylistAlias extends Model
             '/(.+)$#';
 
         if (preg_match($pattern, $originalUrl, $matches)) {
-            return "{$aliasBaseUrl}/{$aliasUsername}/{$aliasPassword}/{$matches[1]}";
+            return "{$outputBaseUrl}/{$outputUsername}/{$outputPassword}/{$matches[1]}";
         }
 
-        return $originalUrl;
+        return null;
     }
 
     /**
@@ -925,5 +1583,54 @@ class PlaylistAlias extends Model
     public function playlistViewers(): MorphMany
     {
         return $this->morphMany(PlaylistViewer::class, 'viewerable');
+    }
+
+    public function bouquets(): BelongsToMany
+    {
+        return $this->belongsToMany(Bouquet::class, 'bouquet_playlist_alias')
+            ->using(BouquetPlaylistAlias::class);
+    }
+
+    /**
+     * Companion fix to the bouquet rename propagation: rewrite provider group
+     * renames into the playlist's aliases' manual group_filter (and, for live,
+     * the custom sort order), which previously went silently stale. Quiet saves:
+     * output is identical before and after (names track the provider), so no
+     * EPG-cache invalidation or other update side effects are wanted.
+     *
+     * @param  array<string, string>  $renames
+     */
+    public static function applyProviderGroupRenames(int $playlistId, string $type, array $renames): void
+    {
+        $key = $type === 'vod' ? 'selected_vod_groups' : 'selected_groups';
+
+        self::where('playlist_id', $playlistId)->cursor()->each(function (self $alias) use ($key, $type, $renames): void {
+            $filter = $alias->group_filter ?? [];
+            $changed = false;
+
+            $map = function (array $names) use ($renames): array {
+                return array_values(array_unique(
+                    array_map(fn (string $name): string => $renames[$name] ?? $name, $names)
+                ));
+            };
+
+            $current = $filter[$key] ?? [];
+            if (! empty($current) && ($updated = $map($current)) !== $current) {
+                $filter[$key] = $updated;
+                $changed = true;
+            }
+
+            if ($type === 'live') {
+                $order = $filter['live_group_order'] ?? [];
+                if (! empty($order) && ($updatedOrder = $map($order)) !== $order) {
+                    $filter['live_group_order'] = $updatedOrder;
+                    $changed = true;
+                }
+            }
+
+            if ($changed) {
+                $alias->updateQuietly(['group_filter' => $filter]);
+            }
+        });
     }
 }

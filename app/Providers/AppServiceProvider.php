@@ -19,11 +19,13 @@ use App\Listeners\AlertOnJobFailed;
 use App\Listeners\PersistUserLocale;
 use App\Livewire\BackupDestinationListRecords;
 use App\Livewire\TmdbSearch;
+use App\Models\Bouquet;
 use App\Models\Channel;
 use App\Models\ChannelFailover;
 use App\Models\ChannelScrubber;
 use App\Models\CustomPlaylist;
 use App\Models\Epg;
+use App\Models\EpgMap;
 use App\Models\Group;
 use App\Models\MediaServerIntegration;
 use App\Models\MergedPlaylist;
@@ -43,7 +45,12 @@ use App\Services\NetworkChannelSyncService;
 use App\Services\PlaylistService;
 use App\Services\ProxyService;
 use App\Services\SortService;
+use App\Services\TagRenamePropagationService;
 use App\Settings\GeneralSettings;
+use App\Support\ApiDocs\DocumentDvrAuthenticationErrors;
+use App\Support\ApiDocs\DocumentXtreamApiResponses;
+use App\Support\ApiDocs\MergeSameStatusResponses;
+use App\Support\ApiDocs\PruneUnreferencedSchemas;
 use App\Support\CopilotProvider;
 use CraftForge\FilamentLanguageSwitcher\Events\LocaleChanged;
 use Dedoc\Scramble\Scramble;
@@ -67,6 +74,7 @@ use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Http\Request;
 use Illuminate\Queue\Events\JobFailed;
+use Illuminate\Queue\Events\JobProcessing;
 use Illuminate\Routing\Route;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
@@ -79,6 +87,7 @@ use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\URL;
 use Illuminate\Support\ServiceProvider;
 use Illuminate\Support\Str;
+use InvalidArgumentException;
 use Laravel\Ai\AiManager;
 use Livewire\Livewire;
 use PDO;
@@ -96,17 +105,17 @@ class AppServiceProvider extends ServiceProvider
     {
         $this->app->bind(FilamentNotification::class, AppNotification::class);
 
-        // Override the Laravel AI manager to fix a strict-mode tool schema bug
-        // where tools with no parameters are missing the required `parameters`
-        // object, causing OpenAI to return a 400 invalid_function_parameters error.
+        // Override the Laravel AI manager so Gemini tools with no required
+        // parameters omit `required` instead of sending an empty array, which
+        // Gemini rejects with a 400 INVALID_ARGUMENT error.
         $this->app->scoped(AiManager::class, fn ($app) => new PatchedAiManager($app));
 
         $this->app->singleton(GitInfoService::class);
 
         // Detect HTTPS before any provider boot() runs, so package providers
-        // calling asset() during their boot() (e.g. filament-copilot) get the
-        // correct scheme. We can't rely on TrustProxies middleware here — it
-        // runs after all providers have booted.
+        // calling asset() during their boot() get the correct scheme. We can't
+        // rely on TrustProxies middleware here, since it runs after all
+        // providers have booted.
         $this->app->booting(function () {
             if (! $this->app->runningInConsole()) {
                 $this->configureDynamicHttpsDetection();
@@ -186,6 +195,16 @@ class AppServiceProvider extends ServiceProvider
 
         // Apply user-defined timezone (when TZ env var is not set)
         $this->applyTimezoneFromSettings();
+
+        // Queue workers (Horizon) boot the application once and stay alive
+        // for days, so a timezone change made in Preferences after a worker
+        // started would otherwise never be picked up by that worker. Re-apply
+        // it before every job so queued jobs (e.g. CreateBackup, whose
+        // filename is generated from the current timezone) stay in sync with
+        // what's configured, without requiring a worker restart.
+        Event::listen(JobProcessing::class, function (): void {
+            $this->applyTimezoneFromSettings();
+        });
 
         // Inject Copilot API key from settings into the Laravel AI config
         $this->applyCopilotApiKeyFromSettings();
@@ -340,6 +359,22 @@ class AppServiceProvider extends ServiceProvider
             return Limit::perMinute(60)->by(optional($request->user())->id ?: $request->ip());
         });
 
+        // Named separately as well as keyed by route class: even callbacks from
+        // the same proxy IP/token cannot consume another callback's allowance.
+        foreach (['resolver', 'webhook', 'broadcast', 'dvr'] as $callback) {
+            RateLimiter::for('m3u-proxy-callback-'.$callback, function (Request $request) use ($callback) {
+                $configured = config('proxy.callback_rate_limits.'.$callback, 120);
+                $limit = is_int($configured) || is_string($configured)
+                    ? filter_var($configured, FILTER_VALIDATE_INT, [
+                        'options' => ['min_range' => 1, 'max_range' => 60000],
+                    ])
+                    : false;
+
+                return Limit::perMinute($limit === false ? 120 : $limit)
+                    ->by($callback.'|'.$request->route()->getDomain().'|'.$request->ip());
+            });
+        }
+
         // Note: Proxy rate limiting is handled by ProxyRateLimitMiddleware for better performance
 
         // Gate the copilot stream endpoint behind the use_ai_copilot permission.
@@ -489,6 +524,16 @@ class AppServiceProvider extends ServiceProvider
                 if ($playlist->isDirty($fields)) {
                     EpgCacheService::clearPlaylistEpgCacheFile($playlist);
                 }
+                EpgCacheService::clearIfTvgIdsRenumbered($playlist);
+
+                // Keep auto-generated EPG map names in sync when the playlist is renamed
+                if ($playlist->wasChanged('name')) {
+                    $previousName = $playlist->getOriginal('name');
+                    $playlist->epgMaps()->with('epg:id,name')->lazy()->each(function (EpgMap $map) use ($playlist, $previousName) {
+                        $map->setRelation('playlist', $playlist);
+                        $map->syncGeneratedName(previousPlaylistName: $previousName);
+                    });
+                }
 
                 // Fire the updated event
                 event(new PlaylistUpdated($playlist));
@@ -565,7 +610,18 @@ class AppServiceProvider extends ServiceProvider
 
             // Process epg on creation
             Epg::created(fn (Epg $epg) => event(new EpgCreated($epg)));
-            Epg::updated(fn (Epg $epg) => event(new EpgUpdated($epg)));
+            Epg::updated(function (Epg $epg) {
+                // Keep auto-generated EPG map names in sync when the EPG is renamed
+                if ($epg->wasChanged('name')) {
+                    $previousName = $epg->getOriginal('name');
+                    $epg->epgMaps()->with('playlist:id,name')->lazy()->each(function (EpgMap $map) use ($epg, $previousName) {
+                        $map->setRelation('epg', $epg);
+                        $map->syncGeneratedName(previousEpgName: $previousName);
+                    });
+                }
+
+                event(new EpgUpdated($epg));
+            });
             Epg::creating(function (Epg $epg) {
                 if (! $epg->user_id) {
                     $epg->user_id = auth()->id();
@@ -581,6 +637,18 @@ class AppServiceProvider extends ServiceProvider
                 if (! $epg->sync_interval) {
                     $epg->sync_interval = '0 */6 * * *';
                 }
+                // New Schedules Direct credentials lift a recorded permanent login
+                // rejection, so the next sync tries them. A different username is a
+                // different provider account, so its login cooldown no longer applies.
+                if ($epg->isDirty(['sd_username', 'sd_password'])) {
+                    $epg->sd_auth_blocked_code = null;
+                    $epg->sd_auth_blocked_message = null;
+                }
+                if ($epg->isDirty('sd_username')) {
+                    $epg->sd_login_cooldown_until = null;
+                    $epg->sd_cooldown_reason = null;
+                    $epg->sd_backoff_attempts = 0;
+                }
 
                 return $epg;
             });
@@ -592,6 +660,25 @@ class AppServiceProvider extends ServiceProvider
                 event(new EpgDeleted($epg));
 
                 return $epg;
+            });
+
+            // Re-derive an EPG map's auto-generated name when it is re-pointed
+            // to a different EPG and/or playlist (e.g. via the resource edit
+            // form, which has no name field). Manually renamed maps are left
+            // untouched by syncGeneratedName().
+            EpgMap::updated(function (EpgMap $map) {
+                if (! $map->wasChanged(['epg_id', 'playlist_id'])) {
+                    return;
+                }
+
+                $previousEpgName = optional(Epg::find($map->getOriginal('epg_id')))->name;
+                $previousPlaylistId = $map->getOriginal('playlist_id');
+                $previousPlaylistName = $previousPlaylistId
+                    ? optional(Playlist::find($previousPlaylistId))->name
+                    : null;
+
+                $map->load(['epg:id,name', 'playlist:id,name']);
+                $map->syncGeneratedName($previousEpgName, $previousPlaylistName);
             });
 
             // Merged playlist
@@ -618,6 +705,7 @@ class AppServiceProvider extends ServiceProvider
 
                 return $mergedPlaylist;
             });
+            MergedPlaylist::updated(fn (MergedPlaylist $mergedPlaylist) => EpgCacheService::clearIfTvgIdsRenumbered($mergedPlaylist));
             MergedPlaylist::deleting(function (MergedPlaylist $mergedPlaylist) {
                 // Remove short URLs
                 $mergedPlaylist->removeShortUrls();
@@ -668,6 +756,7 @@ class AppServiceProvider extends ServiceProvider
 
                 return $customPlaylist;
             });
+            CustomPlaylist::updated(fn (CustomPlaylist $customPlaylist) => EpgCacheService::clearIfTvgIdsRenumbered($customPlaylist));
             CustomPlaylist::deleting(function (CustomPlaylist $customPlaylist) {
                 // Remove short URLs
                 $customPlaylist->removeShortUrls();
@@ -701,11 +790,47 @@ class AppServiceProvider extends ServiceProvider
                 }
             });
 
+            // Custom playlist group/category tags: propagate renames into bouquets
+            // and alias group filters (issue #1391). See TagRenamePropagationService.
+            Tag::updated(fn (Tag $tag) => TagRenamePropagationService::handle($tag));
+
             // Auto-generate UUID for channels
             Channel::creating(function (Channel $channel) {
                 if (empty($channel->uuid)) {
                     $channel->uuid = Str::orderedUuid()->toString();
                 }
+            });
+
+            // A changed EPG mapping is saved immediately, but the generated XMLTV/gzip output
+            // files are served from an output cache that is otherwise only invalidated by the
+            // sync/mapping job chains. Without this, a manual EPG reassignment through the
+            // Channel edit form or the EPG viewer leaves stale output files with the old
+            // channel's programmes until that cache's own TTL expires.
+            Channel::updated(function (Channel $channel) {
+                if (! $channel->wasChanged('epg_channel_id')) {
+                    return;
+                }
+
+                $channel->loadMissing(['playlist.mergedPlaylists', 'customPlaylists']);
+
+                $affectedPlaylists = collect();
+                if ($channel->playlist) {
+                    $affectedPlaylists->push($channel->playlist);
+                    foreach ($channel->playlist->mergedPlaylists as $merged) {
+                        $affectedPlaylists->push($merged);
+                    }
+                }
+                foreach ($channel->customPlaylists as $custom) {
+                    $affectedPlaylists->push($custom);
+                }
+
+                // clearPlaylistEpgCacheFile() returns false when there was no cached file to
+                // remove; Collection::each() stops iterating the first time its callback
+                // returns exactly false, so the callback must not forward that return value.
+                $affectedPlaylists->unique(fn ($p) => $p->getTable().'-'.$p->id)
+                    ->each(function ($p) {
+                        EpgCacheService::clearPlaylistEpgCacheFile($p);
+                    });
             });
 
             // Failover channels
@@ -751,10 +876,20 @@ class AppServiceProvider extends ServiceProvider
                         $playlistAlias->generateShortUrl();
                     }
                 }
-                if ($playlistAlias->isDirty(['playlist_id', 'custom_playlist_id'])) {
+                if ($playlistAlias->isDirty(['playlist_id', 'custom_playlist_id', 'merged_playlist_id'])) {
                     // The alias now points at a different playlist/custom playlist, so its
                     // cached EPG XML (generated against the previous target) is stale.
                     EpgCacheService::clearPlaylistEpgCacheFile($playlistAlias);
+
+                    // Bouquets only apply to aliases of their own playlist (see the
+                    // BouquetPlaylistAlias attach guard), so the previous target's
+                    // bouquets would otherwise keep filtering the new one.
+                    $staleBouquetIds = $playlistAlias->bouquets()->get()
+                        ->reject(fn (Bouquet $bouquet): bool => $bouquet->appliesTo($playlistAlias))
+                        ->modelKeys();
+                    if ($staleBouquetIds !== []) {
+                        $playlistAlias->bouquets()->detach($staleBouquetIds);
+                    }
                 }
 
                 return $playlistAlias;
@@ -769,6 +904,66 @@ class AppServiceProvider extends ServiceProvider
                     ->delete();
 
                 return $playlistAlias;
+            });
+
+            // Bouquets (issue #1391)
+            //
+            // Everything hangs off `saving`, which fires before `creating` on a new
+            // model: the owner has to be assigned before the ownership check below
+            // runs, so a bouquet created without an explicit user_id (relying on the
+            // auth()->id() fallback) still passes it.
+            Bouquet::saving(function (Bouquet $bouquet) {
+                if (! $bouquet->user_id) {
+                    $bouquet->user_id = auth()->id();
+                }
+
+                $hasPlaylist = $bouquet->playlist_id !== null;
+                $hasCustom = $bouquet->custom_playlist_id !== null;
+                $hasMerged = $bouquet->merged_playlist_id !== null;
+                if (count(array_filter([$hasPlaylist, $hasCustom, $hasMerged])) !== 1) {
+                    throw new InvalidArgumentException('A bouquet must target exactly one of playlist_id, custom_playlist_id or merged_playlist_id.');
+                }
+                if ($hasCustom) {
+                    // Auto-include is a provider-sync concept; custom playlists never sync.
+                    $bouquet->auto_include_new_live = false;
+                    $bouquet->auto_include_new_vod = false;
+                    $bouquet->auto_include_live_patterns = null;
+                    $bouquet->auto_include_vod_patterns = null;
+                }
+
+                // The hidden target FK is otherwise a name-existence oracle for other
+                // users' playlists (the staleness callout would reveal group/tag names
+                // on a playlist the requester doesn't own) - confirm the target actually
+                // belongs to this bouquet's user. No auth() dependency: this must also
+                // hold during queue-context saves (e.g. applyProviderRenames()).
+                $target = match (true) {
+                    $hasPlaylist => Playlist::find($bouquet->playlist_id),
+                    $hasCustom => CustomPlaylist::find($bouquet->custom_playlist_id),
+                    default => MergedPlaylist::find($bouquet->merged_playlist_id),
+                };
+                if (! $target || $target->user_id !== $bouquet->user_id) {
+                    throw new InvalidArgumentException('A bouquet must target a playlist owned by its user.');
+                }
+
+                return $bouquet;
+            });
+            Bouquet::updated(function (Bouquet $bouquet) {
+                if ($bouquet->wasChanged('group_selections')) {
+                    // Selections feed attached aliases' effective filters - their cached
+                    // EPG XML was generated against the old selection.
+                    $bouquet->playlistAliases->each(
+                        fn (PlaylistAlias $alias) => EpgCacheService::clearPlaylistEpgCacheFile($alias)
+                    );
+                }
+            });
+            Bouquet::deleting(function (Bouquet $bouquet) {
+                // Pivot rows cascade at the DB level (no pivot events fire there), so
+                // clear the attached aliases' caches while they are still attached.
+                $bouquet->playlistAliases->each(
+                    fn (PlaylistAlias $alias) => EpgCacheService::clearPlaylistEpgCacheFile($alias)
+                );
+
+                return $bouquet;
             });
 
             // StreamProfile
@@ -817,8 +1012,14 @@ class AppServiceProvider extends ServiceProvider
                     $network->schedule_type = 'sequential';
                 }
             });
+            // Keep the network's channel projection current (issue #1303).
+            Network::created(fn (Network $network) => app(NetworkChannelSyncService::class)->syncNetwork($network));
             Network::updated(function (Network $network) {
-                app(NetworkChannelSyncService::class)->refreshNetworkChannel($network);
+                // Broadcast state saves don't touch any projected attribute, so
+                // they skip this entirely.
+                if ($network->wasChanged(NetworkChannelSyncService::PROJECTED_ATTRIBUTES)) {
+                    app(NetworkChannelSyncService::class)->syncNetwork($network);
+                }
             });
             Network::deleting(function (Network $network) {
                 // Ensure any running broadcast is stopped and HLS files are removed
@@ -831,7 +1032,7 @@ class AppServiceProvider extends ServiceProvider
                     ]);
                 }
 
-                Channel::where('network_id', $network->id)->delete();
+                app(NetworkChannelSyncService::class)->removeNetwork($network);
             });
 
             // ChannelScrubber
@@ -895,6 +1096,20 @@ class AppServiceProvider extends ServiceProvider
             PanelsRenderHook::FOOTER,
             fn () => view('footer')
         );
+
+        // Privacy mode: blur URLs and credentials marked with .privacy-sensitive
+        FilamentView::registerRenderHook(
+            PanelsRenderHook::HEAD_END,
+            function (): string {
+                try {
+                    return app(GeneralSettings::class)->privacy_mode
+                        ? view('components.privacy-mode-styles')->render()
+                        : '';
+                } catch (Throwable $e) {
+                    return '';
+                }
+            }
+        );
     }
 
     /**
@@ -920,9 +1135,12 @@ class AppServiceProvider extends ServiceProvider
             ->routes(function (Route $route) {
                 return ! Str::startsWith($route->uri, 'playlist/v/') && Str::startsWith($route->uri, [
                     'playlist/',
+                    'custom-playlist/',
                     'epg/',
                     'user/',
                     'channel/',
+                    'recordings',
+                    'series-rules',
                     'proxy/',
                     'group/',
                     'player_api.php',
@@ -932,7 +1150,15 @@ class AppServiceProvider extends ServiceProvider
                 $openApi->secure(
                     SecurityScheme::http('bearer')
                 );
-            });
+
+                if (blank(config('scramble.info.version'))) {
+                    $openApi->info->setVersion((string) config('dev.version'));
+                }
+            })
+            ->withDocumentTransformers(DocumentXtreamApiResponses::class)
+            ->withDocumentTransformers(PruneUnreferencedSchemas::class)
+            ->withOperationTransformers(DocumentDvrAuthenticationErrors::class)
+            ->withOperationTransformers(MergeSameStatusResponses::class);
     }
 
     /**

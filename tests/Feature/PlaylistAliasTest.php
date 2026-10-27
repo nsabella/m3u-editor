@@ -1,5 +1,6 @@
 <?php
 
+use App\Models\Bouquet;
 use App\Models\Channel;
 use App\Models\Playlist;
 use App\Models\PlaylistAlias;
@@ -133,6 +134,29 @@ describe('PlaylistService::authenticate() with aliases', function () {
     });
 });
 
+// ── Xtream stream routes ──────────────────────────────────────────────────────
+
+describe('Xtream stream routes with alias credentials', function () {
+    it('stops streaming with alias direct credentials once the alias expires', function () {
+        $user = User::factory()->create();
+        $playlist = Playlist::factory()->for($user)->create(['enable_proxy' => false]);
+        $channel = Channel::factory()->for($user)->for($playlist)->create([
+            'enabled' => true,
+            'url' => 'http://provider.example.com/live/u/p/1234.ts',
+        ]);
+        $alias = makeAlias($user, $playlist, [
+            'username' => 'aliasuser',
+            'password' => 'aliaspass',
+        ]);
+
+        $this->get("/live/aliasuser/aliaspass/{$channel->id}.ts")->assertRedirect();
+
+        $alias->update(['expires_at' => now()->subMinute()]);
+
+        $this->get("/live/aliasuser/aliaspass/{$channel->id}.ts")->assertForbidden();
+    });
+});
+
 // ── Xtream API panel action ───────────────────────────────────────────────────
 
 describe('Xtream API panel action with aliases', function () {
@@ -208,12 +232,13 @@ describe('PlaylistAuth::assignTo() with PlaylistAlias', function () {
 // ── Delegating accessors ──────────────────────────────────────────────────────
 
 describe('PlaylistAlias delegating accessors', function () {
-    it('delegates include_vod_in_m3u, include_series_in_m3u, channel_start, dummy_epg, dummy_epg_category to effective playlist', function () {
+    it('delegates include_vod_in_m3u, include_series_in_m3u, channel_start, force_channel_numbering, dummy_epg, dummy_epg_category to effective playlist', function () {
         $user = User::factory()->create();
         $playlist = Playlist::factory()->for($user)->create([
             'include_vod_in_m3u' => true,
             'include_series_in_m3u' => true,
             'channel_start' => 5,
+            'force_channel_numbering' => true,
             'dummy_epg' => true,
             'dummy_epg_category' => true,
         ]);
@@ -223,6 +248,7 @@ describe('PlaylistAlias delegating accessors', function () {
         expect($alias->include_vod_in_m3u)->toBeTrue()
             ->and($alias->include_series_in_m3u)->toBeTrue()
             ->and($alias->channel_start)->toBe(5)
+            ->and($alias->force_channel_numbering)->toBeTrue()
             ->and($alias->dummy_epg)->toBeTrue()
             ->and($alias->dummy_epg_category)->toBeTrue();
     });
@@ -241,6 +267,7 @@ describe('PlaylistAlias delegating accessors', function () {
         expect($alias->include_vod_in_m3u)->toBeFalse()
             ->and($alias->include_series_in_m3u)->toBeFalse()
             ->and($alias->channel_start)->toBe(1)
+            ->and($alias->force_channel_numbering)->toBeFalse()
             ->and($alias->dummy_epg)->toBeFalse()
             ->and($alias->dummy_epg_category)->toBeFalse();
     });
@@ -585,5 +612,54 @@ describe('PlaylistAlias::series() category filter', function () {
 
         expect($first->toArray())->toBe($second->toArray())
             ->and($alias->resolvedCategoryIds)->toBe([10]);
+    });
+});
+
+// ── bouquet union end-to-end through channels() and series() ─────────────────
+
+describe('bouquet union end-to-end through channels() and series()', function () {
+    beforeEach(function () {
+        $this->user = User::factory()->create();
+        $this->playlist = Playlist::factory()->for($this->user)->create();
+    });
+
+    it('a bouquet-only alias filters channels without any manual filter', function () {
+        $alias = makeAlias($this->user, $this->playlist, ['group_filter' => null]);
+        $bouquet = Bouquet::factory()->create([
+            'user_id' => $this->user->id,
+            'playlist_id' => $this->playlist->id,
+            'group_selections' => ['selected_groups' => ['Sports']],
+        ]);
+        $alias->bouquets()->attach($bouquet);
+        $alias->refresh();
+
+        Channel::factory()->for($this->playlist)->for($this->user)->create([
+            'group_internal' => 'Sports', 'is_vod' => false, 'enabled' => true,
+        ]);
+        Channel::factory()->for($this->playlist)->for($this->user)->create([
+            'group_internal' => 'News', 'is_vod' => false, 'enabled' => true,
+        ]);
+
+        $groups = $alias->channels()->pluck('channels.group_internal');
+        expect($groups)->toContain('Sports')->and($groups)->not->toContain('News');
+    });
+
+    it('a bouquet category restricts series() via source_category_id resolution', function () {
+        $alias = makeAlias($this->user, $this->playlist, ['group_filter' => null]);
+        $bouquet = Bouquet::factory()->create([
+            'user_id' => $this->user->id,
+            'playlist_id' => $this->playlist->id,
+            'group_selections' => ['selected_categories' => ['Drama']],
+        ]);
+        $alias->bouquets()->attach($bouquet);
+        $alias->refresh();
+
+        SourceCategory::create([
+            'playlist_id' => $this->playlist->id, 'name' => 'Drama', 'source_category_id' => 11,
+        ]);
+        Series::factory()->for($this->playlist)->for($this->user)->create(['source_category_id' => 11, 'enabled' => true]);
+        Series::factory()->for($this->playlist)->for($this->user)->create(['source_category_id' => 22, 'enabled' => true]);
+
+        expect($alias->series()->count())->toBe(1);
     });
 });

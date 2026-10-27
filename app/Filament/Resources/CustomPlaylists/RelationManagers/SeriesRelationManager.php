@@ -4,8 +4,11 @@ namespace App\Filament\Resources\CustomPlaylists\RelationManagers;
 
 use App\Filament\Resources\CustomPlaylists\RelationManagers\Concerns\ReordersCustomPlaylistPivotSort;
 use App\Filament\Resources\Series\SeriesResource;
+use App\Jobs\AddItemsToCustomPlaylist;
+use App\Jobs\DetachItemsFromCustomPlaylist;
 use App\Models\Series;
 use App\Services\EpgCacheService;
+use App\Services\PlaylistService;
 use App\Traits\AppliesTmdbSelection;
 use Filament\Actions\AttachAction;
 use Filament\Actions\BulkAction;
@@ -24,7 +27,6 @@ use Filament\Tables\Filters\SelectFilter;
 use Filament\Tables\Grouping\Group;
 use Filament\Tables\Table;
 use Illuminate\Database\Eloquent\Builder;
-use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\DB;
 
@@ -106,18 +108,21 @@ class SeriesRelationManager extends RelationManager
                     default => 'CAST(tags.name AS TEXT)'
                 };
 
-                return $query
-                    ->leftJoin('taggables', function ($join) {
-                        $join->on('series.id', '=', 'taggables.taggable_id')
-                            ->where('taggables.taggable_type', '=', Series::class);
-                    })
-                    ->leftJoin('tags', function ($join) use ($ownerRecord) {
-                        $join->on('taggables.tag_id', '=', 'tags.id')
-                            ->where('tags.type', '=', $ownerRecord->uuid.'-category');
-                    })
-                    ->orderByRaw("{$orderByClause} {$direction}")
-                    ->select('series.*', DB::raw("{$orderByClause} as tag_name_sort"))
-                    ->distinct();
+                // Order by a correlated subquery rather than joining taggables/tags: one row per
+                // item, so no DISTINCT over json columns (which Postgres cannot compare) and no
+                // duplicate rows for items carrying more than one tag. The inner orderBy makes the
+                // limit(1) pick deterministic when an item carries more than one relevant tag.
+                return $query->orderBy(
+                    DB::table('taggables')
+                        ->join('tags', 'taggables.tag_id', '=', 'tags.id')
+                        ->selectRaw($orderByClause)
+                        ->whereColumn('taggables.taggable_id', 'series.id')
+                        ->where('taggables.taggable_type', Series::class)
+                        ->where('tags.type', $ownerRecord->uuid.'-category')
+                        ->orderBy('tags.id')
+                        ->limit(1),
+                    $direction,
+                );
             });
         $defaultColumns = SeriesResource::getTableColumns(showCategory: true, showPlaylist: true);
 
@@ -251,17 +256,19 @@ class SeriesRelationManager extends RelationManager
                 ...SeriesResource::getTableBulkActions(addToCustom: false),
                 BulkAction::make('detach')
                     ->label(__('Detach Selected'))
-                    ->action(function (Collection $records) use ($ownerRecord): void {
-                        $tags = $ownerRecord->categoryTags()->get();
-                        foreach ($records as $record) {
-                            $record->detachTags($tags);
-                        }
-                        $ownerRecord->series()->detach($records->pluck('id'));
-                    })->after(function () {
+                    ->fetchSelectedRecords(false)
+                    ->action(function (Builder $recordsQuery) use ($ownerRecord): void {
+                        DetachItemsFromCustomPlaylist::dispatch(
+                            userId: auth()->id(),
+                            itemIds: PlaylistService::selectedRecordIds($recordsQuery),
+                            customPlaylistId: $ownerRecord->id,
+                            type: 'series',
+                        );
+
                         Notification::make()
-                            ->success()
-                            ->title(__('Detached from playlist'))
-                            ->body(__('The selected series have been detached from the custom playlist.'))
+                            ->info()
+                            ->title(__('Detaching from playlist'))
+                            ->body(__('The selected series are being detached from the custom playlist in the background. You will be notified when complete.'))
                             ->send();
                     })
                     ->color('danger')
@@ -288,24 +295,32 @@ class SeriesRelationManager extends RelationManager
                             ->searchable()
                             ->required(),
                     ])
-                    ->action(function (Collection $records, $data) use ($ownerRecord): void {
-                        $tagIds = $data['categories'] ?? [];
-                        if (empty($tagIds)) {
-                            return;
+                    ->fetchSelectedRecords(false)
+                    ->action(function (Builder $recordsQuery, array $data) use ($ownerRecord): void {
+                        // Dispatch one chunked background job per selected category so a
+                        // series can join several custom categories at once. 'select' mode
+                        // appends the tag (preserving existing categories and their
+                        // taggables.sort) rather than replacing.
+                        $itemIds = PlaylistService::selectedRecordIds($recordsQuery);
+                        foreach ($data['categories'] ?? [] as $categoryId) {
+                            $tag = $ownerRecord->categoryTags()->where('id', $categoryId)->first();
+                            if (! $tag) {
+                                continue;
+                            }
+
+                            AddItemsToCustomPlaylist::dispatch(
+                                userId: auth()->id(),
+                                itemIds: $itemIds,
+                                customPlaylistId: $ownerRecord->id,
+                                data: ['mode' => 'select', 'category' => $tag->getAttributeValue('name')],
+                                type: 'series',
+                            );
                         }
 
-                        $tags = $ownerRecord->categoryTags()->whereIn('id', $tagIds)->get();
-
-                        foreach ($records as $record) {
-                            $record->attachTags($tags); // Append, not replace
-                        }
-                        // Clear EPG cache for this custom playlist
-                        EpgCacheService::clearForCustomPlaylistId($ownerRecord->id);
-                    })->after(function () {
                         Notification::make()
-                            ->success()
-                            ->title(__('Added to category'))
-                            ->body(__('The selected series have been added to the custom category.'))
+                            ->info()
+                            ->title(__('Adding to category'))
+                            ->body(__('The selected series are being added to the custom category in the background. You will be notified when complete.'))
                             ->send();
                     })
                     ->deselectRecordsAfterCompletion()

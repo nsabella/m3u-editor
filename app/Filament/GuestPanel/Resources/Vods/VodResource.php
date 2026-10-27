@@ -7,6 +7,7 @@ use App\Facades\PlaylistFacade;
 use App\Filament\GuestPanel\Pages\Concerns\HasPlaylist;
 use App\Models\Channel;
 use App\Models\CustomPlaylist;
+use App\Models\MergedPlaylist;
 use App\Models\Playlist;
 use App\Models\PlaylistAlias;
 use App\Services\DateFormatService;
@@ -98,6 +99,14 @@ class VodResource extends Resource
                     ['is_vod', true], // Only show VOD channels
                 ]);
         }
+        if ($playlist instanceof MergedPlaylist) {
+            return parent::getEloquentQuery()
+                ->with(['epgChannel', 'playlist'])
+                ->where('enabled', true)
+                ->where('is_vod', true)
+                // Only the sources configured to contribute VOD to the merged playlist
+                ->whereIn('playlist_id', $playlist->sourcePlaylistIds('vod'));
+        }
         if ($playlist instanceof PlaylistAlias) {
             // Alias backed by a standard playlist
             if ($playlist->playlist_id) {
@@ -130,6 +139,24 @@ class VodResource extends Resource
                 $allowedVodGroups = $playlist->getAllowedVodGroupNames();
                 if (! empty($allowedVodGroups)) {
                     $query->where(fn ($query) => $playlist->constrainChannelsToCustomGroups($query, $allowedVodGroups));
+                }
+
+                return $query;
+            }
+
+            // Alias backed by a merged playlist
+            if ($playlist->merged_playlist_id) {
+                $query = parent::getEloquentQuery()
+                    ->with(['epgChannel', 'playlist'])
+                    ->where('enabled', true)
+                    ->where('is_vod', true)
+                    ->whereIn('playlist_id', $playlist->mergedPlaylist?->sourcePlaylistIds('vod') ?? []);
+
+                // Apply the source-scoped VOD group filter if configured on the alias. The
+                // stored selection gates it, not the parsed pairs, so a malformed selection
+                // fails closed instead of silently allowing every group.
+                if ($playlist->hasVodGroupFilter()) {
+                    $query->where(fn ($query) => $playlist->constrainChannelsToSourceGroups($query, $playlist->getAllowedVodGroupSelections()));
                 }
 
                 return $query;
@@ -171,10 +198,10 @@ class VodResource extends Resource
                     ->wrap()
                     ->getStateUsing(function ($record) {
                         $info = $record->info;
-                        $title = $record->title_custom ?: $record->title;
+                        $title = e($record->title_custom ?: $record->title, false);
                         $html = "<span class='fi-ta-text-item-label whitespace-normal text-sm leading-6 text-gray-950 dark:text-white'>{$title}</span>";
                         if (is_array($info)) {
-                            $description = Str::limit($info['description'] ?? $info['plot'] ?? '', 200);
+                            $description = e(Str::limit($info['description'] ?? $info['plot'] ?? '', 200), false);
                             if (! empty($description)) {
                                 $html .= "<p class='text-sm text-gray-500 dark:text-gray-400 whitespace-normal mt-2'>{$description}</p>";
                             }
@@ -241,6 +268,7 @@ class VodResource extends Resource
                     })
                     ->toggleable(isToggledHiddenByDefault: true),
                 Tables\Columns\TextColumn::make('url')
+                    ->extraAttributes(['class' => 'privacy-sensitive'])
                     ->label(__('Default URL'))
                     ->sortable()
                     ->searchable(query: function (Builder $query, string $search): Builder {
@@ -276,7 +304,7 @@ class VodResource extends Resource
                 Action::make('play')
                     ->tooltip(__('Play Video'))
                     ->action(function ($record, $livewire) {
-                        $livewire->dispatch('openFloatingStream', $record->getFloatingPlayerAttributes());
+                        $livewire->dispatch('openFloatingStream', static::playerAttributes($record));
                     })
                     ->icon('heroicon-s-play-circle')
                     ->button()

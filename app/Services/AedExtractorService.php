@@ -35,15 +35,16 @@ class AedExtractorService
 
     /**
      * Build a fallback AedEvent using no_event_format when regex extraction fails.
+     * Returns null when no_event_format is blank, meaning no fallback event should be generated.
      */
-    public function fallback(AedProfile $profile, string $channelTitle): AedEvent
+    public function fallback(AedProfile $profile, string $channelTitle): ?AedEvent
     {
-        $title = $profile->no_event_format
-            ? str_replace('{channel}', $channelTitle, $profile->no_event_format)
-            : $channelTitle;
+        if (empty($profile->no_event_format)) {
+            return null;
+        }
 
         return new AedEvent(
-            title: $title,
+            title: str_replace('{channel}', $channelTitle, $profile->no_event_format),
             description: null,
             start: null,
             end: null,
@@ -165,23 +166,27 @@ class AedExtractorService
             $sourceTimezone = $profile->source_timezone ?: 'UTC';
             $outputTimezone = $profile->output_timezone ?: 'UTC';
 
-            // Try each pipe-separated time format until one parses successfully
+            // Try each pipe-separated date format with each pipe-separated time format
+            // until one pair parses successfully
             $startTime = null;
-            foreach (explode('|', $profile->time_format) as $fmt) {
-                $fmt = trim($fmt);
-                $combined = $dateString ? "{$dateString} {$timeString}" : $timeString;
-                $combinedFormat = $dateString && $profile->date_format
-                    ? trim($profile->date_format).' '.$fmt
-                    : $fmt;
+            $matchedDateFormat = null;
+            $combined = $dateString ? "{$dateString} {$timeString}" : $timeString;
+            $dateFormats = $dateString ? array_map('trim', explode('|', $profile->date_format)) : [null];
+            $timeFormats = array_map('trim', explode('|', $profile->time_format));
+            foreach ($dateFormats as $dateFormat) {
+                foreach ($timeFormats as $timeFormat) {
+                    $combinedFormat = $dateFormat ? "{$dateFormat} {$timeFormat}" : $timeFormat;
 
-                try {
-                    $parsed = Carbon::createFromFormat($combinedFormat, $combined, $sourceTimezone);
-                    if ($parsed !== false) {
-                        $startTime = $parsed;
-                        break;
+                    try {
+                        $parsed = Carbon::createFromFormat($combinedFormat, $combined, $sourceTimezone);
+                        if ($parsed !== false) {
+                            $startTime = $parsed;
+                            $matchedDateFormat = $dateFormat;
+                            break 2;
+                        }
+                    } catch (InvalidFormatException) {
+                        // Try the next format pair
                     }
-                } catch (InvalidFormatException) {
-                    continue;
                 }
             }
 
@@ -189,15 +194,24 @@ class AedExtractorService
                 return null;
             }
 
-            // If no year was in the date format, snap to the nearest upcoming occurrence
-            if (! $dateString || ! str_contains($profile->date_format ?? '', 'Y')) {
-                $now = Carbon::now($sourceTimezone);
-                if ($startTime->lt($now->copy()->subHours(12))) {
-                    $startTime->addYear();
-                }
+            $startTime->setTimezone($outputTimezone);
+
+            // If no year was in the date format, snap to the nearest occurrence (last year,
+            // this year or next year). A finished event whose title the provider hasn't
+            // updated stays in the past instead of jumping a full year ahead, while a date
+            // across New Year (e.g. "01.02" seen on Dec 30) still lands in the next year.
+            // Compare calendar dates in the output timezone (not instants) so two events on
+            // the same source date are always treated the same regardless of time of day.
+            if (! $dateString || ! str_contains($matchedDateFormat ?? '', 'Y')) {
+                $today = Carbon::now($outputTimezone)->startOfDay();
+                $startTime = collect([
+                    $startTime->copy()->subYear(),
+                    $startTime,
+                    $startTime->copy()->addYear(),
+                ])->sortBy(fn (Carbon $candidate): float => abs($today->diffInDays($candidate->copy()->startOfDay())))->first();
             }
 
-            return $startTime->setTimezone($outputTimezone);
+            return $startTime;
         } catch (Throwable) {
             return null;
         }

@@ -87,6 +87,9 @@ return [
             'guzzlehttp/promises',
             // ── Core Laravel ecosystem — trusted first-party packages ────────
             'laravel/framework',
+            // v4.4.8 was the security patch for GHSA-mhf7-xp6r-6qrc (Authorize
+            // bypass via reordered parameter keys and #[Json] execution order)
+            'livewire/livewire',
             // transitive deps of laravel/framework, bumped alongside it
             'nesbot/carbon',
             'symfony/http-foundation',
@@ -147,7 +150,6 @@ return [
             'phpstan/phpstan',
             'phpunit/phpunit',
             'pragmarx/google2fa',
-            'prism-php/prism',
             'psy/psysh',
             'ralouphie/getallheaders',
             'react/promise',
@@ -191,6 +193,11 @@ return [
         // not a secret.
         '2a3eaf0a6403',
 
+        // DocumentXtreamApiResponses: 'password' => 'test_pass' is example data
+        // in the API docs, mirroring the Xtream panel `user_info` shape. Not a
+        // credential.
+        '81cff0596bab',
+
         // public/js/saade/filament-laravel-log — published vendor assets that
         // embed tiny base64 PNG sprites inline in CSS. Not credentials.
         'db4f9de8969c',
@@ -228,6 +235,12 @@ return [
         '1cf9f415fe0d',
 
         // ── SQL Injection — validated before interpolation ───────────────────
+        // CopyAttributesToPlaylist::applyMatchConditions — $attribute is
+        // interpolated into DB::raw only after an in_array() check against the
+        // fixed self::MATCHABLE_COLUMNS allowlist; it can never be an arbitrary
+        // string. The match values themselves are passed as bound whereIn params.
+        '214e51e4e2c9',
+
         // SimilaritySearchService: $relevanceSql is assembled only from fixed
         // database-driver templates; search terms use escaped ? bindings.
         'b5bc019c1883',
@@ -262,6 +275,29 @@ return [
         '361a8a8465de',
         '53e3187b2a5f',
         'a215f7e698e0',
+        // SortService bulkSortByRatingExpression(): shared helper used by all four
+        // bulkSort{GroupChannels,CategorySeries,PlaylistVod,PlaylistSeries}ByRating
+        // methods (consolidated from separate near-duplicate methods, same guarantees
+        // as the release-date methods above). $table/$whereSql are hardcoded string
+        // literals passed only by SortService's own call sites, never user input;
+        // $isNullExprByDriver/$valueExprByDriver are compile-time SQL literals keyed
+        // by the PDO driver name; $direction is ternary-validated to 'ASC'|'DESC';
+        // group/category/playlist ids are passed as bound ? placeholders.
+        '17d06f104bc5',
+        '03d5bc0d50c7',
+        'e9351da168bc',
+        '887429bb5f5a',
+        'bd47bbeb172a',
+        // Same helper renamed to bulkSortByExpression() and given an optional
+        // $joinSqlByDriver (plus bound $joinBindings) for the series "most recent
+        // activity" sort. The join SQL comes only from seriesRecentActivityExprs(),
+        // built from compile-time literals and a hardcoded $episodeScopeSql passed
+        // by SortService's own call sites; category/playlist ids and today's date
+        // are bound ? placeholders. The last hash is that sort's fallback-driver
+        // selectRaw(), which interpolates the same literal expression.
+        'e6ca20c46d15',
+        'ca85fe8662a8',
+        '47a7230258a5',
 
         // SortService natural-sort rewrite (issue #1369): same guarantees as the
         // original SortService entries above, just on new lines/hashes.
@@ -282,6 +318,14 @@ return [
         '66a1a4c351d7',
         '6b5bb290e977',
         '4c12ed674220',
+        // OTA sub-channel numbers (issue #1604): the group sort-by-channel branches
+        // gained $tiebreak, a hardcoded SQL literal chosen by `$column === 'channel'`
+        // with the same ternary-validated $direction; the recount statements gained
+        // a literal `channel_minor = NULL`. Same guarantees as above, new hashes.
+        'f8dbb7ab0f2d',
+        '74d70cc2f5d5',
+        'fcd1c278e168',
+        'aa24a598f9c3',
 
         // Migration 2026_04_06: one-time data migration building a CASE
         // expression from UUIDs generated in the same migration — no user input.
@@ -332,12 +376,39 @@ return [
         // from likeOperator() which returns 'LIKE'|'ILIKE'. The actual user
         // input $genre is bound via the ? placeholder.
         '3489035c968f',
+        // Same call, now wrapped in a closure to fix a NULL-group exclusion bug
+        // (issue #1733) — finding text changed enough to produce a new hash.
+        '498c2c960be3',
 
         // ChannelController: $sortOrder was unsanitized — now validated to
         // 'ASC'|'DESC' before use. Hashes left here in case pattern still
         // matches post-fix.
         '57e265dc6af9',
         'db463012a7cf',
+
+        // ChannelResource (#1346 title/name/stream_id sort fix): $direction is
+        // Filament's table sort direction, validated to 'asc'|'desc' via
+        // ternary immediately before interpolation — same guarantee as the
+        // ChannelController fix above.
+        'f8a660d33460', // title_custom sortable (used on both the `info` and `title_custom` columns)
+        '56d4b412ca84', // stream_id_custom sortable
+        '40377b7d003c', // name_custom sortable
+
+        // LibraryGrowthChart dashboard widget: $bucket is
+        // "CASE WHEN created_at IS NULL OR created_at < ? THEN 'base' ELSE <expr> END"
+        // where <expr> is dateExpr('created_at'), one of three compile-time SQL
+        // literals chosen by match() on the PDO driver name. 'created_at' is a
+        // hardcoded literal; the only runtime value ($start) is passed as a bound
+        // ? placeholder. No request/user input reaches the interpolated SQL.
+        '4b62ac19b9b5', // channels query (live/vod split)
+        '71f612830296', // series + episodes queries (COUNT(*) per bucket)
+
+        // BenchmarkEpgMapping::explainSlowestQueries (epg:benchmark-mapping
+        // --explain, a local CLI-only command): prefixes EXPLAIN to SQL captured
+        // from the app's own QueryExecuted events, i.e. statements the query
+        // builder already compiled with ? placeholders. Their values are passed
+        // back as bindings, never interpolated. No request/user input reaches it.
+        '785553ec1889',
 
         // ── XSS — controlled server-side rendering ───────────────────────────
         // regex-tester.blade.php: {!! !!} renders output from a Livewire
@@ -457,6 +528,15 @@ return [
         '9a065d722be9', // QueueMonitor
 
         '0113919ad8de', // EpgMapCandidate
+
+        '885eae8be59c', // Bouquet
+        'a1a5cad70005', // BouquetPlaylistAlias
+
+        // ProviderMigrationPlanRow — ephemeral scratch rows for the "Migrate
+        // Provider" preview, written only from fixed internal arrays in
+        // MigrateProvider/ProviderMigrationPlanner (never from request input).
+        // Same Model::unguard() convention as every model above.
+        '102808485cb2', // ProviderMigrationPlanRow
     ],
 
     /*

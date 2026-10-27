@@ -1,12 +1,16 @@
 <?php
 
-use App\Filament\Resources\PushDeviceTokens\PushDeviceTokenResource;
+use App\Filament\Clusters\Devices\Pages\PairDevice;
 use App\Http\Controllers\AIOStreamsProxyController;
 use App\Http\Controllers\Api\DispatcharrController;
+use App\Http\Controllers\Api\DispatcharrDvrController;
 use App\Http\Controllers\AssetPreviewController;
 use App\Http\Controllers\Auth\OidcController;
 use App\Http\Controllers\BackupDownloadController;
+use App\Http\Controllers\CachedContentStreamController;
 use App\Http\Controllers\ChannelController;
+use App\Http\Controllers\CustomPlaylistController;
+use App\Http\Controllers\DvrRecordingDownloadController;
 use App\Http\Controllers\DvrStreamController;
 use App\Http\Controllers\EpgController;
 use App\Http\Controllers\EpgFileController;
@@ -40,8 +44,7 @@ use Illuminate\Support\Facades\Route;
 // Vanity URL for Device Pairing — short and easy to type from a phone/computer
 // while looking at a TV. Forwards ?code= through if present (e.g. from a QR link).
 Route::get('/pdt', function () {
-    return redirect(PushDeviceTokenResource::getUrl('index', array_filter([
-        'tab' => 'pairing',
+    return redirect(PairDevice::getUrl(array_filter([
         'code' => request()->query('code'),
     ])));
 })->name('device-pairing.vanity');
@@ -99,15 +102,6 @@ Route::post('/webhook/test', WebhookTestController::class)
 Route::get('/webhook/test', WebhookTestController::class)
     ->name('webhook.test.get');
 
-// If local env, show PHP info screen
-Route::get('/phpinfo', function () {
-    if (app()->environment('local')) {
-        phpinfo();
-    } else {
-        abort(404);
-    }
-});
-
 /*
  * Logo proxy route - cache and serve remote logos
  */
@@ -127,6 +121,10 @@ Route::get('/admin/backups/download/{disk}/{path}', BackupDownloadController::cl
     ->middleware(['auth'])
     ->where('path', '[A-Za-z0-9\-_]+')
     ->name('backups.download');
+
+Route::get('/admin/dvr-recordings/{recording}/download', DvrRecordingDownloadController::class)
+    ->middleware(['auth'])
+    ->name('dvr-recordings.download');
 
 Route::get('/extension-plugins/{plugin}/runs/{run}/report', PluginRunReportController::class)
     ->middleware(['auth'])
@@ -152,6 +150,46 @@ Route::get('/logo-repository/logos/{filename}', [LogoRepositoryController::class
 // Generate M3U playlist from the playlist configuration
 Route::get('/{uuid}/playlist.m3u', PlaylistGenerateController::class)
     ->name('playlist.generate');
+
+// Xtream API stream endpoints - defined BEFORE HDHR/{uuid} catch-all routes
+// to prevent the HDHR pattern {uuid}/hdhr/{username}/{password} from
+// matching URLs like /live/hdhr/hdhr/90982.m3u8 (where uuid=live).
+Route::get('/live/{username}/{password}/{streamId}.{format?}', [XtreamStreamController::class, 'handleLive'])
+    ->name('xtream.stream.live.root');
+Route::get('/movie/{username}/{password}/{streamId}.{format?}', [XtreamStreamController::class, 'handleVod'])
+    ->name('xtream.stream.vod.root');
+Route::get('/series/{username}/{password}/{streamId}.{format?}', [XtreamStreamController::class, 'handleSeries'])
+    ->name('xtream.stream.series.root');
+Route::get('/timeshift/{username}/{password}/{duration}/{date}/{streamId}.{format?}', [XtreamStreamController::class, 'handleTimeshift'])
+    ->name('xtream.stream.timeshift.root');
+
+// DVR file streaming routes - also declared before the HDHR /{uuid}/... catch-all.
+// Stream auth mirrors the Xtream stream pattern: the owner's default login (username +
+// playlist UUID or custom password) or PlaylistAuth credentials embedded in the URL. Keep the more specific
+// live.m3u8 and edl routes ahead of the generic {uuid}.{format?} stream route so
+// Laravel does not consume "live.m3u8" as {uuid}.{format?}.
+// The signed routes are handed to anyone who may play one recording (guests
+// included): viewers of a channel that is being recorded are redirected to the
+// live playlist, and DVR VOD entries store the stream URL. Each is scoped to one
+// recording by signature rather than carrying the owner's credentials. `client_id`
+// is appended by the player redirect after signing.
+Route::get('/dvr/signed/{uuid}/live.m3u8', [DvrStreamController::class, 'signedHlsPlaylist'])
+    ->middleware(ValidateSignature::relative(['client_id']))
+    ->name('dvr.recording.hls.signed');
+Route::get('/dvr/signed/{uuid}.{format?}', [DvrStreamController::class, 'signedStream'])
+    ->middleware(ValidateSignature::relative(['client_id']))
+    ->name('dvr.recording.stream.signed');
+Route::get('/dvr/{username}/{password}/{uuid}/live.m3u8', [DvrStreamController::class, 'hlsPlaylist'])
+    ->name('dvr.recording.hls.playlist');
+Route::get('/dvr/{username}/{password}/{uuid}/edl', [DvrStreamController::class, 'edl'])
+    ->name('dvr.recording.edl');
+Route::get('/dvr/{username}/{password}/{uuid}.{format?}', [DvrStreamController::class, 'stream'])
+    ->name('dvr.recording.stream');
+
+// Cached VOD/episode files. Auth matches the DVR route: the owner's default login,
+// or PlaylistAuth credentials.
+Route::get('/cached-content/{username}/{password}/{uuid}.{format?}', [CachedContentStreamController::class, 'stream'])
+    ->name('cached-content.stream');
 
 // Auth-aware HDHR routes (path-based auth to support clients that ignore query string auth)
 Route::get('/{uuid}/hdhr/{username}/{password}/device.xml', [PlaylistGenerateController::class, 'hdhr'])
@@ -308,6 +346,26 @@ Route::group(['middleware' => ['auth:sanctum']], function () {
     Route::post('playlist/{uuid}/merge-channels', [PlaylistController::class, 'mergeChannels'])
         ->name('api.playlist.merge-channels');
 
+    // Custom Playlist API routes
+    Route::group(['prefix' => 'custom-playlist/{uuid}'], function () {
+        Route::get('channels', [CustomPlaylistController::class, 'channels'])
+            ->name('api.custom-playlists.channels.index');
+        Route::post('channels', [CustomPlaylistController::class, 'attachChannels'])
+            ->name('api.custom-playlists.channels.attach');
+        Route::delete('channels', [CustomPlaylistController::class, 'detachChannels'])
+            ->name('api.custom-playlists.channels.detach');
+        Route::patch('channels/{id}', [CustomPlaylistController::class, 'updateChannelPivot'])
+            ->where('id', '[0-9]+')
+            ->name('api.custom-playlists.channels.update');
+        Route::get('groups', [CustomPlaylistController::class, 'groups'])
+            ->name('api.custom-playlists.groups.index');
+        Route::post('groups', [CustomPlaylistController::class, 'createGroup'])
+            ->name('api.custom-playlists.groups.store');
+        Route::patch('groups/{id}', [CustomPlaylistController::class, 'updateGroup'])
+            ->where('id', '[0-9]+')
+            ->name('api.custom-playlists.groups.update');
+    });
+
     // Proxy API routes
     if (config('proxy.proxy_integration_enabled')) {
         Route::get('proxy/status', [ProxyController::class, 'status'])
@@ -315,6 +373,84 @@ Route::group(['middleware' => ['auth:sanctum']], function () {
         Route::get('proxy/streams/active', [ProxyController::class, 'streams'])
             ->name('api.proxy.streams');
     }
+});
+
+/*
+ * Dispatcharr-style DVR API routes (Dispatcharr's shapes at /recordings and
+ * /series-rules). Authenticated with a Sanctum API token sent as Bearer, X-API-Key,
+ * `Authorization: ApiKey`, or `?token=` for media requests. The middleware
+ * parameter is the Sanctum token ability required. Must stay above the Xtream
+ * `/{username}/{password}/{streamId}` catch-all, which would otherwise swallow
+ * three-segment paths like /recordings/{id}/stop.
+ */
+Route::prefix('recordings')->group(function () {
+    Route::get('/', [DispatcharrDvrController::class, 'index'])
+        ->middleware('dispatcharr.dvr:view')
+        ->name('dispatcharr.dvr.recordings.index');
+    Route::post('/', [DispatcharrDvrController::class, 'store'])
+        ->middleware('dispatcharr.dvr:create')
+        ->name('dispatcharr.dvr.recordings.store');
+    Route::post('bulk-delete-upcoming', [DispatcharrDvrController::class, 'bulkDeleteUpcoming'])
+        ->middleware('dispatcharr.dvr:delete')
+        ->name('dispatcharr.dvr.recordings.bulk-delete-upcoming');
+    Route::get('{id}', [DispatcharrDvrController::class, 'show'])
+        ->middleware('dispatcharr.dvr:view')
+        ->whereNumber('id')
+        ->name('dispatcharr.dvr.recordings.show');
+    Route::delete('{id}', [DispatcharrDvrController::class, 'destroy'])
+        ->middleware('dispatcharr.dvr:delete')
+        ->whereNumber('id')
+        ->name('dispatcharr.dvr.recordings.destroy');
+    Route::post('{id}/stop', [DispatcharrDvrController::class, 'stop'])
+        ->middleware('dispatcharr.dvr:update')
+        ->whereNumber('id')
+        ->name('dispatcharr.dvr.recordings.stop');
+    Route::post('{id}/extend', [DispatcharrDvrController::class, 'extend'])
+        ->middleware('dispatcharr.dvr:update')
+        ->whereNumber('id')
+        ->name('dispatcharr.dvr.recordings.extend');
+    Route::post('{id}/update-metadata', [DispatcharrDvrController::class, 'updateMetadata'])
+        ->middleware('dispatcharr.dvr:update')
+        ->whereNumber('id')
+        ->name('dispatcharr.dvr.recordings.update-metadata');
+    Route::post('{id}/refresh-artwork', [DispatcharrDvrController::class, 'refreshArtwork'])
+        ->middleware('dispatcharr.dvr:update')
+        ->whereNumber('id')
+        ->name('dispatcharr.dvr.recordings.refresh-artwork');
+    Route::post('{id}/comskip', [DispatcharrDvrController::class, 'comskip'])
+        ->middleware('dispatcharr.dvr:update')
+        ->whereNumber('id')
+        ->name('dispatcharr.dvr.recordings.comskip');
+    Route::get('{id}/file', [DispatcharrDvrController::class, 'file'])
+        ->middleware('dispatcharr.dvr:view')
+        ->whereNumber('id')
+        ->name('dispatcharr.dvr.recordings.file');
+    Route::get('{id}/hls/{path}', [DispatcharrDvrController::class, 'hls'])
+        ->middleware('dispatcharr.dvr:view')
+        ->whereNumber('id')
+        ->where('path', '.+')
+        ->name('dispatcharr.dvr.recordings.hls');
+});
+
+Route::prefix('series-rules')->group(function () {
+    Route::get('/', [DispatcharrDvrController::class, 'seriesRules'])
+        ->middleware('dispatcharr.dvr:view')
+        ->name('dispatcharr.dvr.series-rules.index');
+    Route::post('/', [DispatcharrDvrController::class, 'storeSeriesRule'])
+        ->middleware('dispatcharr.dvr:create')
+        ->name('dispatcharr.dvr.series-rules.store');
+    Route::delete('/', [DispatcharrDvrController::class, 'destroySeriesRule'])
+        ->middleware('dispatcharr.dvr:delete')
+        ->name('dispatcharr.dvr.series-rules.destroy');
+    Route::post('preview', [DispatcharrDvrController::class, 'previewSeriesRule'])
+        ->middleware('dispatcharr.dvr:view')
+        ->name('dispatcharr.dvr.series-rules.preview');
+    Route::post('evaluate', [DispatcharrDvrController::class, 'evaluateSeriesRules'])
+        ->middleware('dispatcharr.dvr:update')
+        ->name('dispatcharr.dvr.series-rules.evaluate');
+    Route::post('bulk-remove', [DispatcharrDvrController::class, 'bulkRemoveSeriesRecordings'])
+        ->middleware('dispatcharr.dvr:delete')
+        ->name('dispatcharr.dvr.series-rules.bulk-remove');
 });
 
 // Playlist API routes (public with UUID auth - rate limited to prevent DoS/queue flooding)
@@ -330,6 +466,16 @@ Route::middleware(['throttle:5,1'])->prefix('epg')->group(function () {
 });
 
 /*
+ * Flutter TV web app entry point (aligned with the /m3u-proxy prefix).
+ * Everything after /m3u-tv/ is a static file already served directly by
+ * Herd/nginx (public/m3u-tv/*); only the bare entry path falls through to
+ * the router, since Herd's static-file check requires an exact file match
+ * and won't resolve a directory to its index.html.
+ */
+Route::get('/m3u-tv', fn () => redirect('/m3u-tv/'));
+Route::get('/m3u-tv/', fn () => response()->file(public_path('m3u-tv/index.html')));
+
+/*
  * Xtream API endpoints at root
  */
 
@@ -337,18 +483,6 @@ Route::middleware(['throttle:5,1'])->prefix('epg')->group(function () {
 Route::match(['get', 'post'], '/player_api.php', [XtreamApiController::class, 'handle'])->name('xtream.api.player');
 Route::match(['get', 'post'], '/get.php', [XtreamApiController::class, 'handle'])->name('xtream.api.get');
 Route::get('/xmltv.php', [XtreamApiController::class, 'epg'])->name('xtream.api.epg');
-
-// Xtream API stream endpoints
-Route::get('/live/{username}/{password}/{streamId}.{format?}', [XtreamStreamController::class, 'handleLive'])
-    ->name('xtream.stream.live.root');
-Route::get('/movie/{username}/{password}/{streamId}.{format?}', [XtreamStreamController::class, 'handleVod'])
-    ->name('xtream.stream.vod.root');
-Route::get('/series/{username}/{password}/{streamId}.{format?}', [XtreamStreamController::class, 'handleSeries'])
-    ->name('xtream.stream.series.root');
-
-// Timeshift endpoints
-Route::get('/timeshift/{username}/{password}/{duration}/{date}/{streamId}.{format?}', [XtreamStreamController::class, 'handleTimeshift'])
-    ->name('xtream.stream.timeshift.root');
 
 // Dispatcharr-compatible proxy stream endpoint (used by emby-xtream plugin)
 Route::get('/proxy/ts/stream/{uuid}', [DispatcharrController::class, 'proxyStream'])
@@ -431,38 +565,25 @@ Route::get('/webdav-media/{integration}/stream/{item}', [
  *    used by the m3u-tv Flutter client) there's no durable row yet, so the
  *    resolved URL is cached server-side under a short-lived random token —
  *    see MediaServerProxyController::generateAioStreamsLiveProxyUrls().
+ *
+ * The signature check ignores `proxy` (appended by m3u-tv) and `client_id`
+ * (appended by the in-app floating/popout players) so those clients don't 403.
  */
 Route::get('/aiostreams-media/{integration}/channel/{channel}/stream', [
     MediaServerProxyController::class,
     'streamAioStreamsChannel',
-])->middleware(ValidateSignature::relative())->name('aiostreams-media.channel.stream');
+])->middleware(ValidateSignature::relative(['proxy', 'client_id']))->name('aiostreams-media.channel.stream');
 
 Route::get('/aiostreams-media/{integration}/episode/{episode}/stream', [
     MediaServerProxyController::class,
     'streamAioStreamsEpisode',
-])->middleware(ValidateSignature::relative())->name('aiostreams-media.episode.stream');
+])->middleware(ValidateSignature::relative(['proxy', 'client_id']))->name('aiostreams-media.episode.stream');
 
 Route::get('/aiostreams-media/{integration}/live/{item}/stream', [
     MediaServerProxyController::class,
     'streamAioStreamsLive',
-])->middleware(ValidateSignature::relative())->name('aiostreams-media.live.stream');
+])->middleware(ValidateSignature::relative(['proxy', 'client_id']))->name('aiostreams-media.live.stream');
 
-/*
- * DVR routes — file streaming and proxy callbacks
- * Stream auth mirrors the Xtream stream pattern: username + password (playlist UUID)
- * or PlaylistAuth credentials embedded in the URL.
- * The callback route is unauthenticated (validated by API token in the controller).
- */
-
-// HLS playlist for in-progress DVR recordings. Must be declared before the generic
-// dvr.recording.stream route so Laravel does not consume "live.m3u8" as {uuid}.{format?}.
-// Only the playlist (~1 KB) passes through the editor; segment URLs are rewritten to
-// point directly at the proxy's public segment endpoint.
-Route::get('/dvr/{username}/{password}/{uuid}/live.m3u8', [DvrStreamController::class, 'hlsPlaylist'])
-    ->name('dvr.recording.hls.playlist');
-
-Route::get('/dvr/{username}/{password}/{uuid}/edl', [DvrStreamController::class, 'edl'])
-    ->name('dvr.recording.edl');
-
-Route::get('/dvr/{username}/{password}/{uuid}.{format?}', [DvrStreamController::class, 'stream'])
-    ->name('dvr.recording.stream');
+// NOTE: The DVR file streaming routes (dvr.recording.*) were relocated earlier in
+// this file, ahead of the /{uuid}/hdhr/... catch-all, so the HDHR pattern no
+// longer swallows /dvr/... URLs. See the "DVR file streaming routes" block above.

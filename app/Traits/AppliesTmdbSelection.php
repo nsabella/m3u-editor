@@ -174,15 +174,28 @@ trait AppliesTmdbSelection
 
             if (! empty($details['vote_average'])) {
                 $info['rating'] = $details['vote_average'];
+                $info['vote_count'] = $details['vote_count'] ?? null;
             }
 
             if (! empty($details['backdrop_url'])) {
                 $info['backdrop_path'] = [$details['backdrop_url']];
             }
 
+            if (! empty($details['logo_url'])) {
+                $info['clearlogo'] = $details['logo_url'];
+            }
+
             if (! empty($details['cast'])) {
                 $info['cast'] = is_array($details['cast']) ? implode(', ', $details['cast']) : $details['cast'];
             }
+
+            if (! empty($details['cast_list'])) {
+                $info['cast_list'] = $details['cast_list'];
+            }
+
+            // Always set, even to an empty array: it doubles as the "TMDB has been
+            // checked" sentinel FetchTmdbIds' on-demand backfill gate relies on.
+            $info['related_tmdb'] = $details['recommendations'] ?? [];
 
             if (! empty($details['director'])) {
                 $info['director'] = is_array($details['director']) ? implode(', ', $details['director']) : $details['director'];
@@ -191,6 +204,14 @@ trait AppliesTmdbSelection
             if (! empty($details['youtube_trailer'])) {
                 $info['youtube_trailer'] = $details['youtube_trailer'];
             }
+
+            if (! empty($details['certification'])) {
+                $info['mpaa_rating'] = $details['certification'];
+            }
+
+            // Always set, even to null: the on-demand backfill sentinel.
+            $info['tmdb_certification'] = $details['certification'] ?? null;
+            $info['studios'] = ($details['studios'] ?? []) ?: ($info['studios'] ?? []);
 
             if (! empty($details['runtime']) && (empty($info['duration_secs']) || ($info['duration_secs'] ?? 0) === 0)) {
                 $runtimeMinutes = (int) $details['runtime'];
@@ -329,15 +350,32 @@ trait AppliesTmdbSelection
 
             if (! empty($details['vote_average']) && empty($series->rating)) {
                 $updateData['rating'] = $details['vote_average'];
+                $seriesMetadata['vote_count'] = $details['vote_count'] ?? null;
             }
 
             if (! empty($details['backdrop_url'])) {
                 $updateData['backdrop_path'] = json_encode([$details['backdrop_url']]);
             }
 
+            if (! empty($details['logo_url'])) {
+                $seriesMetadata['clearlogo'] = $details['logo_url'];
+            }
+
             if (! empty($details['cast'])) {
                 $updateData['cast'] = is_array($details['cast']) ? implode(', ', $details['cast']) : $details['cast'];
             }
+
+            if (! empty($details['cast_list'])) {
+                $seriesMetadata['cast_list'] = $details['cast_list'];
+            }
+
+            // Always set, even to null/[]: together they're the on-demand backfill sentinel.
+            $seriesMetadata['content_rating'] = $details['certification'] ?? null;
+            $seriesMetadata['networks'] = ($details['networks'] ?? []) ?: ($seriesMetadata['networks'] ?? []);
+
+            // Always set, even to an empty array: it doubles as the "TMDB has been
+            // checked" sentinel FetchTmdbIds' on-demand backfill gate relies on.
+            $seriesMetadata['related_tmdb'] = $details['recommendations'] ?? [];
 
             if (! empty($details['director'])) {
                 $updateData['director'] = is_array($details['director']) ? implode(', ', $details['director']) : $details['director'];

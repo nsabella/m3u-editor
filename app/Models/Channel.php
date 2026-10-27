@@ -3,7 +3,9 @@
 namespace App\Models;
 
 use App\Enums\ChannelLogoType;
+use App\Enums\PlaylistChannelId;
 use App\Enums\PlaylistSourceType;
+use App\Exceptions\XtreamRateLimitedException;
 use App\Jobs\FetchTmdbIds;
 use App\Models\Scopes\ExcludeAioFailoverClonesScope;
 use App\Observers\ChannelObserver;
@@ -11,6 +13,8 @@ use App\Services\PlaylistService;
 use App\Services\StreamProfileRuleEvaluator;
 use App\Services\XtreamService;
 use App\Settings\GeneralSettings;
+use App\Support\ChannelNumber;
+use App\Support\TmdbEnrichment;
 use Exception;
 use Filament\Notifications\Notification;
 use Illuminate\Database\Eloquent\Attributes\ObservedBy;
@@ -20,7 +24,9 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\HasManyThrough;
+use Illuminate\Database\Eloquent\Relations\HasOne;
 use Illuminate\Database\Eloquent\Relations\MorphMany;
+use Illuminate\Database\Eloquent\Relations\MorphOne;
 use Illuminate\Database\Eloquent\Relations\MorphToMany;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\URL;
@@ -59,6 +65,7 @@ class Channel extends Model
         'id' => 'integer',
         'enabled' => 'boolean',
         'channel' => 'integer',
+        'channel_minor' => 'integer',
         'shift' => 'integer',
         'user_id' => 'integer',
         'playlist_id' => 'integer',
@@ -70,6 +77,7 @@ class Channel extends Model
         'is_custom' => 'boolean',
         'is_vod' => 'boolean',
         'enable_proxy' => 'boolean',
+        'proxy_options' => 'array',
         'tmdb_id' => 'integer',
         'tvdb_id' => 'integer',
         'imdb_id' => 'string',
@@ -77,6 +85,7 @@ class Channel extends Model
         'movie_data' => 'array',
         'sync_settings' => 'array',
         'last_metadata_fetch' => 'datetime',
+        'source_added_at' => 'datetime',
         'aed_profile_id' => 'integer',
         'epg_map_enabled' => 'boolean',
         'logo_type' => ChannelLogoType::class,
@@ -151,9 +160,42 @@ class Channel extends Model
         return (bool) ($playlist?->enable_proxy ?? false);
     }
 
+    /**
+     * Shared proxy-eligibility rule used by both live streaming (XtreamStreamController)
+     * and static output generation (PlaylistGenerateController::generate*), so the two
+     * stay in sync instead of maintaining separate copies of the same rule.
+     *
+     * A channel is proxied when the user's plan allows it and any of: the channel itself
+     * force-enables the proxy, the playlist being streamed/output through has it enabled,
+     * the request explicitly asked for it, or the channel's own source playlist pools
+     * provider profiles (profile selection/pool distribution only happens on the proxy path).
+     */
+    public static function needsProxy(
+        bool $channelEnableProxy,
+        bool $playlistEnableProxy,
+        bool $requestProxyFlag,
+        bool $sourcePlaylistProfilesEnabled,
+        bool $userCanUseProxy
+    ): bool {
+        return $userCanUseProxy && (
+            $channelEnableProxy
+            || $playlistEnableProxy
+            || $requestProxyFlag
+            || $sourcePlaylistProfilesEnabled
+        );
+    }
+
     public function playlist(): BelongsTo
     {
         return $this->belongsTo(Playlist::class);
+    }
+
+    /**
+     * The media-server source match when this channel is the provider movie.
+     */
+    public function mediaSourceMatch(): HasOne
+    {
+        return $this->hasOne(MediaSourceMatch::class);
     }
 
     /**
@@ -186,6 +228,65 @@ class Channel extends Model
         return $this->belongsTo(Group::class);
     }
 
+    /**
+     * TMDB-computed dynamic groups this channel belongs to.
+     * Inverse of DynamicGroup::channels() on the polymorphic
+     * `dynamic_group_items` pivot table.
+     */
+    public function dynamicGroups(): MorphToMany
+    {
+        return $this->morphToMany(DynamicGroup::class, 'item', 'dynamic_group_items');
+    }
+
+    /**
+     * TMDB/TVDB identity of this movie, used to find a cached copy shared by
+     * another of the same user's playlists. Channels without an external id
+     * get a per-channel key so they never match anything else.
+     */
+    public function cacheFingerprint(): string
+    {
+        $tmdbId = $this->tmdb_id !== null ? (string) $this->tmdb_id : null;
+        $tvdbId = $this->tvdb_id !== null ? (string) $this->tvdb_id : null;
+
+        return CachedContentFile::fingerprintFor([
+            'content_type' => 'movie',
+            'tmdb_id' => $tmdbId,
+            'tvdb_id' => $tvdbId,
+            'local_key' => ($tmdbId === null || $tmdbId === '') && ($tvdbId === null || $tvdbId === '')
+                ? 'ch'.$this->id
+                : null,
+        ]);
+    }
+
+    /**
+     * The cached file downloaded for this channel, if any (any status).
+     */
+    public function cachedContentFile(): MorphOne
+    {
+        return $this->morphOne(CachedContentFile::class, 'cacheable');
+    }
+
+    /**
+     * Provider URL a cache download fetches (honors a custom URL override).
+     */
+    public function cacheSourceUrl(): string
+    {
+        return (string) ($this->url_custom ?: $this->url);
+    }
+
+    /**
+     * Whether a Completed cached file can serve this channel: its own, or
+     * one shared by another of the same user's playlists.
+     */
+    public function isCached(): bool
+    {
+        if (! $this->playlist_id) {
+            return false;
+        }
+
+        return CachedContentFile::query()->servableFor($this)->exists();
+    }
+
     public function streamFileSetting(): BelongsTo
     {
         return $this->belongsTo(StreamFileSetting::class);
@@ -195,6 +296,12 @@ class Channel extends Model
     {
         return $this->belongsTo(EpgChannel::class)
             ->withoutEagerLoads();
+    }
+
+    /** The DVR recording this VOD channel was integrated from, if any. */
+    public function dvrRecording(): BelongsTo
+    {
+        return $this->belongsTo(DvrRecording::class);
     }
 
     public function aedProfile(): BelongsTo
@@ -249,6 +356,39 @@ class Channel extends Model
     public function getDisplayTitleAttribute(): string
     {
         return $this->title_custom ?? $this->title ?? $this->name_custom ?? $this->name ?? '';
+    }
+
+    /**
+     * The channel's own output number ("5" or "5.1"), before any playlist numbering.
+     * In a custom playlist context the pivot number (and its minor) wins when set.
+     */
+    public function resolveChannelNumber(bool $isCustomContext = false): int|string|null
+    {
+        $pivot = $isCustomContext ? $this->pivot : null;
+
+        return ChannelNumber::resolve(
+            $this->channel,
+            $this->channel_minor,
+            $pivot?->channel_number,
+            $pivot?->channel_minor,
+        );
+    }
+
+    /**
+     * Resolve the TVG/channel ID to output for the given playlist's "Preferred TVG ID output"
+     * setting. Used to keep the M3U, xmltv, Xtream API, and JSON EPG API outputs consistent
+     * with each other (e.g. so `epg_channel_id` matches the `<programme channel="...">` used
+     * in the generated xmltv guide data).
+     */
+    public function resolveTvgId(PlaylistChannelId $idChannelBy, int|string|null $channelNumber = null): int|string|null
+    {
+        return match ($idChannelBy) {
+            PlaylistChannelId::ChannelId => $this->id,
+            PlaylistChannelId::Number => $channelNumber,
+            PlaylistChannelId::Name => $this->name_custom ?? $this->name,
+            PlaylistChannelId::Title => $this->title_custom ?? $this->title,
+            default => $this->stream_id_custom ?? $this->source_id ?? $this->stream_id,
+        };
     }
 
     public function getFloatingPlayerAttributes(?string $username = null, ?string $password = null): array
@@ -354,7 +494,7 @@ class Channel extends Model
             $password = urlencode($password);
         } else {
             $username = urlencode($user->name ?? 'admin');
-            $password = urlencode($playlist->uuid);
+            $password = urlencode($playlist->getInternalAuthPassword());
         }
 
         // Build the proxy URL path
@@ -444,13 +584,14 @@ class Channel extends Model
      *
      * Returns a flat list of entries, each with one of two shapes:
      *   - Stream entry:  ['stream' => ['codec_type' => string, 'codec_name' => string, ...]]
-     *   - Format entry:  ['format' => ['bit_rate' => string]]  (appended once when available)
+     *   - Format entry:  ['format' => ['format_name' => ?string, 'bit_rate' => ?string]]  (appended once when available)
      *
-     * The format entry carries the container-level bit_rate from `-show_format`. It is used
-     * as a fallback video bitrate for live MPEG-TS streams where ffprobe cannot determine
-     * a per-stream bit_rate. See getEmbyStreamStats() for the derivation logic.
+     * The format entry carries the container-level format_name and bit_rate from `-show_format`.
+     * The bit_rate is used as a fallback video bitrate for live MPEG-TS streams where ffprobe
+     * cannot determine a per-stream bit_rate (see getEmbyStreamStats()); format_name is used by
+     * adaptive stream profile rules (see StreamProfileRuleEvaluator).
      *
-     * @return list<array{stream: array{codec_type: string, codec_name: string, codec_long_name: ?string, profile: ?string, width: ?int, height: ?int, bit_rate: ?string, avg_frame_rate: ?string, display_aspect_ratio: ?string, sample_rate: ?string, channels: ?int, channel_layout: ?string, level: ?int, bits_per_raw_sample: ?string, refs: ?int, tags: array<string, string>}}|array{format: array{bit_rate: string}}>
+     * @return list<array{stream: array{codec_type: string, codec_name: string, codec_long_name: ?string, profile: ?string, width: ?int, height: ?int, bit_rate: ?string, avg_frame_rate: ?string, display_aspect_ratio: ?string, sample_rate: ?string, channels: ?int, channel_layout: ?string, level: ?int, bits_per_raw_sample: ?string, refs: ?int, tags: array<string, string>}}|array{format: array{format_name: ?string, bit_rate: ?string}}>
      */
     public function probeStreamStats(int $timeout = 15): array
     {
@@ -508,9 +649,13 @@ class Channel extends Model
                 // bit_rate (no CBR container, unknown duration). Capture the
                 // container-level bit_rate from -show_format so we can derive a
                 // sensible video bitrate fallback in getEmbyStreamStats().
+                $formatName = $json['format']['format_name'] ?? null;
                 $formatBitRate = $json['format']['bit_rate'] ?? null;
-                if ($formatBitRate !== null) {
-                    $streamStats[] = ['format' => ['bit_rate' => $formatBitRate]];
+                if ($formatName !== null || $formatBitRate !== null) {
+                    $streamStats[] = ['format' => [
+                        'format_name' => $formatName,
+                        'bit_rate' => $formatBitRate,
+                    ]];
                 }
 
                 return $streamStats;
@@ -715,7 +860,7 @@ class Channel extends Model
         });
     }
 
-    public function fetchMetadata($xtream = null, $refresh = false, bool $skipTmdb = false)
+    public function fetchMetadata($xtream = null, $refresh = false, bool $skipTmdb = false, bool $preferTmdb = false)
     {
         if (! $this->is_vod) {
             return false;
@@ -755,6 +900,19 @@ class Channel extends Model
                 }
 
                 $movieData = $xtream->getVodInfo($this->source_id, timeout: 60);
+
+                // XtreamService::call() swallows HTTP/transport failures and returns
+                // null (surfaced here as an empty array) rather than throwing, so an
+                // entirely failed provider request looks identical to "the provider
+                // has nothing to say about this VOD" unless we check for it explicitly.
+                // Without this, a failed fetch would still persist last_metadata_fetch
+                // and report success, hiding the failure from the caller.
+                if (empty($movieData['info'] ?? null)) {
+                    Log::warning("VOD metadata fetch returned no data for channel {$this->id} (source_id: {$this->source_id})");
+
+                    return false;
+                }
+
                 $releaseDate = $movieData['info']['release_date'] ?? null;
                 $releaseDateAlt = $movieData['info']['releasedate'] ?? null;
                 $year = $this->year;
@@ -762,10 +920,8 @@ class Channel extends Model
                     // Make sure base release_date is always set
                     $movieData['info']['release_date'] = $releaseDateAlt;
                 }
-                if ($releaseDate || $releaseDateAlt) {
-                    // If either data is set, and year is not set, update it
+                if (empty($year) && ($releaseDate || $releaseDateAlt)) {
                     $dateToParse = $releaseDate ?? $releaseDateAlt;
-                    $year = null;
                     try {
                         $date = new \DateTime($dateToParse);
                         $year = (int) $date->format('Y');
@@ -775,7 +931,14 @@ class Channel extends Model
                 }
                 $update = [
                     'year' => $year,
-                    'info' => $movieData['info'] ?? null,
+                    // Keep TMDB-only enrichment (cast_list/clearlogo/related_tmdb) the
+                    // provider payload never carries, or this refresh would wipe it. With
+                    // $preferTmdb, TMDB-owned fields on an enriched row also win over the provider.
+                    'info' => TmdbEnrichment::preserveOnProviderRefresh(
+                        $this->info,
+                        $movieData['info'] ?? null,
+                        $preferTmdb ? TmdbEnrichment::PREFERRED_VOD_INFO_KEYS : [],
+                    ),
                     'movie_data' => $movieData['movie_data'] ?? null,
                     'last_metadata_fetch' => now(),
                 ];
@@ -795,11 +958,29 @@ class Channel extends Model
             }
 
             return true;
+        } catch (XtreamRateLimitedException $e) {
+            // Let the account-wide cooldown propagate to the caller (e.g.
+            // ProcessVodChannelsChunk) instead of being swallowed here as a
+            // single-channel failure — the caller needs to know to stop
+            // trying the rest of its batch, not just this one channel.
+            throw $e;
         } catch (Exception $e) {
             Log::error('Failed to fetch metadata for VOD '.$this->id, ['exception' => $e]);
         }
 
         return false;
+    }
+
+    /**
+     * The US certification (e.g. "PG-13"): the provider's mpaa_rating first, then
+     * TMDB's persisted certification. Shared by get_vod_info, the movie .nfo and the view page.
+     */
+    public function getContentRating(): ?string
+    {
+        $info = is_array($this->info) ? $this->info : [];
+        $rating = ($info['mpaa_rating'] ?? null) ?: ($info['tmdb_certification'] ?? null);
+
+        return filled($rating) ? (string) $rating : null;
     }
 
     public function getTmdbId(): ?int
@@ -862,6 +1043,20 @@ class Channel extends Model
         return $query->notAioManaged()->where('probe_enabled', true);
     }
 
+    /**
+     * Channels that incremental probing should pick up: never probed, or a failed probe
+     * (probed_at set, no stream_stats) whose last attempt is at least $retryFailedAfterDays old.
+     * A retry window of 0 retries failures on every run.
+     */
+    public function scopeDueForProbe(Builder $query, int $retryFailedAfterDays): Builder
+    {
+        return $query->where(fn (Builder $q) => $q
+            ->whereNull('stream_stats_probed_at')
+            ->orWhere(fn (Builder $q) => $q
+                ->whereNull('stream_stats')
+                ->where('stream_stats_probed_at', '<=', now()->subDays($retryFailedAfterDays))));
+    }
+
     public function scopeHasMovieId(Builder $query): Builder
     {
         $isPgsql = config('database.connections.'.config('database.default').'.driver') === 'pgsql';
@@ -871,14 +1066,17 @@ class Channel extends Model
                 ->orWhereNotNull('imdb_id');
 
             if ($isPgsql) {
-                $q->orWhereRaw("info::jsonb ?? 'tmdb_id'")
-                    ->orWhereRaw("info::jsonb ?? 'tmdb'")
-                    ->orWhereRaw("movie_data::jsonb ?? 'tmdb_id'")
-                    ->orWhereRaw("movie_data::jsonb ?? 'tmdb'")
-                    ->orWhereRaw("info::jsonb ?? 'imdb_id'")
-                    ->orWhereRaw("info::jsonb ?? 'imdb'")
-                    ->orWhereRaw("movie_data::jsonb ?? 'imdb_id'")
-                    ->orWhereRaw("movie_data::jsonb ?? 'imdb'");
+                // ->>'key' (value), not ?? 'key' (key existence): a key can be present with a
+                // null/empty value (e.g. a prior failed enrichment), which should still count
+                // as "no ID" - the ?? operator would wrongly call that "has an ID" (issue #1645).
+                $q->orWhereRaw("info::jsonb->>'tmdb_id' IS NOT NULL AND info::jsonb->>'tmdb_id' != ''")
+                    ->orWhereRaw("info::jsonb->>'tmdb' IS NOT NULL AND info::jsonb->>'tmdb' != ''")
+                    ->orWhereRaw("movie_data::jsonb->>'tmdb_id' IS NOT NULL AND movie_data::jsonb->>'tmdb_id' != ''")
+                    ->orWhereRaw("movie_data::jsonb->>'tmdb' IS NOT NULL AND movie_data::jsonb->>'tmdb' != ''")
+                    ->orWhereRaw("info::jsonb->>'imdb_id' IS NOT NULL AND info::jsonb->>'imdb_id' != ''")
+                    ->orWhereRaw("info::jsonb->>'imdb' IS NOT NULL AND info::jsonb->>'imdb' != ''")
+                    ->orWhereRaw("movie_data::jsonb->>'imdb_id' IS NOT NULL AND movie_data::jsonb->>'imdb_id' != ''")
+                    ->orWhereRaw("movie_data::jsonb->>'imdb' IS NOT NULL AND movie_data::jsonb->>'imdb' != ''");
             }
         });
     }
@@ -891,22 +1089,26 @@ class Channel extends Model
             return $query;
         }
 
+        // ->>'key' (value), not ?? 'key' (key existence): a key can be present with a
+        // null/empty value (e.g. a prior failed enrichment), which should still count as
+        // "no ID" here too, so this stays the exact negation of scopeHasMovieId() above
+        // instead of excluding rows that ought to match (issue #1645).
         return $query->where(function (Builder $q) {
             $q->where(function (Builder $inner) {
                 $inner->whereNull('info')
                     ->orWhere(function (Builder $i) {
-                        $i->whereRaw("NOT (info::jsonb ?? 'tmdb_id')")
-                            ->whereRaw("NOT (info::jsonb ?? 'tmdb')")
-                            ->whereRaw("NOT (info::jsonb ?? 'imdb_id')")
-                            ->whereRaw("NOT (info::jsonb ?? 'imdb')");
+                        $i->whereRaw("(info::jsonb->>'tmdb_id' IS NULL OR info::jsonb->>'tmdb_id' = '')")
+                            ->whereRaw("(info::jsonb->>'tmdb' IS NULL OR info::jsonb->>'tmdb' = '')")
+                            ->whereRaw("(info::jsonb->>'imdb_id' IS NULL OR info::jsonb->>'imdb_id' = '')")
+                            ->whereRaw("(info::jsonb->>'imdb' IS NULL OR info::jsonb->>'imdb' = '')");
                     });
             })->where(function (Builder $inner) {
                 $inner->whereNull('movie_data')
                     ->orWhere(function (Builder $i) {
-                        $i->whereRaw("NOT (movie_data::jsonb ?? 'tmdb_id')")
-                            ->whereRaw("NOT (movie_data::jsonb ?? 'tmdb')")
-                            ->whereRaw("NOT (movie_data::jsonb ?? 'imdb_id')")
-                            ->whereRaw("NOT (movie_data::jsonb ?? 'imdb')");
+                        $i->whereRaw("(movie_data::jsonb->>'tmdb_id' IS NULL OR movie_data::jsonb->>'tmdb_id' = '')")
+                            ->whereRaw("(movie_data::jsonb->>'tmdb' IS NULL OR movie_data::jsonb->>'tmdb' = '')")
+                            ->whereRaw("(movie_data::jsonb->>'imdb_id' IS NULL OR movie_data::jsonb->>'imdb_id' = '')")
+                            ->whereRaw("(movie_data::jsonb->>'imdb' IS NULL OR movie_data::jsonb->>'imdb' = '')");
                     });
             });
         });

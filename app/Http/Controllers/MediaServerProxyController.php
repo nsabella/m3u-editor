@@ -2,18 +2,24 @@
 
 namespace App\Http\Controllers;
 
+use App\Enums\ImageProfile;
 use App\Facades\ProxyFacade;
+use App\Http\Controllers\Concerns\StreamLocalFile;
 use App\Models\Channel;
 use App\Models\Episode;
 use App\Models\MediaServerIntegration;
 use App\Models\Scopes\ExcludeAioFailoverClonesScope;
+use App\Services\LogoCacheService;
 use App\Services\MediaServerService;
+use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Http\Client\Response as ClientResponse;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\URL;
 use Illuminate\Support\Str;
 use Symfony\Component\HttpFoundation\StreamedResponse;
@@ -26,6 +32,12 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
  */
 class MediaServerProxyController extends Controller
 {
+    /**
+     * Hours a cached media server image is served before it is refetched, so
+     * artwork changed on the media server shows up within a day.
+     */
+    private const IMAGE_CACHE_HOURS = 24;
+
     /**
      * Proxy an image from the media server.
      *
@@ -53,50 +65,62 @@ class MediaServerProxyController extends Controller
                 return response()->json(['error' => 'Integration is disabled'], 403);
             }
 
-            // Build cache key for this image
-            $cacheKey = "media_server_image_{$integrationId}_{$itemId}_{$imageType}";
+            // Artwork is cached on disk at the size its image type calls for
+            // (Primary = poster, Backdrop = backdrop, Logo = title logo), keyed
+            // by integration/item/type rather than by the signed URL.
+            $profile = ImageProfile::fromMediaServerImageType($imageType);
+            $sourceKey = LogoCacheService::mediaServerSourceKey($integrationId, $itemId, $imageType);
 
-            // Check cache first (cache for 24 hours)
-            $cachedResponse = Cache::get($cacheKey);
-            if ($cachedResponse) {
-                return response($cachedResponse['body'], 200, $cachedResponse['headers']);
+            $cacheFile = LogoCacheService::findImage($sourceKey, $profile, self::IMAGE_CACHE_HOURS);
+            if ($cacheFile) {
+                return $this->imageResponse($cacheFile);
             }
 
             $mediaServer = MediaServerService::make($integration);
-            $imageUrl = $mediaServer->getDirectImageUrl($itemId, $imageType);
+            $maxWidth = $profile->maxWidth();
 
-            // Fetch the image with authentication
-            $response = Http::withHeaders([
-                'Accept' => 'image/*',
-            ])->timeout(30)->get($imageUrl);
+            // Ask the media server for a right-sized copy so the editor rarely
+            // has to resize anything itself (null = original size).
+            try {
+                $response = $this->fetchImage($mediaServer->getDirectImageUrl($itemId, $imageType, $maxWidth));
+
+                // A server that rejects the resize request still serves the
+                // original, which storeImage() then downscales locally.
+                if ($maxWidth !== null && ! $response->successful() && $response->status() !== 404) {
+                    $response = $this->fetchImage($mediaServer->getDirectImageUrl($itemId, $imageType));
+                }
+            } catch (ConnectionException $e) {
+                // The media server is unreachable: an expired copy beats a broken image.
+                $staleFile = LogoCacheService::findAnyCopy($sourceKey);
+                if ($staleFile) {
+                    return $this->imageResponse($staleFile);
+                }
+
+                throw $e;
+            }
 
             if ($response->successful()) {
                 $body = $response->body();
-                $contentType = $response->header('Content-Type', 'image/jpeg');
+                $contentType = $response->header('Content-Type') ?: 'image/jpeg';
 
-                // Prepare headers for the proxied response
-                $headers = [
-                    'Content-Type' => $contentType,
-                    'Content-Length' => strlen($body),
-                    'Cache-Control' => 'public, max-age=86400', // Cache for 24 hours
-                    'X-Proxied-From' => 'MediaServer',
-                ];
-
-                // Cache the successful response for 24 hours
-                Cache::put($cacheKey, [
-                    'body' => $body,
-                    'headers' => $headers,
-                ], now()->addHours(24));
+                $cacheFile = LogoCacheService::storeImage($sourceKey, $body, $contentType, $profile);
 
                 Log::debug('Successfully proxied media server image', [
                     'integration_id' => $integrationId,
                     'item_id' => $itemId,
                     'image_type' => $imageType,
                     'content_type' => $contentType,
-                    'size_bytes' => strlen($body),
+                    'fetched_bytes' => strlen($body),
+                    'cached_bytes' => Storage::disk('local')->size($cacheFile),
                 ]);
 
-                return response($body, 200, $headers);
+                return $this->imageResponse($cacheFile, $contentType);
+            }
+
+            // The media server refused: an expired copy beats a broken image.
+            $staleFile = LogoCacheService::findAnyCopy($sourceKey);
+            if ($staleFile) {
+                return $this->imageResponse($staleFile);
             }
 
             Log::warning('Failed to fetch media server image', [
@@ -122,6 +146,20 @@ class MediaServerProxyController extends Controller
                 'error' => 'Internal server error while proxying image',
             ], 500);
         }
+    }
+
+    private function fetchImage(string $url): ClientResponse
+    {
+        return Http::withHeaders([
+            'Accept' => 'image/*',
+        ])->timeout(30)->get($url);
+    }
+
+    private function imageResponse(string $cacheFile, ?string $contentType = null): StreamedResponse
+    {
+        return LogoCacheService::streamResponse($cacheFile, $contentType, self::IMAGE_CACHE_HOURS * 3600, [
+            'X-Proxied-From' => 'MediaServer',
+        ]);
     }
 
     /**
@@ -428,77 +466,22 @@ class MediaServerProxyController extends Controller
             $extension = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
             $contentType = $this->getContentTypeForContainer($extension);
 
-            // Handle range requests for video seeking
-            $start = 0;
-            $end = $fileSize - 1;
-            $statusCode = 200;
-
-            $headers = [
-                'Content-Type' => $contentType,
-                'Accept-Ranges' => 'bytes',
-                'Content-Disposition' => 'inline; filename="'.basename($filePath).'"',
-                'X-Content-Duration' => 'unknown',
-            ];
-
-            if ($request->hasHeader('Range')) {
-                $range = $request->header('Range');
-
-                if (preg_match('/bytes=(\d*)-(\d*)/', $range, $matches)) {
-                    $start = $matches[1] !== '' ? (int) $matches[1] : 0;
-                    $end = $matches[2] !== '' ? (int) $matches[2] : $fileSize - 1;
-
-                    // Validate range
-                    if ($start > $end || $start >= $fileSize) {
-                        return response('', 416, [
-                            'Content-Range' => "bytes */{$fileSize}",
-                        ]);
-                    }
-
-                    $end = min($end, $fileSize - 1);
-                    $statusCode = 206;
-                    $headers['Content-Range'] = "bytes {$start}-{$end}/{$fileSize}";
-                }
-            }
-
-            $length = $end - $start + 1;
-            $headers['Content-Length'] = $length;
-
             Log::debug('Streaming local media file', [
                 'integration_id' => $integration,
                 'file_path' => $filePath,
                 'file_size' => $fileSize,
                 'range' => $request->header('Range'),
-                'start' => $start,
-                'end' => $end,
-                'length' => $length,
             ]);
 
-            return new StreamedResponse(function () use ($filePath, $start, $end) {
-                $handle = fopen($filePath, 'rb');
-
-                if (! $handle) {
-                    return;
-                }
-
-                fseek($handle, $start);
-                $remaining = $end - $start + 1;
-                $bufferSize = 1024 * 1024; // 1MB chunks
-
-                while ($remaining > 0 && ! feof($handle) && connection_status() === CONNECTION_NORMAL) {
-                    $readSize = min($bufferSize, $remaining);
-                    $data = fread($handle, $readSize);
-
-                    if ($data === false) {
-                        break;
-                    }
-
-                    echo $data;
-                    flush();
-                    $remaining -= strlen($data);
-                }
-
-                fclose($handle);
-            }, $statusCode, $headers);
+            return StreamLocalFile::serve(
+                fullPath: $filePath,
+                fileSize: $fileSize,
+                mimeType: $contentType,
+                filename: basename($filePath),
+                range: $request->header('Range'),
+                extraHeaders: ['X-Content-Duration' => 'unknown'],
+                chunkSize: 1024 * 1024,
+            );
         } catch (\Exception $e) {
             Log::error('Exception in local media stream', [
                 'integration_id' => $integration,
@@ -1030,7 +1013,21 @@ class MediaServerProxyController extends Controller
             'has_range' => $request->hasHeader('Range'),
         ]);
 
-        return new StreamedResponse(function () use ($resolvedUrl, $requestHeaders) {
+        // Set sensible default headers BEFORE the curl stream starts.
+        // ExoPlayer/Media3 probes with a HEAD request before playing; if no
+        // headers are set yet (they're lazily applied on first body chunk in
+        // the WRITEFUNCTION), the response defaults to text/html and the
+        // player rejects the source.  These defaults are overridden by the
+        // real upstream headers once the first body byte arrives.
+        //
+        // ExoPlayer/Media3 refuses to probe a huge response served as generic
+        // application/octet-stream, so we set a concrete video MIME type based
+        // on the resolved URL's file extension (e.g. .mkv -> video/x-matroska).
+        // This mirrors what the upstream debrid host serves for the same file,
+        // which is what lets other players (Nuvio/Stremio) play it directly.
+        $contentType = self::mimeForUrl($resolvedUrl);
+
+        $response = new StreamedResponse(function () use ($resolvedUrl, $requestHeaders, $contentType) {
             $ch = curl_init($resolvedUrl);
             curl_setopt($ch, CURLOPT_HTTPHEADER, array_map(
                 fn ($k, $v) => "{$k}: {$v}",
@@ -1069,7 +1066,7 @@ class MediaServerProxyController extends Controller
 
             $responseStarted = false;
 
-            curl_setopt($ch, CURLOPT_WRITEFUNCTION, function ($ch, $data) use (&$responseStarted, &$finalHeaders) {
+            curl_setopt($ch, CURLOPT_WRITEFUNCTION, function ($ch, $data) use (&$responseStarted, &$finalHeaders, $contentType) {
                 // See other proxy methods in this class: a seek abandons this
                 // connection without closing it, and ignore_user_abort(true) means
                 // PHP won't notice unless we check here.
@@ -1083,7 +1080,12 @@ class MediaServerProxyController extends Controller
                     $status = $finalHeaders['status'] ?? 200;
                     http_response_code(in_array($status, [200, 206], true) ? $status : 200);
 
-                    header('Content-Type: '.($finalHeaders['content-type'] ?? 'application/octet-stream'));
+                    // Prefer the concrete MIME type derived from the URL extension
+                    // over a generic upstream type (application/octet-stream,
+                    // binary/octet-stream, an empty header, ...), which
+                    // ExoPlayer/Media3 refuses to probe for large files.
+                    $upstreamContentType = $finalHeaders['content-type'] ?? '';
+                    header('Content-Type: '.self::resolveStreamContentType($upstreamContentType, $contentType));
                     header('Accept-Ranges: bytes');
                     header('X-Proxied-From: AIOStreams');
 
@@ -1121,5 +1123,73 @@ class MediaServerProxyController extends Controller
                 echo json_encode(['error' => 'Failed to reach the resolved upstream URL']);
             }
         });
+
+        // Set headers on the StreamedResponse object (Symfony sends these,
+        // not raw header() calls which are overridden).
+        $response->headers->set('Content-Type', $contentType);
+        $response->headers->set('Accept-Ranges', 'bytes');
+        $response->headers->set('X-Proxied-From', 'AIOStreams');
+
+        // When the client sends a Range request on a GET, mark the envelope 206
+        // up front; the WRITEFUNCTION callback still corrects it to the real
+        // upstream status (200 if the host ignored the Range) before the first
+        // body byte, and adds Content-Range / Content-Length there.
+        //
+        // A HEAD request never runs that callback (Symfony nulls the body for
+        // HEAD, so sendContent() returns early), which means Content-Range and
+        // Content-Length would be absent - a 206 without them is malformed and
+        // strict players reject it. Leave HEAD as a 200 probe response.
+        if ($request->hasHeader('Range') && ! $request->isMethod('HEAD')) {
+            $response->setStatusCode(206);
+        }
+
+        return $response;
+    }
+
+    /**
+     * Pick the Content-Type to serve for a proxied stream.
+     *
+     * A concrete video/* type from the upstream host is the most accurate and
+     * always wins. Otherwise the upstream type is generic
+     * (application/octet-stream, binary/octet-stream, an empty header, or an
+     * error page's text/html) and ExoPlayer/Media3 refuses to probe it, so fall
+     * back to the type derived from the URL's file extension when one resolved.
+     */
+    private static function resolveStreamContentType(string $upstreamContentType, string $urlContentType): string
+    {
+        $normalized = strtolower(trim(Str::before($upstreamContentType, ';')));
+
+        if (str_starts_with($normalized, 'video/')) {
+            return $upstreamContentType;
+        }
+
+        if ($urlContentType !== 'application/octet-stream') {
+            return $urlContentType;
+        }
+
+        return $upstreamContentType !== '' ? $upstreamContentType : 'application/octet-stream';
+    }
+
+    /**
+     * Resolve a concrete video MIME type from a media URL's file extension.
+     * Returns application/octet-stream when the extension is unknown.
+     */
+    private static function mimeForUrl(string $url): string
+    {
+        $extension = strtolower(pathinfo(parse_url($url, PHP_URL_PATH) ?? '', PATHINFO_EXTENSION));
+
+        return match ($extension) {
+            'mkv' => 'video/x-matroska',
+            'webm' => 'video/webm',
+            'mp4', 'm4v' => 'video/mp4',
+            'mov' => 'video/quicktime',
+            'avi' => 'video/x-msvideo',
+            'mpg', 'mpeg' => 'video/mpeg',
+            'ts', 'm2ts', 'mts' => 'video/mp2t',
+            'flv' => 'video/x-flv',
+            'wmv' => 'video/x-ms-wmv',
+            '3gp' => 'video/3gpp',
+            default => 'application/octet-stream',
+        };
     }
 }

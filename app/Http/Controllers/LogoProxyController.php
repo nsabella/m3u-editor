@@ -2,15 +2,18 @@
 
 namespace App\Http\Controllers;
 
+use App\Enums\ImageProfile;
 use App\Services\LogoCacheService;
 use App\Settings\GeneralSettings;
+use App\Support\PrivateNetworkGuard;
 use Carbon\Carbon;
-use Illuminate\Http\Client\Response as HttpClientResponse;
+use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
+use InvalidArgumentException;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 
 class LogoProxyController extends Controller
@@ -29,13 +32,12 @@ class LogoProxyController extends Controller
                 return $this->returnPlaceholder();
             }
 
-            // Make sure the cache directory exists
-            Storage::disk('local')->makeDirectory(LogoCacheService::CACHE_DIRECTORY);
+            $profile = $this->resolveProfile($request);
 
-            // Check if the logo is already cached
-            $cacheFile = LogoCacheService::findCacheFileForUrl($originalUrl);
-            if ($cacheFile && Storage::disk('local')->exists($cacheFile)) {
-                return $this->serveFromCache($cacheFile);
+            // Check if the logo is already cached (for this profile, if any)
+            $cacheFile = LogoCacheService::findImage($originalUrl, $profile);
+            if ($cacheFile) {
+                return LogoCacheService::streamResponse($cacheFile);
             }
 
             // Fetch the logo from the remote URL
@@ -45,18 +47,9 @@ class LogoProxyController extends Controller
                 return $this->returnPlaceholder();
             }
 
-            $extension = LogoCacheService::normalizeExtensionFromContentType(
-                $logoData['content_type'] ?? null,
-                $originalUrl
-            );
+            $cacheFile = LogoCacheService::storeImage($originalUrl, $logoData['content'], $logoData['content_type'] ?? null, $profile);
 
-            $cacheFile = LogoCacheService::cacheFileForUrl($originalUrl, $extension);
-
-            // Cache the logo and metadata
-            Storage::disk('local')->put($cacheFile, $logoData['content']);
-            LogoCacheService::writeCacheMetadata($originalUrl, $cacheFile, $logoData['content_type'] ?? null);
-
-            return $this->serveFromCache($cacheFile, $logoData['content_type']);
+            return LogoCacheService::streamResponse($cacheFile, $logoData['content_type'] ?? null);
         } catch (\Exception $e) {
             Log::error('Logo proxy error', [
                 'encoded_url' => $encodedUrl,
@@ -68,10 +61,19 @@ class LogoProxyController extends Controller
     }
 
     /**
-     * Generate a proxy URL for a given logo URL
+     * Generate a proxy URL for a given logo URL.
+     *
+     * When [$profile] is passed, the proxy serves (and caches) a copy sized
+     * for that role (see ImageProfile) instead of the full-resolution source.
+     * The URL carries the profile name, never pixel values, so it stays valid
+     * when the sizes change under Settings > Assets. No profile leaves the
+     * URL without a query string.
      */
-    public static function generateProxyUrl(?string $originalUrl, $internal = false): string
-    {
+    public static function generateProxyUrl(
+        ?string $originalUrl,
+        $internal = false,
+        ?ImageProfile $profile = null
+    ): string {
         // Get the config values (takes priority over settings values)
         $proxyUrlOverride = config('proxy.url_override');
         $includeLogosInOverride = config('proxy.url_override_include_logos', true);
@@ -99,6 +101,12 @@ class LogoProxyController extends Controller
             $url = $proxyUrlOverride && ! $internal && $includeLogosInOverride
                 ? rtrim($proxyUrlOverride, '/')."/logo-proxy/{$encodedUrl}/{$filename}"
                 : url("/logo-proxy/{$encodedUrl}/{$filename}");
+
+            // Always carried (the server ignores it while optimization is off),
+            // so turning optimization on or off never changes artwork URLs.
+            if ($profile) {
+                $url .= '?'.http_build_query(['p' => $profile->value]);
+            }
         }
 
         return $url;
@@ -109,16 +117,13 @@ class LogoProxyController extends Controller
      */
     private function fetchRemoteLogo(string $url): ?array
     {
-        if ($this->isPrivateUrl($url)) {
-            return null;
-        }
-
         try {
-            /** @var HttpClientResponse $response */
-            $response = Http::timeout(10)
+            // Every redirect hop is checked, not just $url: a public host
+            // could otherwise 302 the proxy onto a private address.
+            $response = PrivateNetworkGuard::get($url, fn (): PendingRequest => Http::timeout(10)
                 ->withHeaders([
                     'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
-                ])->get($url);
+                ]));
 
             if (! $response->successful()) {
                 return null;
@@ -156,6 +161,10 @@ class LogoProxyController extends Controller
                 'content' => $content,
                 'content_type' => $contentType,
             ];
+        } catch (InvalidArgumentException) {
+            // Private, reserved, or non-http(s) destination: placeholder,
+            // without a warning per request for a logo that is never cached.
+            return null;
         } catch (\Exception $e) {
             Log::warning('Failed to fetch remote logo', [
                 'url' => $url,
@@ -167,27 +176,28 @@ class LogoProxyController extends Controller
     }
 
     /**
-     * Serve logo from cache
+     * The size profile a request asks for: `?p=` by name, or a `?w=` / `?h=`
+     * hint snapped to the nearest profile so arbitrary sizes never become
+     * extra cached copies. Null serves the original.
      */
-    private function serveFromCache(string $cacheFile, ?string $contentType = null): StreamedResponse
+    private function resolveProfile(Request $request): ?ImageProfile
     {
-        $filePath = Storage::disk('local')->path($cacheFile);
-
-        if (! $contentType) {
-            // Try to determine content type from file
-            $contentType = $this->getContentTypeFromFile($filePath);
+        $named = $request->query('p');
+        if (is_string($named) && $named !== '') {
+            return ImageProfile::tryFrom($named);
         }
 
-        return response()->stream(function () use ($filePath) {
-            $stream = fopen($filePath, 'rb');
-            fpassthru($stream);
-            fclose($stream);
-        }, 200, [
-            'Content-Type' => $contentType,
-            'Cache-Control' => 'public, max-age=2592000', // 30 days
-            'Expires' => now()->addDays(30)->format('D, d M Y H:i:s \G\M\T'),
-            'Last-Modified' => date('D, d M Y H:i:s \G\M\T', filemtime($filePath)),
-        ]);
+        $width = $request->query('w');
+        if (is_numeric($width) && (int) $width > 0) {
+            return ImageProfile::nearestToWidth((int) $width);
+        }
+
+        $height = $request->query('h');
+        if (is_numeric($height) && (int) $height > 0) {
+            return ImageProfile::Poster;
+        }
+
+        return null;
     }
 
     /**
@@ -221,21 +231,6 @@ class LogoProxyController extends Controller
             'Content-Type' => 'image/png',
             'Cache-Control' => 'public, max-age=86400', // 1 day
         ]);
-    }
-
-    /**
-     * Check if the given URL resolves to a private/reserved IP address.
-     */
-    private function isPrivateUrl(string $url): bool
-    {
-        $host = parse_url($url, PHP_URL_HOST);
-        if (! $host) {
-            return true;
-        }
-
-        $ip = gethostbyname($host);
-
-        return ! filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE);
     }
 
     /**
@@ -326,30 +321,6 @@ class LogoProxyController extends Controller
     }
 
     /**
-     * Get content type from file
-     */
-    private function getContentTypeFromFile(string $filePath): string
-    {
-        $mimeType = mime_content_type($filePath);
-
-        // Fallback to common image types if detection fails
-        if (! $mimeType || ! str_starts_with($mimeType, 'image/')) {
-            $extension = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
-
-            return match ($extension) {
-                'jpg', 'jpeg' => 'image/jpeg',
-                'png' => 'image/png',
-                'gif' => 'image/gif',
-                'webp' => 'image/webp',
-                'svg' => 'image/svg+xml',
-                default => 'image/png',
-            };
-        }
-
-        return $mimeType;
-    }
-
-    /**
      * Clear expired cache entries
      */
     public function clearExpiredCache(): int
@@ -362,31 +333,37 @@ class LogoProxyController extends Controller
         } catch (\Exception $e) {
         }
 
+        $disk = Storage::disk('local');
+        $expiryDays = (int) config('app.logo_cache_expiry_days', 30);
         $cleared = 0;
-        $logoFiles = Storage::disk('local')->files(LogoCacheService::CACHE_DIRECTORY);
+        $remainingBaseNames = [];
+        $metaFiles = [];
 
-        if (empty($logoFiles)) {
-            return 0;
-        }
-
-        foreach ($logoFiles as $file) {
+        foreach ($disk->files(LogoCacheService::CACHE_DIRECTORY) as $file) {
             if (str_ends_with($file, '.meta.json')) {
+                $metaFiles[] = $file;
+
                 continue;
             }
 
-            // Get file last modified timestamp
-            $lastModified = Carbon::createFromTimestamp(Storage::disk('local')->lastModified($file));
-
-            // If no metadata or file is older than X days, delete it
-            if (now()->diffInDays($lastModified) > config('app.logo_cache_expiry_days', 30)) {
-                Storage::disk('local')->delete($file);
+            // Delete files last written more than X days ago
+            $lastModified = Carbon::createFromTimestamp($disk->lastModified($file));
+            if ($lastModified->diffInDays(now()) > $expiryDays) {
+                $disk->delete($file);
                 $cleared++;
 
-                $metaFile = LogoCacheService::CACHE_DIRECTORY.'/'.pathinfo($file, PATHINFO_FILENAME).'.meta.json';
-                if (Storage::disk('local')->exists($metaFile)) {
-                    Storage::disk('local')->delete($metaFile);
-                    $cleared++;
-                }
+                continue;
+            }
+
+            $remainingBaseNames[LogoCacheService::cacheBaseNameOf($file)] = true;
+        }
+
+        // An original and its size variants share one metadata file, which
+        // goes once none of them are left.
+        foreach ($metaFiles as $metaFile) {
+            if (! isset($remainingBaseNames[basename($metaFile, '.meta.json')])) {
+                $disk->delete($metaFile);
+                $cleared++;
             }
         }
 

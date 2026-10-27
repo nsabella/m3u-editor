@@ -9,10 +9,17 @@ use App\Models\TvNotification;
 use App\Models\TvNotificationRead;
 use App\Models\User;
 use App\Notifications\Notification;
+use Illuminate\Routing\Middleware\ThrottleRequestsWithRedis;
 use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Event;
 
 beforeEach(function () {
+    // The tv/* route group is throttled (60/min per IP). The limiter state is
+    // shared across a whole test run, so a full file can trip 429s; these tests
+    // cover endpoint behaviour, not the rate limiter. (Matches the pattern in
+    // PlaylistAuthNotificationScopeTest / RequesterLifecycleNotificationTest.)
+    $this->withoutMiddleware(ThrottleRequestsWithRedis::class);
+
     $this->user = User::factory()->create();
     $this->playlist = Playlist::factory()->for($this->user)->create();
 
@@ -63,6 +70,32 @@ it('tvBroadcast dispatches TvNotificationEvent with correct payload', function (
             && $event->title === 'Error occurred'
             && $event->status === 'danger';
     });
+});
+
+it('TvNotificationEvent broadcasts admin_only in snake_case matching the REST payload', function () {
+    Notification::make()
+        ->title('Admin alert')
+        ->warning()
+        ->tvBroadcast($this->playlist, 'billing', adminOnly: true);
+
+    $record = TvNotification::first();
+    $event = new TvNotificationEvent(
+        id: $record->id,
+        notifiableType: $record->notifiable_type,
+        notifiableId: $record->notifiable_id,
+        notifiableUuid: $this->playlist->uuid,
+        adminOnly: $record->admin_only,
+        channel: $record->channel,
+        title: $record->title,
+        body: $record->body ?? '',
+        status: $record->status,
+        playlistAuthId: $record->playlist_auth_id,
+        metadata: $record->metadata,
+    );
+
+    expect($event->broadcastWith())
+        ->toHaveKey('admin_only', true)
+        ->not->toHaveKey('adminOnly');
 });
 
 it('tvBroadcast defaults channel to general and adminOnly to false', function () {

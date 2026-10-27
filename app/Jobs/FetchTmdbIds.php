@@ -6,8 +6,10 @@ use App\Enums\SyncRunPhase;
 use App\Models\Category;
 use App\Models\Channel;
 use App\Models\Group;
+use App\Models\Playlist;
 use App\Models\Series;
 use App\Models\User;
+use App\Services\GenreGroupReclassifyService;
 use App\Services\SyncPipelineService;
 use App\Services\TmdbService;
 use App\Settings\GeneralSettings;
@@ -17,13 +19,15 @@ use Illuminate\Bus\Batchable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Foundation\Queue\Queueable;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 
 /**
- * Job to fetch TMDB/TVDB/IMDB IDs for VOD channels and Series.
+ * Job to fetch full TMDB metadata (plot, artwork, cast, genres, seasons/episodes)
+ * plus TMDB/TVDB/IMDB IDs for VOD channels and Series.
  * Can process a single item or a batch of items.
  */
 class FetchTmdbIds implements ShouldQueue
@@ -37,6 +41,12 @@ class FetchTmdbIds implements ShouldQueue
     protected GeneralSettings $settings;
 
     protected const BATCH_STATS_TTL_HOURS = 6;
+
+    /**
+     * Days after which a series' episodes are looked up on TMDB again, even when no new
+     * episodes have been added, so recently aired episodes TMDB lacked get picked up.
+     */
+    protected const EPISODE_RECHECK_DAYS = 7;
 
     public int $batchChunkSize = self::BATCH_CHUNK_SIZE;
 
@@ -63,6 +73,8 @@ class FetchTmdbIds implements ShouldQueue
      * @param  bool  $allSeriesPlaylists  Process all series from all user playlists
      * @param  bool  $overwriteExisting  Whether to overwrite existing IDs
      * @param  User|null  $user  The user to notify upon completion
+     * @param  Collection|array|null  $vodGroupIds  VOD group IDs to process (merged parents expand to children)
+     * @param  Collection|array|null  $seriesCategoryIds  Series category IDs to process (merged parents expand to children)
      */
     public function __construct(
         public Collection|array|null $vodChannelIds = null,
@@ -79,6 +91,8 @@ class FetchTmdbIds implements ShouldQueue
         public array $postCompletionJobs = [],
         public ?int $syncRunId = null,
         public ?SyncRunPhase $completionPhase = null,
+        public Collection|array|null $vodGroupIds = null,
+        public Collection|array|null $seriesCategoryIds = null,
     ) {
         // Legacy support: convert Collections to arrays
         if ($this->vodChannelIds instanceof Collection) {
@@ -86,6 +100,12 @@ class FetchTmdbIds implements ShouldQueue
         }
         if ($this->seriesIds instanceof Collection) {
             $this->seriesIds = $this->seriesIds->toArray();
+        }
+        if ($this->vodGroupIds instanceof Collection) {
+            $this->vodGroupIds = $this->vodGroupIds->toArray();
+        }
+        if ($this->seriesCategoryIds instanceof Collection) {
+            $this->seriesCategoryIds = $this->seriesCategoryIds->toArray();
         }
     }
 
@@ -101,6 +121,8 @@ class FetchTmdbIds implements ShouldQueue
             'allSeriesPlaylists' => $this->allSeriesPlaylists,
             'user_id' => $this->user?->id,
             'overwriteExisting' => $this->overwriteExisting,
+            'vodGroupIds' => $this->vodGroupIds,
+            'seriesCategoryIds' => $this->seriesCategoryIds,
         ]);
 
         $this->settings = app(GeneralSettings::class);
@@ -108,7 +130,7 @@ class FetchTmdbIds implements ShouldQueue
 
         if (! $tmdb->isConfigured()) {
             Log::warning('FetchTmdbIds: TMDB API key not configured');
-            $this->notifyUser('TMDB Lookup Failed', 'TMDB API key is not configured. Please add your API key in Settings.', 'danger');
+            $this->notifyUser('TMDB Metadata Fetch Failed', 'TMDB API key is not configured. Please add your API key in Settings.', 'danger');
 
             // Still advance the pipeline so downstream phases (FindReplace, ChannelMerge, etc.) run.
             if ($this->syncRunId && $this->completionPhase) {
@@ -127,13 +149,21 @@ class FetchTmdbIds implements ShouldQueue
         }
 
         // Process VOD channels (new playlist-based or legacy ID-based)
-        if ($this->vodPlaylistId || $this->allVodPlaylists || ! empty($this->vodChannelIds)) {
+        if ($this->vodPlaylistId || $this->allVodPlaylists || ! empty($this->vodChannelIds) || ! empty($this->vodGroupIds)) {
             $this->processVodChannels($tmdb);
         }
 
         // Process Series (new playlist-based or legacy ID-based)
-        if ($this->seriesPlaylistId || $this->allSeriesPlaylists || ! empty($this->seriesIds)) {
+        if ($this->seriesPlaylistId || $this->allSeriesPlaylists || ! empty($this->seriesIds) || ! empty($this->seriesCategoryIds)) {
             $this->processSeries($tmdb);
+        }
+
+        // Reclassify non-genre-matching groups for any touched playlist that opted in.
+        // Only on the non-chunk inline path - chunk jobs would re-run this against the
+        // same playlist. The batched path triggers it from the Batch::finally() callback
+        // exactly once at the true end.
+        if (! $this->isChunkJob) {
+            $this->reclassifyGroupsForTouchedPlaylists();
         }
 
         if ($this->isChunkJob) {
@@ -192,12 +222,14 @@ class FetchTmdbIds implements ShouldQueue
         $postCompletionJobs = $this->postCompletionJobs;
         $syncRunId = $this->syncRunId;
         $completionPhase = $this->completionPhase;
+        $vodPlaylistIds = $this->resolveTouchedVodPlaylistIds();
+        $seriesPlaylistIds = $this->resolveTouchedSeriesPlaylistIds();
 
         Bus::batch($jobs->all())
             ->onConnection('redis') // force to use redis connection
             ->onQueue('import')
             ->allowFailures()
-            ->finally(function (Batch $batch) use ($userId, $postCompletionJobs, $syncRunId, $completionPhase): void {
+            ->finally(function (Batch $batch) use ($userId, $postCompletionJobs, $syncRunId, $completionPhase, $vodPlaylistIds, $seriesPlaylistIds): void {
                 if ($userId) {
                     $user = User::find($userId);
 
@@ -219,7 +251,7 @@ class FetchTmdbIds implements ShouldQueue
                         }
 
                         $notification = Notification::make()
-                            ->title("TMDB ID Lookup Complete ({$total} processed)")
+                            ->title("TMDB Metadata Fetch Complete ({$total} processed)")
                             ->body($body);
 
                         if ($failedJobs > 0 || $stats['errors'] > 0) {
@@ -236,6 +268,13 @@ class FetchTmdbIds implements ShouldQueue
                     }
                 }
 
+                // Run the reclassify pass once per playlist per run, at the true end.
+                // Playlist IDs were resolved and captured as plain arrays *before* this
+                // closure was built - never capture $this/the job instance here, Laravel
+                // serializes this closure (batch callbacks can run in another process)
+                // and the job's GeneralSettings property isn't serializable.
+                self::reclassifyGroupsForPlaylistIds($vodPlaylistIds, $seriesPlaylistIds);
+
                 if ($syncRunId && $completionPhase) {
                     app(SyncPipelineService::class)->completePhase($syncRunId, $completionPhase);
                 } elseif (! empty($postCompletionJobs)) {
@@ -245,7 +284,7 @@ class FetchTmdbIds implements ShouldQueue
             ->dispatch();
 
         $this->notifyUser(
-            'TMDB ID Lookup Started',
+            'TMDB Metadata Fetch Started',
             "Large lookup split into {$chunkCount} jobs and queued for processing. You will receive a notification when the batch is complete.",
             'info'
         );
@@ -328,6 +367,21 @@ class FetchTmdbIds implements ShouldQueue
     }
 
     /**
+     * Expand merged group/category IDs to include their child IDs, since merged
+     * parents never own channels/series directly.
+     *
+     * @param  class-string<Group|Category>  $model
+     * @param  array<int>  $ids
+     * @return array<int>
+     */
+    protected function expandMergedIds(string $model, array $ids): array
+    {
+        $childIds = $model::query()->whereIn('parent_id', $ids)->pluck('id')->all();
+
+        return array_values(array_unique(array_merge($ids, $childIds)));
+    }
+
+    /**
      * Build filtered VOD query based on job arguments.
      */
     protected function buildVodQuery(): ?Builder
@@ -343,6 +397,10 @@ class FetchTmdbIds implements ShouldQueue
             $query->whereHas('playlist', function ($q) {
                 $q->where('user_id', $this->user->id);
             });
+            $this->applyScopeFilter($query);
+        } elseif (! empty($this->vodGroupIds)) {
+            $query->whereIn('group_id', $this->expandMergedIds(Group::class, $this->vodGroupIds))
+                ->when($this->user, fn ($q) => $q->where('user_id', $this->user->id));
             $this->applyScopeFilter($query);
         } elseif (! empty($this->vodChannelIds)) {
             // Legacy: direct ID array support
@@ -375,6 +433,10 @@ class FetchTmdbIds implements ShouldQueue
             $this->applyScopeFilter($query);
         } elseif ($this->allSeriesPlaylists && $this->user) {
             $query->where('user_id', $this->user->id);
+            $this->applyScopeFilter($query);
+        } elseif (! empty($this->seriesCategoryIds)) {
+            $query->whereIn('category_id', $this->expandMergedIds(Category::class, $this->seriesCategoryIds))
+                ->when($this->user, fn ($q) => $q->where('user_id', $this->user->id));
             $this->applyScopeFilter($query);
         } elseif (! empty($this->seriesIds)) {
             // Legacy: direct ID array support
@@ -454,11 +516,43 @@ class FetchTmdbIds implements ShouldQueue
 
     /**
      * Process a single VOD channel.
+     *
+     * Public so it can also be called synchronously and on-demand (outside of
+     * this job's queue dispatch) - e.g. Xtream get_vod_info enriching a title
+     * the first time it's viewed. Self-gating on existing tmdb_id/metadata,
+     * so repeat calls after the first successful enrichment are cheap no-ops.
+     *
+     * $backfillEnrichment (on-demand Xtream path) also requires the related_tmdb
+     * and tmdb_certification/studios sentinels, so a title whose provider already supplied
+     * tmdb_id/plot/cover - or one enriched before cast_list/clearlogo/related_tmdb/
+     * mpaa_rating/studios existed - still gets those fields filled once.
      */
-    protected function processVodChannel(TmdbService $tmdb, Channel $channel): void
+    public function processVodChannel(TmdbService $tmdb, Channel $channel, bool $backfillEnrichment = false): void
     {
         $info = $channel->info ?? [];
-        $hasMetadata = ! empty($info['plot']) && ! empty($info['cover_big']);
+        // A full TMDB details fetch always writes related_tmdb (even as []), so its presence
+        // means TMDB has already been asked. Without this, titles TMDB has no poster or
+        // overview for never satisfy plot + cover and are re-fetched on every sync.
+        $hasMetadata = (! empty($info['plot']) && ! empty($info['cover_big']))
+            || array_key_exists('related_tmdb', $info);
+
+        // Media-server syncs (Plex/Emby) can leave plot/cover populated while
+        // related_tmdb was never populated (media servers have no TMDB recommendations) -
+        // treat that as incomplete so it still routes through TMDB below to
+        // fill the gap, rather than being treated as fully enriched. Xtream-
+        // native content isn't held to this stricter bar in the bulk job, so titles
+        // enriched before related_tmdb existed keep their cheap no-op there.
+        if ($hasMetadata && ($backfillEnrichment || ! empty($info['media_server_id']))) {
+            $hasMetadata = array_key_exists('related_tmdb', $info);
+        }
+
+        // The on-demand path also backfills the US certification and studios once on
+        // titles enriched before they existed. mpaa_rating can't be the sentinel (providers
+        // send it, often blank), so the TMDB-only tmdb_certification/studios pair is.
+        if ($hasMetadata && $backfillEnrichment) {
+            $hasMetadata = array_key_exists('tmdb_certification', $info)
+                && array_key_exists('studios', $info);
+        }
 
         // Determine the best existing TMDB ID we have
         $tmdbId = $channel->getTmdbId();
@@ -470,10 +564,18 @@ class FetchTmdbIds implements ShouldQueue
                 $channel->update(['tmdb_id' => $tmdbId]);
             }
 
-            // Check if genre/group needs TMDB enrichment (e.g., still set to library folder name)
+            // Check if genre/group needs TMDB enrichment (e.g., still set to library folder name).
+            // Done once per genre: tmdb_genre_checked holds the genre left after TMDB's genres were
+            // compared, so a genuine single-genre title isn't re-fetched from TMDB on every sync,
+            // but one a provider refresh set back to a library name is checked again.
             $currentGenre = $info['genre'] ?? $channel->group ?? '';
-            if (! empty($currentGenre) && ! str_contains($currentGenre, ',') && strlen($currentGenre) <= 20) {
+            if (! empty($currentGenre) && ! str_contains($currentGenre, ',') && strlen($currentGenre) <= 20
+                && ($info['tmdb_genre_checked'] ?? null) !== $currentGenre) {
                 $details = $tmdb->getMovieDetails((int) $tmdbId);
+                $genreUpdated = false;
+                if ($details) {
+                    $info['tmdb_genre_checked'] = $currentGenre;
+                }
                 if ($details && ! empty($details['genres'])) {
                     $tmdbGenres = is_string($details['genres'])
                         ? array_map('trim', explode(',', $details['genres']))
@@ -487,6 +589,7 @@ class FetchTmdbIds implements ShouldQueue
                         ]);
 
                         $info['genre'] = $details['genres'];
+                        $info['tmdb_genre_checked'] = $details['genres'];
                         $updateData = ['info' => $info];
 
                         if ($this->autoCreateGroups) {
@@ -510,7 +613,11 @@ class FetchTmdbIds implements ShouldQueue
                         }
 
                         $channel->update($updateData);
+                        $genreUpdated = true;
                     }
+                }
+                if ($details && ! $genreUpdated) {
+                    $channel->update(['info' => $info]);
                 }
             }
 
@@ -519,8 +626,14 @@ class FetchTmdbIds implements ShouldQueue
             return;
         }
 
-        // If previously attempted but no match was found, skip unless overwriting
-        if (! $tmdbId && $channel->last_metadata_fetch && ! $this->overwriteExisting) {
+        // If previously attempted but no match was found, skip unless overwriting. Gated on
+        // info['tmdb_search_failed'] rather than last_metadata_fetch: media-server syncs
+        // (Plex/Emby) stamp last_metadata_fetch at sync time as an unrelated "synced from
+        // the media server" marker (see SyncMediaServer::syncVodItem()), so using that field
+        // here would make every media-server channel without a tmdb_id look like an already-
+        // failed TMDB search and permanently block the on-demand enrichment this method exists
+        // to drive.
+        if (! $tmdbId && ! empty($info['tmdb_search_failed']) && ! $this->overwriteExisting) {
             $this->skippedCount++;
 
             return;
@@ -537,8 +650,13 @@ class FetchTmdbIds implements ShouldQueue
             return;
         }
 
-        // If we already have tmdb_id but missing metadata, use it directly
-        // Otherwise, search TMDB for the movie
+        // If we already have tmdb_id but missing metadata, use it directly.
+        // Otherwise (or when overwriting), search TMDB for the movie - overwrite is also how
+        // a wrongly-matched ID gets corrected. But if that search comes back with no
+        // confident match, fall back to the known ID instead of reporting "not found" and
+        // discarding it: overwriteExisting means "let a search correct the ID", not "throw
+        // away a perfectly good one when the search for a replacement happens to fail"
+        // (issue #1647).
         if ($tmdbId && ! $this->overwriteExisting) {
             $result = [
                 'tmdb_id' => $tmdbId,
@@ -551,6 +669,17 @@ class FetchTmdbIds implements ShouldQueue
         } else {
             // Search TMDB
             $result = $tmdb->searchMovie($title, $year);
+
+            if (! $result && $tmdbId) {
+                $result = [
+                    'tmdb_id' => $tmdbId,
+                    'imdb_id' => $channel->imdb_id ?? $info['imdb_id'] ?? null,
+                ];
+                Log::debug('FetchTmdbIds: Search found no confident match, falling back to existing TMDB ID', [
+                    'channel_id' => $channel->id,
+                    'tmdb_id' => $tmdbId,
+                ]);
+            }
         }
 
         if ($result && isset($result['tmdb_id'])) {
@@ -630,9 +759,14 @@ class FetchTmdbIds implements ShouldQueue
                     $updateData['year'] = substr($details['release_date'], 0, 4);
                 }
 
-                // Populate rating if not already set
-                if (! empty($details['vote_average']) && empty($info['rating'])) {
+                // Populate rating if not already set, or refresh it when overwriting
+                if (! empty($details['vote_average']) && (empty($info['rating']) || $this->overwriteExisting)) {
                     $info['rating'] = $details['vote_average'];
+                }
+
+                // Persist vote count alongside rating (used by Xtream resolution to gate low-vote scores)
+                if (isset($details['vote_count'])) {
+                    $info['vote_count'] = $details['vote_count'];
                 }
 
                 // Populate backdrop path
@@ -640,10 +774,29 @@ class FetchTmdbIds implements ShouldQueue
                     $info['backdrop_path'] = [$details['backdrop_url']];
                 }
 
+                // Populate transparent title logo (clearlogo)
+                if (! empty($details['logo_url']) && (empty($info['clearlogo']) || $this->overwriteExisting)) {
+                    $info['clearlogo'] = $details['logo_url'];
+                }
+
                 // Populate cast if available
                 if (! empty($details['cast'])) {
                     $info['cast'] = is_array($details['cast']) ? implode(', ', $details['cast']) : $details['cast'];
                 }
+
+                // Populate rich cast list (id/name/character/photo) for structured
+                // client rendering (Xtream get_vod_info reads it straight from here).
+                if (! empty($details['cast_list'])) {
+                    $info['cast_list'] = $details['cast_list'];
+                }
+
+                // Populate "more like this" candidates (Xtream get_vod_info resolves
+                // these against the playlist's own library at request time). Always
+                // set the key, even to an empty array, so it also acts as a sentinel
+                // marking that TMDB has been checked for recommendations - otherwise
+                // a title with genuinely none would never satisfy $hasMetadata and
+                // would be re-enriched on every request.
+                $info['related_tmdb'] = $details['recommendations'] ?? [];
 
                 // Populate director if available
                 if (! empty($details['director'])) {
@@ -654,6 +807,21 @@ class FetchTmdbIds implements ShouldQueue
                 if (! empty($details['youtube_trailer'])) {
                     $info['youtube_trailer'] = $details['youtube_trailer'];
                 }
+
+                // Populate US certification (PG-13, R, ...) if not already set, or refresh it when overwriting
+                if (! empty($details['certification']) && (empty($info['mpaa_rating']) || $this->overwriteExisting)) {
+                    $info['mpaa_rating'] = $details['certification'];
+                }
+
+                // Always set, even to null: TMDB's own certification doubles as the
+                // "certification checked" sentinel for the on-demand backfill gate.
+                $info['tmdb_certification'] = $details['certification'] ?? null;
+
+                // Populate production companies (id/name/logo) - written to the movie .nfo
+                // as <studio>. Always set, even to [], alongside tmdb_certification: the
+                // pair is the on-demand backfill sentinel. When TMDB has none, a media
+                // server's studios are kept.
+                $info['studios'] = ($details['studios'] ?? []) ?: ($info['studios'] ?? []);
 
                 // Populate duration from TMDB runtime (in minutes)
                 if (! empty($details['runtime']) && (empty($info['duration_secs']) || ($info['duration_secs'] ?? 0) === 0)) {
@@ -690,7 +858,8 @@ class FetchTmdbIds implements ShouldQueue
             $this->foundCount++;
         } else {
             // Mark as attempted so we don't keep re-processing on every sync cycle
-            $channel->update(['last_metadata_fetch' => now()]);
+            $info['tmdb_search_failed'] = true;
+            $channel->update(['info' => $info, 'last_metadata_fetch' => now()]);
 
             Log::debug('FetchTmdbIds: No TMDB match found for VOD channel', [
                 'channel_id' => $channel->id,
@@ -741,20 +910,50 @@ class FetchTmdbIds implements ShouldQueue
 
     /**
      * Process a single series.
+     *
+     * Public so it can also be called synchronously and on-demand (outside of
+     * this job's queue dispatch) - e.g. Xtream get_series_info enriching a
+     * series the first time it's viewed. Self-gating on existing tmdb_id/
+     * metadata, so repeat calls after the first successful enrichment are
+     * cheap no-ops.
      */
-    protected function processSingleSeries(TmdbService $tmdb, Series $series): void
+    public function processSingleSeries(TmdbService $tmdb, Series $series, bool $backfillEnrichment = false): void
     {
         // Resolve IDs from all storage locations (dedicated columns + legacy metadata array).
         ['tmdb' => $existingTmdbId, 'tvdb' => $existingTvdbId] = $series->getMovieDbIds();
 
         // Only skip if we have IDs AND the metadata is populated
-        $hasMetadata = ! empty($series->plot) && ! empty($series->cover);
+        $seriesMetadataArr = is_array($series->metadata) ? $series->metadata : [];
+        // related_tmdb is written by every full TMDB details fetch (see the VOD equivalent), so
+        // series TMDB has no poster or overview for still count as enriched.
+        $hasMetadata = (! empty($series->plot) && ! empty($series->cover))
+            || array_key_exists('related_tmdb', $seriesMetadataArr);
+
+        // Media-server syncs (Plex/Emby) can leave plot/cover populated while
+        // related_tmdbwas never populated (media servers have no TMDB recommendations) -
+        // treat that as incomplete so it still routes through TMDB below to
+        // fill the gap, rather than being treated as fully enriched. Xtream-
+        // native content isn't held to this stricter bar, so titles enriched
+        // before related_tmdb existed keep their cheap no-op.
+        // $backfillEnrichment (on-demand Xtream path) holds every series to the same
+        // bar, so provider-supplied plot/cover/tmdb_id still get cast_list/clearlogo filled.
+        if ($hasMetadata && ($backfillEnrichment || ! empty($seriesMetadataArr['media_server_id']))) {
+            $hasMetadata = array_key_exists('related_tmdb', $seriesMetadataArr);
+        }
+
+        // The on-demand path also backfills the US rating and networks once on series
+        // enriched before they existed - both keys are always written, so their presence
+        // marks the series as checked even when TMDB has neither.
+        if ($hasMetadata && $backfillEnrichment) {
+            $hasMetadata = array_key_exists('content_rating', $seriesMetadataArr)
+                && array_key_exists('networks', $seriesMetadataArr);
+        }
 
         if (($existingTvdbId || $existingTmdbId) && $hasMetadata && ! $this->overwriteExisting) {
             $needsEnrichment = false;
 
             // Check if episodes need TMDB data
-            if ($existingTmdbId && $series->episodes()->whereNull('tmdb_id')->exists()) {
+            if ($existingTmdbId && $this->seriesEpisodesNeedEnrichment($series, $seriesMetadataArr)) {
                 Log::info('FetchTmdbIds: Series metadata complete but episodes need enrichment', [
                     'series_id' => $series->id,
                     'tmdb_id' => $existingTmdbId,
@@ -766,9 +965,17 @@ class FetchTmdbIds implements ShouldQueue
             // Check if genre needs TMDB enrichment (e.g., still set to library folder name)
             // A TMDB-enriched genre typically contains a comma (multiple genres) or matches known TMDB genres.
             // If the genre is a single short word that doesn't contain a comma, it's likely a library name placeholder.
-            if ($existingTmdbId && ! empty($series->genre) && ! str_contains($series->genre, ',') && strlen($series->genre) <= 20) {
+            // Done once per genre (tmdb_genre_checked), as for VOD.
+            if ($existingTmdbId && ! empty($series->genre) && ! str_contains($series->genre, ',') && strlen($series->genre) <= 20
+                && ($seriesMetadataArr['tmdb_genre_checked'] ?? null) !== $series->genre) {
                 // Fetch TMDB details to check if the current genre matches a TMDB genre
                 $details = $tmdb->getTvSeriesDetails((int) $existingTmdbId);
+                // Read after processSeriesEpisodes() above, which may have stamped tmdb_episodes_checked_at.
+                $genreMetadata = is_array($series->metadata) ? $series->metadata : [];
+                if ($details) {
+                    $genreMetadata['tmdb_genre_checked'] = $series->genre;
+                }
+                $genreUpdate = $details ? ['metadata' => $genreMetadata] : [];
                 if ($details && ! empty($details['genres'])) {
                     $tmdbGenres = is_string($details['genres'])
                         ? array_map('trim', explode(',', $details['genres']))
@@ -783,7 +990,8 @@ class FetchTmdbIds implements ShouldQueue
                             'tmdb_genres' => $details['genres'],
                         ]);
 
-                        $updateData = ['genre' => $details['genres']];
+                        $genreMetadata['tmdb_genre_checked'] = $details['genres'];
+                        $updateData = ['genre' => $details['genres'], 'metadata' => $genreMetadata];
 
                         // Update category to match the primary TMDB genre
                         if ($this->autoCreateGroups) {
@@ -805,8 +1013,12 @@ class FetchTmdbIds implements ShouldQueue
                         }
 
                         $series->update($updateData);
+                        $genreUpdate = [];
                         $needsEnrichment = true;
                     }
+                }
+                if (! empty($genreUpdate)) {
+                    $series->update($genreUpdate);
                 }
             }
 
@@ -840,6 +1052,15 @@ class FetchTmdbIds implements ShouldQueue
             Log::debug('FetchTmdbIds: Skipping series (empty name)', [
                 'series_id' => $series->id,
             ]);
+            $this->skippedCount++;
+
+            return;
+        }
+
+        // Previously searched with no match: skip unless overwriting, mirroring VOD's
+        // info['tmdb_search_failed'] gate (last_metadata_fetch can't be used here because
+        // media-server syncs stamp it too).
+        if (! $existingTmdbId && ! empty($seriesMetadataArr['tmdb_search_failed']) && ! $this->overwriteExisting) {
             $this->skippedCount++;
 
             return;
@@ -957,9 +1178,15 @@ class FetchTmdbIds implements ShouldQueue
                     $updateData['release_date'] = $details['first_air_date'];
                 }
 
-                // Populate rating if not already set
-                if (! empty($details['vote_average']) && empty($series->rating)) {
+                // Populate rating if not already set, or refresh it when overwriting
+                if (! empty($details['vote_average']) && (empty($series->rating) || $this->overwriteExisting)) {
                     $updateData['rating'] = $details['vote_average'];
+                }
+
+                // Persist vote count alongside rating (used by Xtream resolution to gate low-vote scores)
+                if (isset($details['vote_count'])) {
+                    $metadata['vote_count'] = $details['vote_count'];
+                    $updateData['metadata'] = $metadata;
                 }
 
                 // Populate backdrop path
@@ -967,10 +1194,41 @@ class FetchTmdbIds implements ShouldQueue
                     $updateData['backdrop_path'] = json_encode([$details['backdrop_url']]);
                 }
 
+                // Populate transparent title logo (clearlogo)
+                if (! empty($details['logo_url']) && (empty($metadata['clearlogo']) || $this->overwriteExisting)) {
+                    $metadata['clearlogo'] = $details['logo_url'];
+                    $updateData['metadata'] = $metadata;
+                }
+
                 // Populate cast if available
                 if (! empty($details['cast'])) {
                     $updateData['cast'] = is_array($details['cast']) ? implode(', ', $details['cast']) : $details['cast'];
                 }
+
+                // Populate rich cast list (id/name/character/photo) for structured
+                // client rendering (Xtream get_series_info reads it straight from here).
+                if (! empty($details['cast_list'])) {
+                    $metadata['cast_list'] = $details['cast_list'];
+                    $updateData['metadata'] = $metadata;
+                }
+
+                // Populate US TV rating (TV-MA, TV-14, ...). Only TMDB writes it, so it's
+                // always refreshed. Always set, even to null/[], alongside networks: the
+                // pair doubles as the on-demand backfill sentinel.
+                $metadata['content_rating'] = $details['certification'] ?? null;
+
+                // Populate networks (id/name/logo) - written to tvshow.nfo as <studio>.
+                // When TMDB has none, a media server's networks are kept.
+                $metadata['networks'] = ($details['networks'] ?? []) ?: ($metadata['networks'] ?? []);
+
+                // Populate "more like this" candidates (Xtream get_series_info resolves
+                // these against the playlist's own library at request time). Always
+                // set the key, even to an empty array, so it also acts as a sentinel
+                // marking that TMDB has been checked for recommendations - otherwise
+                // a series with genuinely none would never satisfy $hasMetadata and
+                // would be re-enriched on every request.
+                $metadata['related_tmdb'] = $details['recommendations'] ?? [];
+                $updateData['metadata'] = $metadata;
 
                 // Populate director if available
                 if (! empty($details['director'])) {
@@ -1001,7 +1259,9 @@ class FetchTmdbIds implements ShouldQueue
             $this->foundCount++;
         } else {
             // Mark as attempted so we don't keep re-processing on every sync cycle
-            $series->update(['last_metadata_fetch' => now()]);
+            $metadata = is_array($series->metadata) ? $series->metadata : [];
+            $metadata['tmdb_search_failed'] = true;
+            $series->update(['metadata' => $metadata, 'last_metadata_fetch' => now()]);
 
             Log::warning('FetchTmdbIds: No TMDB match found for series', [
                 'series_id' => $series->id,
@@ -1024,19 +1284,30 @@ class FetchTmdbIds implements ShouldQueue
             'tmdb_id' => $tmdbId,
         ]);
 
-        // Get all seasons from TMDB
-        $seasons = $tmdb->getAllSeasons($tmdbId);
+        // Get all seasons from TMDB (null when the lookup failed)
+        $seasons = $tmdb->getAllSeasons($tmdbId, nullOnError: true);
 
-        if (empty($seasons)) {
+        if ($seasons === null) {
+            return;
+        }
+
+        if ($seasons === []) {
             Log::debug('FetchTmdbIds: No seasons found for series', [
                 'series_id' => $series->id,
                 'tmdb_id' => $tmdbId,
             ]);
 
+            // TMDB verifiably has no seasons, so there is nothing to look up until the
+            // weekly re-check or new episodes arrive.
+            $this->markSeriesEpisodesChecked($series);
+
             return;
         }
 
         $episodeCount = 0;
+        // A failed season fetch must not mark the series as checked, or it would be
+        // skipped until new episodes arrive or the weekly re-check comes round.
+        $allSeasonsFetched = true;
 
         foreach ($seasons as $season) {
             $seasonNumber = $season['season_number'] ?? 0;
@@ -1046,10 +1317,19 @@ class FetchTmdbIds implements ShouldQueue
                 continue;
             }
 
-            // Fetch detailed season data with episodes
-            $seasonDetails = $tmdb->getSeasonDetails($tmdbId, $seasonNumber);
+            // Fetch detailed season data with episodes. A season TMDB lists but verifiably
+            // has no entry for counts as checked; only a failed lookup is retried.
+            $seasonResult = $tmdb->getSeasonDetailsResult($tmdbId, $seasonNumber);
 
-            if (! $seasonDetails || empty($seasonDetails['episodes'])) {
+            if ($seasonResult['status'] === 'error') {
+                $allSeasonsFetched = false;
+
+                continue;
+            }
+
+            $seasonDetails = $seasonResult['payload'] ?? [];
+
+            if (empty($seasonDetails['episodes'])) {
                 continue;
             }
 
@@ -1057,18 +1337,23 @@ class FetchTmdbIds implements ShouldQueue
                 ->where('season_number', $seasonNumber)
                 ->first();
 
-            if ($seasonRecord && ! empty($seasonDetails['poster_path'])) {
-                $coverUrl = 'https://image.tmdb.org/t/p/w500'.$seasonDetails['poster_path'];
-                $coverBigUrl = 'https://image.tmdb.org/t/p/original'.$seasonDetails['poster_path'];
-
+            if ($seasonRecord) {
                 $seasonUpdateData = [];
 
-                if (empty($seasonRecord->cover) || $this->overwriteExisting) {
-                    $seasonUpdateData['cover'] = $coverUrl;
+                if (! empty($seasonDetails['poster_path'])) {
+                    if (empty($seasonRecord->cover) || $this->overwriteExisting) {
+                        $seasonUpdateData['cover'] = 'https://image.tmdb.org/t/p/w500'.$seasonDetails['poster_path'];
+                    }
+
+                    if (empty($seasonRecord->cover_big) || $this->overwriteExisting) {
+                        $seasonUpdateData['cover_big'] = 'https://image.tmdb.org/t/p/original'.$seasonDetails['poster_path'];
+                    }
                 }
 
-                if (empty($seasonRecord->cover_big) || $this->overwriteExisting) {
-                    $seasonUpdateData['cover_big'] = $coverBigUrl;
+                $seasonMetadata = $seasonRecord->metadata ?? [];
+                if (! empty($seasonDetails['youtube_trailer']) && (empty($seasonMetadata['youtube_trailer']) || $this->overwriteExisting)) {
+                    $seasonMetadata['youtube_trailer'] = $seasonDetails['youtube_trailer'];
+                    $seasonUpdateData['metadata'] = $seasonMetadata;
                 }
 
                 if (! empty($seasonUpdateData)) {
@@ -1146,6 +1431,12 @@ class FetchTmdbIds implements ShouldQueue
                         $updateData['info'] = $info;
                     }
 
+                    if (isset($episodeData['vote_count'])) {
+                        $info = $updateData['info'] ?? $episode->info ?? [];
+                        $info['vote_count'] = $episodeData['vote_count'];
+                        $updateData['info'] = $info;
+                    }
+
                     // Populate duration from TMDB episode runtime (in minutes)
                     if (! empty($episodeData['runtime'])) {
                         $info = $updateData['info'] ?? $episode->info ?? [];
@@ -1167,6 +1458,10 @@ class FetchTmdbIds implements ShouldQueue
             }
         }
 
+        if ($allSeasonsFetched) {
+            $this->markSeriesEpisodesChecked($series);
+        }
+
         Log::info('FetchTmdbIds: Completed episode data fetch for series', [
             'series_id' => $series->id,
             'tmdb_id' => $tmdbId,
@@ -1175,8 +1470,39 @@ class FetchTmdbIds implements ShouldQueue
     }
 
     /**
-     * Clean title for TMDB search by applying user-defined patterns and stripping common prefixes.
+     * Whether a series has episodes still worth looking up on TMDB.
+     *
+     * Episodes TMDB has no entry for keep a null tmdb_id forever, so after a check only
+     * episodes added since then count - plus a weekly re-check, as TMDB fills in
+     * recently aired episodes over time.
+     *
+     * @param  array<string, mixed>  $metadata
      */
+    protected function seriesEpisodesNeedEnrichment(Series $series, array $metadata): bool
+    {
+        $query = $series->episodes()->whereNull('tmdb_id');
+
+        $checkedAt = ! empty($metadata['tmdb_episodes_checked_at'])
+            ? Carbon::parse($metadata['tmdb_episodes_checked_at'])
+            : null;
+
+        if ($checkedAt && $checkedAt->gt(now()->subDays(self::EPISODE_RECHECK_DAYS))) {
+            $query->where('created_at', '>', $checkedAt);
+        }
+
+        return $query->exists();
+    }
+
+    /**
+     * Record when a series' episodes were last looked up on TMDB.
+     */
+    protected function markSeriesEpisodesChecked(Series $series): void
+    {
+        $metadata = is_array($series->metadata) ? $series->metadata : [];
+        $metadata['tmdb_episodes_checked_at'] = now()->toIso8601String();
+        $series->update(['metadata' => $metadata]);
+    }
+
     protected function cleanTitleForSearch(?string $title, bool $isSeries = false): string
     {
         $title = $title ?? '';
@@ -1216,7 +1542,7 @@ class FetchTmdbIds implements ShouldQueue
             $this->errorCount
         );
 
-        $title = "TMDB ID Lookup Complete ({$total} processed)";
+        $title = "TMDB Metadata Fetch Complete ({$total} processed)";
 
         $this->notifyUser($title, $body, $this->errorCount > 0 ? 'warning' : 'success');
     }
@@ -1261,6 +1587,102 @@ class FetchTmdbIds implements ShouldQueue
         self::incrementBatchStat($batchId, 'not_found', $this->notFoundCount);
         self::incrementBatchStat($batchId, 'skipped', $this->skippedCount);
         self::incrementBatchStat($batchId, 'errors', $this->errorCount);
+    }
+
+    /**
+     * VOD playlist IDs touched by this job's current scope. Plain int array - safe to
+     * capture into a closure that Laravel will serialize (e.g. a Bus::batch()->finally()
+     * callback), unlike capturing $this/the job instance itself.
+     *
+     * Derives the IDs from buildVodQuery() so every scope is covered: whole-playlist,
+     * all-playlists, and the group- / channel-ID scoped runs (FetchTmdbIdsForGroupsAction).
+     *
+     * @return array<int>
+     */
+    protected function resolveTouchedVodPlaylistIds(): array
+    {
+        if ($this->vodPlaylistId) {
+            return [(int) $this->vodPlaylistId];
+        }
+
+        $vodQuery = $this->buildVodQuery();
+
+        return $vodQuery
+            ? (clone $vodQuery)->distinct()->pluck('playlist_id')->map(fn ($id): int => (int) $id)->all()
+            : [];
+    }
+
+    /**
+     * Series playlist IDs touched by this job's current scope. See resolveTouchedVodPlaylistIds().
+     *
+     * @return array<int>
+     */
+    protected function resolveTouchedSeriesPlaylistIds(): array
+    {
+        if ($this->seriesPlaylistId) {
+            return [(int) $this->seriesPlaylistId];
+        }
+
+        $seriesQuery = $this->buildSeriesQuery();
+
+        return $seriesQuery
+            ? (clone $seriesQuery)->distinct()->pluck('playlist_id')->map(fn ($id): int => (int) $id)->all()
+            : [];
+    }
+
+    /**
+     * Reclassify non-genre-matching VOD groups / Series categories for every playlist
+     * touched by this job that has either `reclassify_vod_groups_to_tmdb_genres` or
+     * `reclassify_series_categories_to_tmdb_genres` enabled.
+     *
+     * Reads the playlist column fresh (NOT a constructor arg) so the chunk-job path -
+     * which forwards only `overwriteExisting` + `lookupScope` to child jobs - still
+     * triggers the reclassify exactly once per playlist per run.
+     *
+     * Only safe to call from the non-batched inline path. The batched-chunk path must
+     * use self::reclassifyGroupsForPlaylistIds() with IDs resolved and captured as plain
+     * arrays *before* Bus::batch()->finally() - never capture $this/the job instance
+     * into that closure, Laravel serializes it and something under GeneralSettings
+     * throws "Serialization of 'WeakMap' is not allowed" when it does.
+     */
+    protected function reclassifyGroupsForTouchedPlaylists(): void
+    {
+        self::reclassifyGroupsForPlaylistIds($this->resolveTouchedVodPlaylistIds(), $this->resolveTouchedSeriesPlaylistIds());
+    }
+
+    /**
+     * Each playlist's reclassify pass is wrapped so a failure (a TMDB error, a DB
+     * constraint) is logged and skipped rather than thrown: this runs *before*
+     * completePhase() / Bus::chain($postCompletionJobs) on both the inline and the
+     * Bus::batch()->finally() paths, so an uncaught exception here would strand the
+     * whole sync pipeline (VodStrm, ProbeStreams, EPG, ChannelMerge, FindReplace).
+     *
+     * @param  array<int>  $vodPlaylistIds
+     * @param  array<int>  $seriesPlaylistIds
+     */
+    protected static function reclassifyGroupsForPlaylistIds(array $vodPlaylistIds, array $seriesPlaylistIds): void
+    {
+        foreach (Playlist::query()->whereIn('id', $vodPlaylistIds)->where('reclassify_vod_groups_to_tmdb_genres', true)->get() as $playlist) {
+            try {
+                GenreGroupReclassifyService::reclassifyVodGroups($playlist);
+            } catch (\Throwable $e) {
+                Log::error('FetchTmdbIds: VOD genre reclassify failed, continuing', [
+                    'playlist_id' => $playlist->id,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        foreach (Playlist::query()->whereIn('id', $seriesPlaylistIds)->where('reclassify_series_categories_to_tmdb_genres', true)->get() as $playlist) {
+            try {
+                GenreGroupReclassifyService::reclassifyCategories($playlist);
+            } catch (\Throwable $e) {
+                Log::error('FetchTmdbIds: Series genre reclassify failed, continuing', [
+                    'playlist_id' => $playlist->id,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
     }
 
     /**
@@ -1328,8 +1750,8 @@ class FetchTmdbIds implements ShouldQueue
         ]);
 
         $this->notifyUser(
-            'TMDB ID Lookup Failed',
-            'An error occurred while fetching TMDB IDs: '.$exception->getMessage(),
+            'TMDB Metadata Fetch Failed',
+            'An error occurred while fetching TMDB metadata: '.$exception->getMessage(),
             'danger'
         );
     }

@@ -5,17 +5,19 @@ namespace App\Filament\Pages;
 use App\Enums\DvrRuleType;
 use App\Enums\DvrSeriesMode;
 use App\Filament\Concerns\HasBrowseShowsFiltersForm;
+use App\Filament\Support\DvrPaddingFields;
 use App\Jobs\DvrSchedulerTick;
 use App\Models\Channel;
 use App\Models\DvrRecordingRule;
 use App\Models\DvrSetting;
 use App\Models\Epg;
-use App\Models\EpgChannel;
 use App\Models\EpgProgramme;
 use App\Models\Group;
+use App\Services\EpgProgrammeChannelResolver;
 use App\Services\ShowMetadataService;
 use App\Settings\GeneralSettings;
 use App\Support\EpgProgrammeNormalizer;
+use Carbon\CarbonInterface;
 use Filament\Forms\Components\Select;
 use Filament\Notifications\Notification;
 use Filament\Pages\Page;
@@ -146,6 +148,7 @@ class BrowseShows extends Page
                         ->searchable()
                         ->options(fn () => DvrSetting::with(['playlist', 'customPlaylist', 'mergedPlaylist'])
                             ->where('user_id', Auth::id())
+                            ->where('enabled', true)
                             ->get()
                             ->mapWithKeys(fn (DvrSetting $s) => [$s->id => $s->owner()?->name ?? "DVR #{$s->id}"])
                             ->all())
@@ -264,7 +267,11 @@ class BrowseShows extends Page
             'seriesChannelId' => $this->seriesChannelId,
             'seriesPriority' => $this->seriesPriority,
             'seriesStartEarly' => $this->seriesStartEarly,
+            'seriesStartUnit' => $this->seriesStartUnit,
+            'seriesStartDirection' => $this->seriesStartDirection,
             'seriesEndLate' => $this->seriesEndLate,
+            'seriesEndUnit' => $this->seriesEndUnit,
+            'seriesEndDirection' => $this->seriesEndDirection,
             'seriesKeepLast' => $this->seriesKeepLast,
         ]);
     }
@@ -285,8 +292,8 @@ class BrowseShows extends Page
             $channelName,
             $this->seriesNewOnly ? __('new only') : null,
             $this->seriesPriority !== 50 ? 'P:'.$this->seriesPriority : null,
-            ($this->seriesStartEarly || $this->seriesEndLate)
-                ? '+'.$this->seriesStartEarly.'s/+'.$this->seriesEndLate.'s'
+            ($this->seriesStartEarlySeconds() || $this->seriesEndLateSeconds())
+                ? DvrPaddingFields::formatSeconds($this->seriesStartEarlySeconds()).'/'.DvrPaddingFields::formatSeconds($this->seriesEndLateSeconds())
                 : null,
             $this->seriesKeepLast ? __('keep').' '.$this->seriesKeepLast : null,
         ]);
@@ -341,8 +348,7 @@ class BrowseShows extends Page
         $this->selectedShowTitle = $title;
         $this->seriesNewOnly = 0;
         $this->seriesPriority = 50;
-        $this->seriesStartEarly = 0;
-        $this->seriesEndLate = 0;
+        $this->resetSeriesPadding();
         $this->seriesKeepLast = null;
         [$this->sourceChannelId, $this->sourceChannelName] = $this->resolveSourceChannel($title);
         $this->seriesChannelId = 0;
@@ -369,7 +375,7 @@ class BrowseShows extends Page
             return;
         }
 
-        $programme = EpgProgramme::find($programmeId);
+        $programme = app(EpgProgrammeChannelResolver::class)->findOwnedProgramme($programmeId, $dvrSetting->user_id);
 
         if (! $programme) {
             Notification::make()->title(__('Programme not found.'))->danger()->send();
@@ -389,17 +395,10 @@ class BrowseShows extends Page
             return;
         }
 
-        // epg_programmes.epg_channel_id is the string channel ID from the EPG XML;
-        // channels.epg_channel_id is an integer FK to epg_channels.id — resolve via EpgChannel first.
-        $channel = null;
-        if ($programme->epg_channel_id) {
-            $epgChannelId = EpgChannel::where('channel_id', $programme->epg_channel_id)->value('id');
-            if ($epgChannelId) {
-                $channel = Channel::where('user_id', Auth::id())
-                    ->where('epg_channel_id', $epgChannelId)
-                    ->first();
-            }
-        }
+        $ownerChannels = $dvrSetting->ownerChannelsSubquery();
+        $channel = $ownerChannels
+            ? app(EpgProgrammeChannelResolver::class)->channelForProgramme($programme, $ownerChannels, ['id'])
+            : null;
 
         DvrRecordingRule::create([
             'user_id' => Auth::id(),
@@ -486,8 +485,8 @@ class BrowseShows extends Page
             'channel_id' => $channelId,
             'source_channel_id' => $sourceChannelId,
             'priority' => $this->seriesPriority,
-            'start_early_seconds' => $this->seriesStartEarly,
-            'end_late_seconds' => $this->seriesEndLate,
+            'start_early_seconds' => $this->seriesStartEarlySeconds(),
+            'end_late_seconds' => $this->seriesEndLateSeconds(),
             'keep_last' => $this->seriesKeepLast ?: null,
         ]);
     }
@@ -512,20 +511,14 @@ class BrowseShows extends Page
         $programme = $this->buildBaseQuery()
             ->where('title', $title)
             ->orderBy('start_time')
-            ->first(['epg_channel_id']);
+            ->first(['epg_id', 'epg_channel_id']);
 
-        if (! $programme?->epg_channel_id) {
+        if (! $programme) {
             return [null, null];
         }
 
-        $epgChannelPk = EpgChannel::where('channel_id', $programme->epg_channel_id)->value('id');
-        if (! $epgChannelPk) {
-            return [null, null];
-        }
-
-        $channel = Channel::whereIn('id', $subquery)
-            ->where('epg_channel_id', $epgChannelPk)
-            ->first(['id', 'title', 'title_custom', 'name', 'name_custom']);
+        $channel = app(EpgProgrammeChannelResolver::class)
+            ->channelForProgramme($programme, $subquery, ['id', 'title', 'title_custom', 'name', 'name_custom']);
 
         if (! $channel) {
             return [null, null];
@@ -816,8 +809,7 @@ class BrowseShows extends Page
             return null;
         }
 
-        $channelIds = $programmes->pluck('epg_channel_id')->unique()->filter()->values()->all();
-        $channelNames = $this->resolveChannelNames($channelIds);
+        $channelNames = app(EpgProgrammeChannelResolver::class)->channelNames($programmes);
         $timezone = config('dev.timezone') ?? app(GeneralSettings::class)->app_timezone ?? 'UTC';
 
         $episodeLookups = [];
@@ -835,6 +827,7 @@ class BrowseShows extends Page
 
         $airings = $programmes->map(function (EpgProgramme $p) use ($channelNames, $timezone, $episodeIsNewMap) {
             $startTime = $p->start_time?->timezone($timezone);
+            $endTime = $p->end_time?->timezone($timezone);
 
             [$season, $episode, $subtitle, $description] = $this->parseSeasonEpisode($p);
 
@@ -844,8 +837,10 @@ class BrowseShows extends Page
 
             return [
                 'id' => $p->id,
-                'channel_name' => $channelNames[$p->epg_channel_id] ?? $p->epg_channel_id,
+                'channel_name' => EpgProgrammeChannelResolver::nameFor($channelNames, $p),
                 'start_time_human' => $startTime?->format('D M j, g:ia'),
+                'end_time_human' => $endTime?->format('g:ia'),
+                'duration_human' => $this->formatDuration($startTime, $endTime),
                 'season' => $season,
                 'episode' => $episode,
                 'subtitle' => $subtitle,
@@ -888,6 +883,27 @@ class BrowseShows extends Page
         ];
     }
 
+    private function formatDuration(?CarbonInterface $startTime, ?CarbonInterface $endTime): ?string
+    {
+        if (! $startTime || ! $endTime) {
+            return null;
+        }
+
+        $minutes = (int) $startTime->diffInMinutes($endTime);
+        $hours = intdiv($minutes, 60);
+        $remainingMinutes = $minutes % 60;
+
+        if ($hours > 0 && $remainingMinutes > 0) {
+            return "{$hours}hr {$remainingMinutes}min";
+        }
+
+        if ($hours > 0) {
+            return "{$hours}hr";
+        }
+
+        return "{$remainingMinutes}min";
+    }
+
     /**
      * @return array{0: int|null, 1: int|null, 2: string|null, 3: string|null}
      */
@@ -910,28 +926,6 @@ class BrowseShows extends Page
         }
 
         return [$season, $episode, $subtitle, $description];
-    }
-
-    /**
-     * @param  list<string>  $channelIds
-     * @return array<string, string>
-     */
-    private function resolveChannelNames(array $channelIds): array
-    {
-        if (empty($channelIds)) {
-            return [];
-        }
-
-        return EpgChannel::without('epg')
-            ->whereIn('channel_id', $channelIds)
-            ->get(['channel_id', 'name', 'display_name', 'name_custom', 'display_name_custom'])
-            ->mapWithKeys(fn (EpgChannel $c) => [
-                $c->channel_id => $c->name_custom
-                    ?: $c->display_name_custom
-                    ?: $c->display_name
-                    ?: $c->name,
-            ])
-            ->all();
     }
 
     /**
@@ -963,7 +957,22 @@ class BrowseShows extends Page
             }
             $epgId = $channelQuery->value('epg_channels.channel_id');
 
-            return $epgId ? [$epgId] : null;
+            if ($epgId) {
+                return [$epgId];
+            }
+
+            // No explicit EPG-channel mapping: fall back to the channel's own
+            // stream_id (tvg-id), matching the broader scope's merge logic below.
+            $streamIdQuery = DB::table('channels')
+                ->where('channels.id', $this->channel_id)
+                ->whereNotNull('channels.stream_id')
+                ->where('channels.stream_id', '!=', '');
+            if (! $includeDisabled) {
+                $streamIdQuery->where('channels.enabled', true);
+            }
+            $streamId = $streamIdQuery->value('channels.stream_id');
+
+            return $streamId ? [$streamId] : [];
         }
 
         $epgMapBase = DB::table('channels')

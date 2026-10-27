@@ -382,12 +382,23 @@ class AedProfileResource extends Resource implements CopilotResource
                             ->label(__('No Event Format (Optional)'))
                             ->default('{channel}')
                             ->maxLength(500)
-                            ->helperText(__('Used when regex extraction fails entirely. {channel} = original channel title.')),
+                            ->helperText(__('Used when regex extraction fails entirely. {channel} = original channel title. Leave blank to skip generating any programme for channels with no detected event.')),
 
                         TextInput::make('category')
                             ->label(__('EPG Category (Optional)'))
                             ->placeholder(__('Sports'))
                             ->maxLength(100),
+                    ]),
+
+                    Grid::make(2)->schema([
+                        TextInput::make('dummy_epg_days')
+                            ->label(__('Dummy EPG Length (days)'))
+                            ->numeric()
+                            ->minValue(1)
+                            ->maxValue(14)
+                            ->columnSpanFull()
+                            ->placeholder(__('Use playlist default'))
+                            ->helperText(__('How many days of EPG data to generate for channels using this profile. Leave blank to use the playlist\'s dummy EPG length.')),
                     ]),
                 ]),
 

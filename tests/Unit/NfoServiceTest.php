@@ -1,5 +1,8 @@
 <?php
 
+use App\Models\Channel;
+use App\Models\Episode;
+use App\Models\Series;
 use App\Services\NfoService;
 
 describe('NfoService getScalarValue', function () {
@@ -64,6 +67,147 @@ describe('NfoService getScalarValue', function () {
         $result = $method->invokeArgs($service, [$imagePaths]);
 
         expect($result)->toBe('/path/to/image1.jpg');
+    });
+});
+
+describe('NfoService series provider fields', function () {
+    it('writes dedicated provider IDs and artwork before legacy metadata', function () {
+        $path = sys_get_temp_dir().'/nfo-service-'.bin2hex(random_bytes(6));
+        $series = (new Series)->forceFill([
+            'name' => 'Current Fields',
+            'release_date' => '2026-08-20',
+            'tmdb_id' => 220855,
+            'tvdb_id' => 428608,
+            'imdb_id' => 'tt26923358',
+            'cover' => 'https://images.example/current-poster.jpg',
+            'backdrop_path' => ['https://images.example/current-backdrop.jpg'],
+            'metadata' => [
+                'tmdb_id' => 1,
+                'tvdb_id' => 2,
+                'imdb_id' => 'tt0000002',
+                'poster_path' => 'https://images.example/legacy-poster.jpg',
+                'backdrop_path' => 'https://images.example/legacy-backdrop.jpg',
+                'clearlogo' => 'https://images.example/current-logo.png',
+            ],
+        ]);
+
+        expect((new NfoService)->generateSeriesNfo($series, $path))->toBeTrue();
+
+        $xml = file_get_contents($path.'/tvshow.nfo');
+        expect($xml)
+            ->toContain('<tmdbid>220855</tmdbid>')
+            ->toContain('<tvdbid>428608</tvdbid>')
+            ->toContain('<imdbid>tt26923358</imdbid>')
+            ->toContain('https://images.example/current-poster.jpg')
+            ->toContain('https://images.example/current-backdrop.jpg')
+            ->toContain('<thumb aspect="clearlogo">https://images.example/current-logo.png</thumb>')
+            ->not->toContain('https://images.example/legacy-poster.jpg')
+            ->not->toContain('https://images.example/legacy-backdrop.jpg');
+
+        unlink($path.'/tvshow.nfo');
+        rmdir($path);
+    });
+
+    it('keeps legacy metadata as a fallback', function () {
+        $path = sys_get_temp_dir().'/nfo-service-'.bin2hex(random_bytes(6));
+        $series = (new Series)->forceFill([
+            'name' => 'Legacy Fields',
+            'tmdb_id' => 0,
+            'tvdb_id' => '',
+            'imdb_id' => '',
+            'cover' => '',
+            'backdrop_path' => [''],
+            'metadata' => [
+                'tmdb_id' => [225467],
+                'tvdb_id' => 436946,
+                'imdb_id' => 'tt27787158',
+                'poster_path' => 'https://images.example/legacy-poster.jpg',
+                'backdrop_path' => 'https://images.example/legacy-backdrop.jpg',
+            ],
+        ]);
+
+        expect((new NfoService)->generateSeriesNfo($series, $path))->toBeTrue();
+
+        $xml = file_get_contents($path.'/tvshow.nfo');
+        expect($xml)
+            ->toContain('<tmdbid>225467</tmdbid>')
+            ->toContain('<tvdbid>436946</tvdbid>')
+            ->toContain('<imdbid>tt27787158</imdbid>')
+            ->toContain('https://images.example/legacy-poster.jpg')
+            ->toContain('https://images.example/legacy-backdrop.jpg');
+
+        unlink($path.'/tvshow.nfo');
+        rmdir($path);
+    });
+
+    it('uses dedicated series provider IDs in episode NFOs', function () {
+        $path = sys_get_temp_dir().'/nfo-service-'.bin2hex(random_bytes(6));
+        mkdir($path);
+        $strmPath = $path.'/episode.strm';
+        touch($strmPath);
+
+        $series = (new Series)->forceFill([
+            'name' => 'Current Fields',
+            'tmdb_id' => 220855,
+            'tvdb_id' => 428608,
+            'imdb_id' => 'tt26923358',
+            'metadata' => [],
+        ]);
+        $episode = (new Episode)->forceFill([
+            'title' => 'Pilot',
+            'season' => 1,
+            'episode_num' => 1,
+            'info' => [],
+        ]);
+
+        expect((new NfoService)->generateEpisodeNfo($episode, $series, $strmPath))->toBeTrue();
+
+        $xml = file_get_contents($path.'/episode.nfo');
+        expect($xml)
+            ->toContain('<uniqueid type="tmdb" default="true">220855</uniqueid>')
+            ->toContain('<uniqueid type="tvdb">428608</uniqueid>')
+            ->toContain('<uniqueid type="imdb">tt26923358</uniqueid>');
+
+        unlink($path.'/episode.nfo');
+        unlink($strmPath);
+        rmdir($path);
+    });
+
+    it('falls back to usable legacy provider IDs in episode NFOs', function () {
+        $path = sys_get_temp_dir().'/nfo-service-'.bin2hex(random_bytes(6));
+        mkdir($path);
+        $strmPath = $path.'/episode.strm';
+        touch($strmPath);
+
+        $series = (new Series)->forceFill([
+            'name' => 'Legacy Fields',
+            'tmdb_id' => 0,
+            'tvdb_id' => '',
+            'imdb_id' => '',
+            'metadata' => [
+                'tmdb_id' => [225467],
+                'tvdb_id' => 436946,
+                'imdb_id' => 'tt27787158',
+            ],
+        ]);
+        $episode = (new Episode)->forceFill([
+            'title' => 'Pilot',
+            'season' => 1,
+            'episode_num' => 1,
+            'info' => [],
+        ]);
+
+        expect((new NfoService)->generateEpisodeNfo($episode, $series, $strmPath))->toBeTrue();
+
+        $xml = file_get_contents($path.'/episode.nfo');
+        expect($xml)
+            ->toContain('<uniqueid type="tmdb" default="true">225467</uniqueid>')
+            ->toContain('<uniqueid type="tvdb">436946</uniqueid>')
+            ->toContain('<uniqueid type="imdb">tt27787158</uniqueid>');
+
+        unlink($path.'/episode.nfo');
+        unlink($strmPath);
+        rmdir($path);
     });
 });
 
@@ -169,5 +313,122 @@ describe('NfoService applyNameFilter', function () {
         $result = $method->invokeArgs($service, [$name, true, ['[4K]']]);
 
         expect($result)->toBe('Test  Movie  Name');
+    });
+});
+
+describe('NfoService content ratings and networks', function () {
+    it('writes the TMDB content rating and networks to tvshow.nfo', function () {
+        $path = sys_get_temp_dir().'/nfo-service-'.bin2hex(random_bytes(6));
+        $series = (new Series)->forceFill([
+            'name' => 'Breaking Bad',
+            'metadata' => [
+                'content_rating' => 'TV-MA',
+                'official_rating' => 'TV-14',
+                'networks' => [['id' => 174, 'name' => 'AMC', 'logo' => null]],
+            ],
+        ]);
+
+        expect((new NfoService)->generateSeriesNfo($series, $path))->toBeTrue();
+
+        $xml = file_get_contents($path.'/tvshow.nfo');
+        expect($xml)
+            ->toContain('<mpaa>TV-MA</mpaa>')
+            ->not->toContain('TV-14')
+            ->toContain('<studio>AMC</studio>');
+
+        unlink($path.'/tvshow.nfo');
+        rmdir($path);
+    });
+
+    it('falls back to the media server rating in tvshow.nfo', function () {
+        $path = sys_get_temp_dir().'/nfo-service-'.bin2hex(random_bytes(6));
+        $series = (new Series)->forceFill([
+            'name' => 'Local Show',
+            'metadata' => ['official_rating' => 'TV-14'],
+        ]);
+
+        expect((new NfoService)->generateSeriesNfo($series, $path))->toBeTrue();
+
+        expect(file_get_contents($path.'/tvshow.nfo'))->toContain('<mpaa>TV-14</mpaa>');
+
+        unlink($path.'/tvshow.nfo');
+        rmdir($path);
+    });
+
+    it('writes the movie certification to the movie nfo', function () {
+        $path = sys_get_temp_dir().'/nfo-service-'.bin2hex(random_bytes(6));
+        mkdir($path);
+        $strmPath = $path.'/movie.strm';
+
+        $channel = (new Channel)->forceFill([
+            'title' => 'The Matrix',
+            'info' => ['mpaa_rating' => 'R'],
+        ]);
+
+        expect((new NfoService)->generateMovieNfo($channel, $strmPath))->toBeTrue();
+
+        expect(file_get_contents($path.'/movie.nfo'))->toContain('<mpaa>R</mpaa>');
+
+        unlink($path.'/movie.nfo');
+        rmdir($path);
+    });
+
+    it('writes TMDB studios to the movie nfo', function () {
+        $path = sys_get_temp_dir().'/nfo-service-'.bin2hex(random_bytes(6));
+        mkdir($path);
+        $strmPath = $path.'/movie.strm';
+
+        $channel = (new Channel)->forceFill([
+            'title' => 'The Matrix',
+            'info' => ['studios' => [
+                ['id' => 79, 'name' => 'Village Roadshow Pictures', 'logo' => null],
+                ['id' => 372, 'name' => 'Groucho II Film Partnership', 'logo' => null],
+            ]],
+        ]);
+
+        expect((new NfoService)->generateMovieNfo($channel, $strmPath))->toBeTrue();
+
+        expect(file_get_contents($path.'/movie.nfo'))
+            ->toContain('<studio>Village Roadshow Pictures</studio>')
+            ->toContain('<studio>Groucho II Film Partnership</studio>');
+
+        unlink($path.'/movie.nfo');
+        rmdir($path);
+    });
+
+    it('falls back to the TMDB certification when the provider rating is blank', function () {
+        $path = sys_get_temp_dir().'/nfo-service-'.bin2hex(random_bytes(6));
+        mkdir($path);
+        $strmPath = $path.'/movie.strm';
+
+        $channel = (new Channel)->forceFill([
+            'title' => 'The Matrix',
+            'info' => ['mpaa_rating' => '', 'tmdb_certification' => 'R'],
+        ]);
+
+        expect((new NfoService)->generateMovieNfo($channel, $strmPath))->toBeTrue();
+
+        expect(file_get_contents($path.'/movie.nfo'))->toContain('<mpaa>R</mpaa>');
+
+        unlink($path.'/movie.nfo');
+        rmdir($path);
+    });
+
+    it('omits mpaa from the movie nfo when the rating is blank', function () {
+        $path = sys_get_temp_dir().'/nfo-service-'.bin2hex(random_bytes(6));
+        mkdir($path);
+        $strmPath = $path.'/movie.strm';
+
+        $channel = (new Channel)->forceFill([
+            'title' => 'The Matrix',
+            'info' => ['mpaa_rating' => ''],
+        ]);
+
+        expect((new NfoService)->generateMovieNfo($channel, $strmPath))->toBeTrue();
+
+        expect(file_get_contents($path.'/movie.nfo'))->not->toContain('<mpaa>');
+
+        unlink($path.'/movie.nfo');
+        rmdir($path);
     });
 });

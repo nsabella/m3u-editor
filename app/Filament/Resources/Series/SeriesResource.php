@@ -2,10 +2,12 @@
 
 namespace App\Filament\Resources\Series;
 
+use App\Enums\CachedContentFileStatus;
 use App\Facades\LogoFacade;
 use App\Filament\Actions\AssetPickerAction;
 use App\Filament\Actions\BulkModalActionGroup;
 use App\Filament\Actions\RegexTesterAction;
+use App\Filament\Clusters\Settings\Pages\ManageSyncSettings;
 use App\Filament\Concerns\HasCopilotSupport;
 use App\Filament\Resources\Series\Pages\CreateSeries;
 use App\Filament\Resources\Series\Pages\EditSeries;
@@ -17,6 +19,7 @@ use App\Jobs\FetchTmdbIds;
 use App\Jobs\ProbeStreamsChunk;
 use App\Jobs\ProbeStreamsComplete;
 use App\Jobs\ProcessM3uImportSeriesEpisodes;
+use App\Jobs\QueueCachedContentDownloads;
 use App\Jobs\SeriesFindAndReplace;
 use App\Jobs\SyncSeriesStrmFiles;
 use App\Models\Category;
@@ -24,6 +27,7 @@ use App\Models\Episode;
 use App\Models\Playlist;
 use App\Models\Series;
 use App\Rules\CheckIfUrlOrLocalPath;
+use App\Services\CachedContentDispatchService;
 use App\Services\DateFormatService;
 use App\Services\LogoCacheService;
 use App\Services\PlaylistService;
@@ -204,6 +208,18 @@ class SeriesResource extends Resource implements CopilotResource
                 ->badge()
                 ->toggleable()
                 ->sortable(),
+            TextColumn::make('cached_episodes_count')
+                ->label(__('Cached'))
+                ->visible(fn (): bool => app(CachedContentDispatchService::class)->isEnabled())
+                ->counts(['episodes as cached_episodes_count' => fn ($q) => $q->whereHas(
+                    'cachedContentFile',
+                    fn ($file) => $file->where('status', CachedContentFileStatus::Completed),
+                )])
+                ->badge()
+                ->color(fn ($state) => $state > 0 ? 'success' : 'gray')
+                ->tooltip(__('Episodes with a local cache file'))
+                ->toggleable()
+                ->sortable(),
             TextColumn::make('probe_enabled_episodes_count')
                 ->label(__('Probe Enabled'))
                 ->counts(['episodes as probe_enabled_episodes_count' => fn ($q) => $q->where('probe_enabled', true)])
@@ -316,6 +332,54 @@ class SeriesResource extends Resource implements CopilotResource
         ];
     }
 
+    public static function getCacheAllEpisodesAction(): Action
+    {
+        return Action::make('cache_all_episodes')
+            ->label(__('Cache all episodes'))
+            ->icon('heroicon-o-arrow-down-tray')
+            ->color('gray')
+            ->visible(fn (Series $record): bool => app(CachedContentDispatchService::class)->isEnabled()
+                && filled($record->playlist_id))
+            ->requiresConfirmation()
+            ->modalIcon('heroicon-o-arrow-down-tray')
+            ->modalHeading(__('Cache all episodes?'))
+            ->modalDescription(fn (Series $record): string => __('Queue background downloads of every episode of ":name" to local storage, or add the series to Sonarr if Sonarr is set up for caching. Episodes that are already cached or queued are skipped.', ['name' => $record->name]))
+            ->modalSubmitActionLabel(__('Cache all episodes'))
+            ->action(function (Series $record): void {
+                $counts = app(CachedContentDispatchService::class)->dispatchSeries($record);
+                CachedContentDispatchService::summaryNotification($counts)->send();
+            });
+    }
+
+    /**
+     * Bulk variant of `getCacheAllEpisodesAction()`. The episodes are queued
+     * from a background job (see `QueueCachedContentDownloads`), which sends
+     * one summary notification across every selected series when it finishes.
+     */
+    public static function getCacheAllEpisodesBulkAction(): BulkAction
+    {
+        return BulkAction::make('cache_all_episodes')
+            ->label(__('Cache all episodes'))
+            ->icon('heroicon-o-arrow-down-tray')
+            ->color('gray')
+            ->visible(fn (): bool => app(CachedContentDispatchService::class)->isEnabled())
+            ->requiresConfirmation()
+            ->modalIcon('heroicon-o-arrow-down-tray')
+            ->modalHeading(__('Cache all episodes from selected series?'))
+            ->modalDescription(__('Queue background downloads of every episode of every selected series to local storage, or add each series to Sonarr if Sonarr is set up for caching. Episodes that are already cached, queued, or have no cacheable source URL are skipped.'))
+            ->modalSubmitActionLabel(__('Cache all episodes'))
+            ->action(function (Collection $records): void {
+                QueueCachedContentDownloads::dispatch('series', $records->modelKeys(), auth()->id());
+            })->after(function () {
+                Notification::make()
+                    ->success()
+                    ->title(__('Caching started'))
+                    ->body(__('Cache downloads are being queued in the background. You will be notified once the process is complete.'))
+                    ->send();
+            })
+            ->deselectRecordsAfterCompletion();
+    }
+
     public static function getTableActions(): array
     {
         return [
@@ -328,7 +392,7 @@ class SeriesResource extends Resource implements CopilotResource
                             ->live()
                             ->label(__('Category'))
                             ->helperText(__('Select the category you would like to move the series to.'))
-                            ->options(fn (Get $get, $record) => Category::where(['user_id' => auth()->id(), 'playlist_id' => $record->playlist_id])->get(['name', 'id'])->pluck('name', 'id'))
+                            ->options(fn (Get $get, $record) => Category::query()->assignableTarget()->where(['user_id' => auth()->id(), 'playlist_id' => $record->playlist_id])->get(['name', 'id'])->pluck('name', 'id'))
                             ->searchable(),
                     ])
                     ->action(function ($record, array $data): void {
@@ -349,12 +413,18 @@ class SeriesResource extends Resource implements CopilotResource
                     ->modalDescription(__('Move the series to another category.'))
                     ->modalSubmitActionLabel(__('Move now')),
                 Action::make('fetch_tmdb_ids')
-                    ->label(__('Fetch TMDB/TVDB IDs'))
+                    ->label(__('Fetch TMDB Metadata'))
                     ->icon('heroicon-o-film')
                     ->modalIcon('heroicon-o-film')
-                    ->modalDescription(__('Fetch TMDB, TVDB, and IMDB IDs for this series from The Movie Database.'))
-                    ->modalSubmitActionLabel(__('Fetch IDs now'))
-                    ->action(function ($record) {
+                    ->modalDescription(__('Fetch full metadata (plot, artwork, cast, genres, episodes) plus TMDB, TVDB and IMDB IDs for this title from The Movie Database.'))
+                    ->modalSubmitActionLabel(__('Fetch metadata now'))
+                    ->schema([
+                        Toggle::make('overwrite_existing')
+                            ->label(__('Overwrite Existing Metadata'))
+                            ->helperText(__('Overwrite existing TMDB metadata? If disabled, only series missing metadata are fetched.'))
+                            ->default(false),
+                    ])
+                    ->action(function ($record, array $data) {
                         $settings = app(GeneralSettings::class);
                         if (empty($settings->tmdb_api_key)) {
                             Notification::make()
@@ -370,14 +440,14 @@ class SeriesResource extends Resource implements CopilotResource
                         app('Illuminate\Contracts\Bus\Dispatcher')
                             ->dispatch(new FetchTmdbIds(
                                 seriesIds: [$record->id],
-                                overwriteExisting: true,
+                                overwriteExisting: (bool) ($data['overwrite_existing'] ?? false),
                                 user: auth()->user(),
                             ));
 
                         Notification::make()
                             ->success()
                             ->title(__('TMDB Search Started'))
-                            ->body(__('Searching for TMDB/TVDB IDs. Check the logs or refresh the page in a few seconds.'))
+                            ->body(__('Fetching metadata from TMDB. Check the logs or refresh the page in a few seconds.'))
                             ->duration(8000)
                             ->send();
                     })
@@ -477,7 +547,7 @@ class SeriesResource extends Resource implements CopilotResource
                             ]),
                     ]),
                 Action::make('process')
-                    ->label(__('Fetch Series Metadata'))
+                    ->label(__('Fetch Provider Metadata'))
                     ->schema([
                         Toggle::make('overwrite_existing')
                             ->label(__('Overwrite Existing Metadata'))
@@ -565,6 +635,7 @@ class SeriesResource extends Resource implements CopilotResource
                     ->modalIcon('heroicon-o-signal')
                     ->modalDescription(__('Probe all episodes of this series with ffprobe to collect stream metadata (codec, resolution, bitrate, HDR). This data enables Trash Guide naming with stream-stat-based detection.'))
                     ->modalSubmitActionLabel(__('Start probing')),
+                self::getCacheAllEpisodesAction(),
                 DeleteAction::make()
                     ->modalIcon('heroicon-o-trash')
                     ->modalDescription(__('Are you sure you want to delete this series? This will delete all episodes and seasons for this series. This action cannot be undone.'))
@@ -613,6 +684,7 @@ class SeriesResource extends Resource implements CopilotResource
                             ->helperText(__('Select the category you would like to move the series to.'))
                             ->options(
                                 fn () => Category::query()
+                                    ->assignableTarget()
                                     ->with(['playlist'])
                                     ->where(['user_id' => auth()->id()])
                                     ->get(['name', 'id', 'playlist_id'])
@@ -717,7 +789,7 @@ class SeriesResource extends Resource implements CopilotResource
             // -- Series Metadata --
             BulkModalActionGroup::section('Series Metadata', [
                 BulkAction::make('process')
-                    ->label(__('Fetch Series Metadata'))
+                    ->label(__('Fetch Provider Metadata'))
                     ->icon('heroicon-o-arrow-down-tray')
                     ->schema([
                         Toggle::make('overwrite_existing')
@@ -747,12 +819,12 @@ class SeriesResource extends Resource implements CopilotResource
                     ->modalDescription(__('Process selected series now? This will fetch all episodes and seasons for this series. This may take a while depending on the number of series selected.'))
                     ->modalSubmitActionLabel(__('Yes, process now')),
                 BulkAction::make('fetch_tmdb_ids')
-                    ->label(__('Fetch TMDB/TVDB IDs'))
+                    ->label(__('Fetch TMDB Metadata'))
                     ->icon('heroicon-o-magnifying-glass')
                     ->schema([
                         Toggle::make('overwrite_existing')
-                            ->label(__('Overwrite Existing IDs'))
-                            ->helperText(__('Overwrite existing TMDB/TVDB/IMDB IDs? If disabled, it will only fetch IDs for series that don\'t already have them.'))
+                            ->label(__('Overwrite Existing Metadata'))
+                            ->helperText(__('Overwrite existing TMDB metadata? If disabled, only series missing metadata are fetched.'))
                             ->default(false),
                     ])
                     ->action(function ($records, $data) {
@@ -781,15 +853,15 @@ class SeriesResource extends Resource implements CopilotResource
                         Notification::make()
                             ->success()
                             ->title('Fetching TMDB/TVDB IDs for '.count($seriesIds).' series')
-                            ->body(__('The TMDB ID lookup has been started. You will be notified when it is complete.'))
+                            ->body(__('The TMDB metadata fetch has been started. You will be notified when it is complete.'))
                             ->duration(10000)
                             ->send();
                     })
                     ->deselectRecordsAfterCompletion()
                     ->requiresConfirmation()
                     ->modalIcon('heroicon-o-magnifying-glass')
-                    ->modalDescription(__('Search TMDB for matching TV series and populate TMDB/TVDB/IMDB IDs for the selected series? This enables Trash Guides compatibility for Sonarr.'))
-                    ->modalSubmitActionLabel(__('Yes, fetch IDs now')),
+                    ->modalDescription(__('Search TMDB for matching TV series and fetch full metadata (plot, artwork, cast, genres, seasons and episodes) plus TMDB, TVDB and IMDB IDs for the selected series? This also enables Trash Guides compatibility for Sonarr.'))
+                    ->modalSubmitActionLabel(__('Yes, fetch metadata now')),
                 BulkAction::make('sync')
                     ->label(__('Sync Series .strm files'))
                     ->action(function ($records) {
@@ -1001,6 +1073,11 @@ class SeriesResource extends Resource implements CopilotResource
                     ->modalSubmitActionLabel(__('Start probing')),
             ]),
 
+            // -- Caching --
+            BulkModalActionGroup::section('Caching', [
+                self::getCacheAllEpisodesBulkAction(),
+            ])->visible(fn (): bool => app(CachedContentDispatchService::class)->isEnabled()),
+
             // -- Enable / Disable --
             BulkModalActionGroup::section('Enable / Disable', [
                 BulkAction::make('enable')
@@ -1086,7 +1163,7 @@ class SeriesResource extends Resource implements CopilotResource
                                         ->inline(false)
                                         ->required(),
                                     Select::make('category_id')
-                                        ->relationship('category', 'name'),
+                                        ->relationship('category', 'name', fn ($query) => $query->assignableTarget()),
                                     TextInput::make('cover')
                                         ->maxLength(255)
                                         ->suffixActions([
@@ -1172,7 +1249,7 @@ class SeriesResource extends Resource implements CopilotResource
                                                 ->icon('heroicon-o-cog-6-tooth')
                                                 ->iconPosition('after')
                                                 ->size('sm')
-                                                ->url('/preferences?tab=sync-options%3A%3Adata%3A%3Atab')
+                                                ->url(ManageSyncSettings::getUrl())
                                                 ->openUrlInNewTab(false)
                                         )
                                         ->helperText(__('Select a Stream File Setting profile to override global/category settings for this series. Leave empty to use category or global settings.')),

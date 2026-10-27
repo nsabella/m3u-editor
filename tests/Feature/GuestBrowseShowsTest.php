@@ -158,7 +158,7 @@ it('groups multiple airings of the same title into one card', function () {
 // --- recordOnce ---
 
 it('creates a Once rule with playlist_auth_id and dvr_setting_id stamped', function () {
-    $programme = EpgProgramme::factory()->create([
+    $programme = EpgProgramme::factory()->for(Epg::factory()->for($this->user))->create([
         'title' => 'Breaking Bad',
         'start_time' => now()->addHours(2),
         'end_time' => now()->addHours(3),
@@ -178,7 +178,7 @@ it('creates a Once rule with playlist_auth_id and dvr_setting_id stamped', funct
 });
 
 it('does not duplicate a Once rule for the same programme', function () {
-    $programme = EpgProgramme::factory()->create([
+    $programme = EpgProgramme::factory()->for(Epg::factory()->for($this->user))->create([
         'title' => 'Breaking Bad',
         'start_time' => now()->addHours(2),
         'end_time' => now()->addHours(3),
@@ -259,6 +259,70 @@ it('creates a Series rule with custom options and playlist_auth_id', function ()
 
 // --- openShowDetail / closeShowDetail ---
 
+it('includes a formatted end time alongside start time for each airing', function () {
+    EpgProgramme::factory()->create([
+        'title' => 'The Wire',
+        'start_time' => now()->addHours(2)->minute(0)->second(0),
+        'end_time' => now()->addHours(3)->minute(0)->second(0),
+    ]);
+
+    $component = makeGuestBrowseShows();
+    $component->openShowDetail('The Wire');
+
+    $airing = $component->selectedShowDetail['airings'][0];
+
+    expect($airing['end_time_human'])->not->toBeNull()
+        ->and($airing['end_time_human'])->not->toBe($airing['start_time_human']);
+});
+
+it('formats airing duration in hours and minutes', function () {
+    $start = now()->addHours(2)->startOfHour();
+    EpgProgramme::factory()->create([
+        'title' => 'The Wire',
+        'start_time' => $start,
+        'end_time' => $start->copy()->addMinutes(90),
+    ]);
+
+    $component = makeGuestBrowseShows();
+    $component->openShowDetail('The Wire');
+
+    $airing = $component->selectedShowDetail['airings'][0];
+
+    expect($airing['duration_human'])->toBe('1hr 30min');
+});
+
+it('formats airing duration as whole hours when there are no leftover minutes', function () {
+    $start = now()->addHours(2)->startOfHour();
+    EpgProgramme::factory()->create([
+        'title' => 'Breaking Bad',
+        'start_time' => $start,
+        'end_time' => $start->copy()->addHour(),
+    ]);
+
+    $component = makeGuestBrowseShows();
+    $component->openShowDetail('Breaking Bad');
+
+    $airing = $component->selectedShowDetail['airings'][0];
+
+    expect($airing['duration_human'])->toBe('1hr');
+});
+
+it('formats airing duration in minutes only when under an hour', function () {
+    $start = now()->addHours(2)->startOfHour();
+    EpgProgramme::factory()->create([
+        'title' => 'News at Noon',
+        'start_time' => $start,
+        'end_time' => $start->copy()->addMinutes(30),
+    ]);
+
+    $component = makeGuestBrowseShows();
+    $component->openShowDetail('News at Noon');
+
+    $airing = $component->selectedShowDetail['airings'][0];
+
+    expect($airing['duration_human'])->toBe('30min');
+});
+
 it('sets selectedShowTitle when openShowDetail is called', function () {
     $component = makeGuestBrowseShows();
     $component->openShowDetail('Breaking Bad');
@@ -313,6 +377,41 @@ it('includes disabled channels in guest channel options when include_disabled_ch
     expect($component->channelOptionsDispatched)->toBeTrue();
     expect(Channel::where('playlist_id', $this->playlist->id)->pluck('id')->toArray())
         ->toContain($disabled->id);
+});
+
+it('restricts guest search to the selected channel using tvg-id when there is no explicit EPG mapping', function () {
+    $epg = Epg::factory()->for($this->user)->create();
+
+    $channelA = Channel::factory()->for($this->user)->for($this->playlist)->create([
+        'stream_id' => 'r07.a',
+        'epg_channel_id' => null,
+        'enabled' => true,
+    ]);
+    Channel::factory()->for($this->user)->for($this->playlist)->create([
+        'stream_id' => 'r07.b',
+        'epg_channel_id' => null,
+        'enabled' => true,
+    ]);
+
+    EpgProgramme::factory()->for($epg)->create([
+        'title' => 'R07 Programme A',
+        'epg_channel_id' => 'r07.a',
+        'start_time' => now()->addHours(2),
+        'end_time' => now()->addHours(3),
+    ]);
+    EpgProgramme::factory()->for($epg)->create([
+        'title' => 'R07 Programme B',
+        'epg_channel_id' => 'r07.b',
+        'start_time' => now()->addHours(2),
+        'end_time' => now()->addHours(3),
+    ]);
+
+    $component = makeGuestBrowseShows();
+    $component->channel_id = $channelA->id;
+    $component->search();
+
+    expect($component->groupedShows)->toHaveCount(1)
+        ->and($component->groupedShows[0]['title'])->toBe('R07 Programme A');
 });
 
 it('includes programmes from disabled channels for guests when include_disabled_channels is true', function () {

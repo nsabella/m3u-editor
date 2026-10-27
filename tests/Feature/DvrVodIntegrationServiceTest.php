@@ -19,12 +19,16 @@
  */
 
 use App\Enums\DvrRecordingStatus;
+use App\Events\DvrRecordingStatusEvent;
 use App\Jobs\EnrichDvrMetadata;
 use App\Jobs\IntegrateDvrRecordingToVod;
 use App\Models\Channel;
+use App\Models\CustomPlaylist;
 use App\Models\DvrRecording;
+use App\Models\DvrRecordingRule;
 use App\Models\DvrSetting;
 use App\Models\Episode;
+use App\Models\MergedPlaylist;
 use App\Models\Playlist;
 use App\Models\Season;
 use App\Models\Series;
@@ -35,9 +39,11 @@ use App\Services\DvrVodIntegrationService;
 use Carbon\Carbon;
 use Filament\Notifications\DatabaseNotification;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Notification;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\URL;
 
 uses(RefreshDatabase::class);
 
@@ -120,12 +126,10 @@ it('sets the VOD channel URL to the authenticated dvr stream route', function ()
 
     $channel = Channel::where('dvr_recording_id', $recording->id)->firstOrFail();
     $setting = $recording->dvrSetting;
-    $expectedUrl = route('dvr.recording.stream', [
-        'username' => $recording->user->name,
-        'password' => $setting->playlist->uuid,
+    $expectedUrl = url(URL::signedRoute('dvr.recording.stream.signed', [
         'uuid' => $recording->uuid,
         'format' => $setting->dvr_output_format ?? 'ts',
-    ]);
+    ], absolute: false));
 
     expect($channel->url)->toBe($expectedUrl);
 });
@@ -246,12 +250,10 @@ it('sets the episode URL to the authenticated dvr stream route', function () {
 
     $episode = Episode::where('dvr_recording_id', $recording->id)->firstOrFail();
     $setting = $recording->dvrSetting;
-    $expectedUrl = route('dvr.recording.stream', [
-        'username' => $recording->user->name,
-        'password' => $setting->playlist->uuid,
+    $expectedUrl = url(URL::signedRoute('dvr.recording.stream.signed', [
         'uuid' => $recording->uuid,
         'format' => $setting->dvr_output_format ?? 'ts',
-    ]);
+    ], absolute: false));
 
     expect($episode->url)->toBe($expectedUrl);
 });
@@ -1030,6 +1032,126 @@ it('classifies recording with non-movie category and subtitle as TV', function (
     expect($series->name)->toBe('Premier League');
 });
 
+it('classifies a bare film-genre category with a subtitle as a movie', function (string $category) {
+    $recording = makeCompletedRecording([
+        'title' => 'Heat',
+        'subtitle' => 'Director\'s Cut',
+        'season' => null,
+        'episode' => null,
+        'metadata' => null,
+        'epg_programme_data' => ['category' => $category],
+    ]);
+
+    $this->service->integrateRecording($recording);
+
+    expect($recording->isTvContent())->toBeFalse()
+        ->and(Series::count())->toBe(0)
+        ->and(Channel::where('dvr_recording_id', $recording->id)->exists())->toBeTrue();
+})->with(['Drama', 'Action', 'Thriller', 'Comedy']);
+
+it('ignores a provider ID in episode_num and classifies the recording as a movie', function () {
+    $recording = makeCompletedRecording([
+        'title' => 'Heat',
+        'subtitle' => null,
+        'season' => null,
+        'episode' => null,
+        'metadata' => null,
+        'epg_programme_data' => ['episode_num' => 'MV000123.0000'],
+    ]);
+
+    $this->service->integrateRecording($recording);
+
+    expect($recording->isTvContent())->toBeFalse()
+        ->and(Series::count())->toBe(0)
+        ->and(Channel::where('dvr_recording_id', $recording->id)->exists())->toBeTrue();
+});
+
+it('does not treat series_key as a TV signal because every recording has one', function () {
+    $recording = makeCompletedRecording([
+        'title' => 'Heat',
+        'series_key' => 'setting:1|title:heat',
+        'season' => null,
+        'episode' => null,
+        'metadata' => null,
+        'epg_programme_data' => null,
+    ]);
+
+    $this->service->integrateRecording($recording);
+
+    expect($recording->isTvContent())->toBeFalse()
+        ->and(Channel::where('dvr_recording_id', $recording->id)->exists())->toBeTrue();
+});
+
+it('classifies a Series rule recording as TV even with a bare film genre or no category', function (?string $category) {
+    $recording = makeCompletedRecording([
+        'title' => 'Greys Anatomy',
+        'subtitle' => 'Some Episode Title',
+        'season' => null,
+        'episode' => null,
+        'metadata' => null,
+        'epg_programme_data' => $category === null ? null : ['category' => $category],
+    ]);
+    $rule = DvrRecordingRule::factory()->series()
+        ->for($recording->dvrSetting, 'dvrSetting')
+        ->for($recording->user)
+        ->create(['series_title' => 'Greys Anatomy']);
+    $recording->update(['dvr_recording_rule_id' => $rule->id]);
+
+    $this->service->integrateRecording($recording);
+
+    expect($recording->isTvContent())->toBeTrue()
+        ->and(Series::count())->toBe(1)
+        ->and(Channel::where('dvr_recording_id', $recording->id)->exists())->toBeFalse();
+})->with(['Drama', null]);
+
+it('still files a Series rule recording with a movie category as a movie', function () {
+    $recording = makeCompletedRecording([
+        'title' => 'Heat',
+        'season' => null,
+        'episode' => null,
+        'metadata' => null,
+        'epg_programme_data' => ['category' => 'Movie'],
+    ]);
+    $rule = DvrRecordingRule::factory()->series()
+        ->for($recording->dvrSetting, 'dvrSetting')
+        ->for($recording->user)
+        ->create(['series_title' => 'Heat']);
+    $recording->update(['dvr_recording_rule_id' => $rule->id]);
+
+    expect($recording->isTvContent())->toBeFalse();
+});
+
+it('reads Gracenote programme ID prefixes in episode_num', function (string $episodeNum, bool $expected) {
+    $recording = makeCompletedRecording([
+        'title' => 'Heat',
+        'subtitle' => 'Some Subtitle',
+        'season' => null,
+        'episode' => null,
+        'metadata' => null,
+        'epg_programme_data' => ['episode_num' => $episodeNum, 'category' => 'Drama'],
+    ]);
+
+    expect($recording->isTvContent())->toBe($expected);
+})->with([
+    'movie' => ['MV000123.0000', false],
+    'episode' => ['EP01234567.0045', true],
+    'show' => ['SH01234567.0000', true],
+    'sports' => ['SP01234567.0000', true],
+]);
+
+it('only treats a film genre as a movie when it is the whole category', function (string $category) {
+    $recording = makeCompletedRecording([
+        'title' => 'Some Cartoon',
+        'subtitle' => 'Episode Title',
+        'season' => null,
+        'episode' => null,
+        'metadata' => null,
+        'epg_programme_data' => ['category' => $category],
+    ]);
+
+    expect($recording->isTvContent())->toBeTrue();
+})->with(['Animation', 'Crime drama']);
+
 it('falls through to movie when no category, no S/E, no subtitle', function () {
     $recording = makeCompletedRecording([
         'title' => 'Some Random Programme',
@@ -1062,4 +1184,257 @@ it('classifies category="news" without S/E as TV', function () {
     $this->service->integrateRecording($recording);
 
     expect(Series::count())->toBe(1);
+});
+
+// ── Fix #31: Polymorphic DvrSetting ownership resolution ────────────────────────
+// DvrSetting can be owned by a Playlist, CustomPlaylist, or MergedPlaylist.
+// Series / Channel / Episode / Group / Category all require a real Playlist FK,
+// so when the setting's playlist_id is null, integrateRecording must fall back
+// to the recording's channel's playlist_id. Channels always resolve through to
+// a real Playlist even when surfaced through a merged or custom playlist.
+
+it('uses setting playlist_id when present (real Playlist owner) — regression', function () {
+    $user = User::factory()->create();
+    $playlist = Playlist::factory()->for($user)->create();
+    $setting = DvrSetting::factory()->enabled()->for($user)->for($playlist)->create();
+    $channel = Channel::factory()->for($user)->for($playlist)->create();
+
+    $recording = DvrRecording::factory()
+        ->completed()
+        ->for($setting, 'dvrSetting')
+        ->for($user)
+        ->for($channel, 'channel')
+        ->create([
+            'title' => 'Regression Show',
+            'season' => 1,
+            'episode' => 1,
+            'metadata' => null,
+        ]);
+
+    $this->service->integrateRecording($recording);
+
+    $episode = Episode::where('dvr_recording_id', $recording->id)->firstOrFail();
+    expect($episode->playlist_id)->toBe($setting->playlist_id)
+        ->and($episode->playlist_id)->toBe($channel->playlist_id);
+});
+
+it('integrates through the channel when the setting has merged_playlist_id (playlist_id null)', function () {
+    $user = User::factory()->create();
+    $sourcePlaylist = Playlist::factory()->for($user)->create();
+    $mergedPlaylist = MergedPlaylist::factory()->for($user)->create();
+    $setting = DvrSetting::factory()->enabled()->for($user)->create([
+        'playlist_id' => null,
+        'merged_playlist_id' => $mergedPlaylist->id,
+    ]);
+    $channel = Channel::factory()->for($user)->for($sourcePlaylist)->create();
+
+    $recording = DvrRecording::factory()
+        ->completed()
+        ->for($setting, 'dvrSetting')
+        ->for($user)
+        ->for($channel, 'channel')
+        ->create([
+            'title' => 'Merged Show',
+            'season' => 1,
+            'episode' => 1,
+            'metadata' => null,
+        ]);
+
+    $this->service->integrateRecording($recording);
+
+    $episode = Episode::where('dvr_recording_id', $recording->id)->firstOrFail();
+    expect($episode->playlist_id)->toBe($sourcePlaylist->id);
+
+    $expectedUrl = url(URL::signedRoute('dvr.recording.stream.signed', [
+        'uuid' => $recording->uuid,
+        'format' => $setting->dvr_output_format ?? 'ts',
+    ], absolute: false));
+    expect($episode->url)->toBe($expectedUrl);
+});
+
+it('integrates through the channel when the setting has custom_playlist_id (playlist_id null)', function () {
+    $user = User::factory()->create();
+    $sourcePlaylist = Playlist::factory()->for($user)->create();
+    $customPlaylist = CustomPlaylist::factory()->for($user)->create();
+    $setting = DvrSetting::factory()->enabled()->for($user)->create([
+        'playlist_id' => null,
+        'custom_playlist_id' => $customPlaylist->id,
+    ]);
+    $channel = Channel::factory()->for($user)->for($sourcePlaylist)->create();
+
+    $recording = DvrRecording::factory()
+        ->completed()
+        ->for($setting, 'dvrSetting')
+        ->for($user)
+        ->for($channel, 'channel')
+        ->create([
+            'title' => 'Custom Show',
+            'season' => 1,
+            'episode' => 1,
+            'metadata' => null,
+        ]);
+
+    $this->service->integrateRecording($recording);
+
+    $episode = Episode::where('dvr_recording_id', $recording->id)->firstOrFail();
+    expect($episode->playlist_id)->toBe($sourcePlaylist->id);
+});
+
+it('skips gracefully when setting has no playlist_id and channel has no playlist_id', function () {
+    $user = User::factory()->create();
+    $setting = DvrSetting::factory()->enabled()->for($user)->create([
+        'playlist_id' => null,
+        'merged_playlist_id' => null,
+        'custom_playlist_id' => null,
+    ]);
+    // Channel with null playlist_id — pathological case (channels.playlist_id is nullable)
+    $channel = Channel::factory()->for($user)->create(['playlist_id' => null]);
+
+    $recording = DvrRecording::factory()
+        ->completed()
+        ->for($setting, 'dvrSetting')
+        ->for($user)
+        ->for($channel, 'channel')
+        ->create([
+            'title' => 'Skip Channel Show',
+            'season' => 1,
+            'episode' => 1,
+            'metadata' => null,
+        ]);
+
+    expect(fn () => $this->service->integrateRecording($recording))->not->toThrow(Exception::class);
+    expect(Episode::where('dvr_recording_id', $recording->id)->exists())->toBeFalse();
+    expect(Channel::where('dvr_recording_id', $recording->id)->exists())->toBeFalse();
+});
+
+// ── Issue #1403: re-broadcast status when VOD integration actually finishes ───
+//
+// DvrPostProcessorService::process() flips status -> Completed (which
+// auto-broadcasts via DvrRecording's updated hook) and only then dispatches
+// IntegrateDvrRecordingToVod onto the dvr-post queue. Without a second
+// broadcast at the end of the job, clients refresh on the first (premature)
+// push and never receive a refresh signal that lands after the Series /
+// Episode / Channel rows actually exist.
+//
+// These tests pin the behavior of the fix (single broadcast at end of
+// successful handle(), no broadcast on genuine throw, no-spurious-broadcast
+// on the skip path).
+
+it('re-broadcasts status exactly once at the end of a successful handle() — issue #1403', function () {
+    $recording = makeCompletedRecording([
+        'title' => 'Inception',
+        'season' => null,
+        'episode' => null,
+        'metadata' => [
+            'tmdb' => [
+                'id' => 27205,
+                'type' => 'movie',
+                'name' => 'Inception',
+                'overview' => 'A thief who steals corporate secrets.',
+                'poster_url' => 'https://image.tmdb.org/t/p/w500/poster.jpg',
+                'release_date' => '2010-07-16',
+            ],
+        ],
+    ]);
+
+    // Event::fake() is installed AFTER the recording was created above, so
+    // the factory-driven created-hook broadcast at create-time is not in
+    // scope — we are only asserting broadcasts that fire from inside
+    // handle().
+    Event::fake([DvrRecordingStatusEvent::class]);
+
+    (new IntegrateDvrRecordingToVod($recording->id))->handle($this->service);
+
+    Event::assertDispatchedTimes(DvrRecordingStatusEvent::class, 1);
+    Event::assertDispatched(
+        DvrRecordingStatusEvent::class,
+        fn (DvrRecordingStatusEvent $event) => $event->uuid === $recording->uuid
+            && $event->status === 'completed'
+            && $event->title === 'Inception'
+    );
+
+    // Sanity: the integration itself still ran — Channel row exists.
+    expect(Channel::where('dvr_recording_id', $recording->id)->exists())->toBeTrue();
+});
+
+it('does not re-broadcast when integrateRecording() throws — retry semantics preserved — issue #1403', function () {
+    $recording = makeCompletedRecording([
+        'title' => 'Failing Movie',
+        'season' => null,
+        'episode' => null,
+        'metadata' => [
+            'tmdb' => ['id' => 999, 'type' => 'movie', 'name' => 'Failing Movie'],
+        ],
+    ]);
+
+    // Stub the integration service to throw — matches the real behaviour of
+    // DvrVodIntegrationService::integrateRecording()'s catch block, which
+    // rethrows.
+    $failingService = Mockery::mock(DvrVodIntegrationService::class);
+    $failingService->shouldReceive('integrateRecording')
+        ->once()
+        ->andThrow(new Exception('integration failed'));
+
+    Event::fake([DvrRecordingStatusEvent::class]);
+
+    expect(fn () => (new IntegrateDvrRecordingToVod($recording->id))->handle($failingService))
+        ->toThrow(Exception::class, 'integration failed');
+
+    // Critical: no second broadcast fires when integration genuinely fails.
+    // The job's `tries = 3` retry path is the only path that should retry —
+    // a spurious broadcast here would falsely tell clients the library row
+    // exists when it doesn't.
+    Event::assertNotDispatched(DvrRecordingStatusEvent::class);
+});
+
+it('completes handle() without error on the no-resolvable-playlist skip path — issue #1403', function () {
+    // Orphaned-recording scenario (same shape as the
+    // "skips gracefully when setting has no playlist_id and channel has no
+    //  playlist_id" test above, but exercised at the JOB level).  This is
+    // the only DB-constructible skip path now that user_id and
+    // dvr_setting_id are NOT NULL — they would also early-return from
+    // integrateRecording(), but cannot be reproduced in tests.
+    $user = User::factory()->create();
+    $setting = DvrSetting::factory()->enabled()->for($user)->create([
+        'playlist_id' => null,
+        'merged_playlist_id' => null,
+        'custom_playlist_id' => null,
+    ]);
+    $channel = Channel::factory()->for($user)->create(['playlist_id' => null]);
+
+    $recording = DvrRecording::factory()
+        ->completed()
+        ->for($setting, 'dvrSetting')
+        ->for($user)
+        ->for($channel, 'channel')
+        ->create([
+            'title' => 'Orphan Recording',
+            'season' => 1,
+            'episode' => 1,
+            'metadata' => null,
+        ]);
+
+    Event::fake([DvrRecordingStatusEvent::class]);
+
+    // Critical assertion: handle() reaches its end without throwing even
+    // when integrateRecording() early-returns.  The fix's
+    // broadcastStatus() call must NOT be guarded on "did integration
+    // actually do something?", per the issue.
+    expect(fn () => (new IntegrateDvrRecordingToVod($recording->id))->handle($this->service))
+        ->not->toThrow(Exception::class);
+
+    // For an orphaned recording (no resolvable playlist), the recording's
+    // owner() is null and broadcastStatus() silently no-ops — no event is
+    // dispatched, because there is no Reverb channel for a player to
+    // subscribe to. The fix preserves this safety: the broadcast call is
+    // reached (no exception interrupts it), and the no-op result is the
+    // correct safety outcome.
+    Event::assertNotDispatched(DvrRecordingStatusEvent::class);
+
+    // Confirm we did reach the broadcastStatus() call (not just that
+    // handle() bailed out earlier) by verifying the post_processing_step
+    // label was cleared. handle() clears it on the success and skip paths
+    // both; only an uncaught throw would leave it set.
+    $recording->refresh();
+    expect($recording->post_processing_step)->toBeNull();
 });

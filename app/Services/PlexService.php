@@ -5,15 +5,19 @@ namespace App\Services;
 use App\Http\Controllers\MediaServerProxyController;
 use App\Interfaces\MediaServer;
 use App\Models\MediaServerIntegration;
+use App\Traits\DoesNotSupportLibraryCreation;
 use Exception;
 use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Http\Request;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Throwable;
 
 class PlexService implements MediaServer
 {
+    use DoesNotSupportLibraryCreation;
+
     protected MediaServerIntegration $integration;
 
     protected string $baseUrl;
@@ -41,6 +45,28 @@ class PlexService implements MediaServer
                 'X-Plex-Token' => $this->apiKey,
                 'Accept' => 'application/json',
             ]);
+    }
+
+    /**
+     * Cheap reachability probe for stream-start gating. Unlike
+     * testConnection() this uses short timeouts and no retries: a dead
+     * media server must never stall playback start.
+     */
+    public function isReachable(): bool
+    {
+        try {
+            return Http::baseUrl($this->baseUrl)
+                ->connectTimeout(2)
+                ->timeout(3)
+                ->withHeaders([
+                    'X-Plex-Token' => $this->apiKey,
+                    'Accept' => 'application/json',
+                ])
+                ->get('/identity')
+                ->successful();
+        } catch (Throwable $e) {
+            return false;
+        }
     }
 
     public function testConnection(): array
@@ -140,7 +166,11 @@ class PlexService implements MediaServer
 
         foreach ($libraries as $library) {
             try {
-                $response = $this->client()->get("/library/sections/{$library['key']}/all");
+                // includeGuids exposes the tmdb/tvdb/imdb ids (ProviderIds)
+                // that media-source matching keys on.
+                $response = $this->client()->get("/library/sections/{$library['key']}/all", [
+                    'includeGuids' => 1,
+                ]);
 
                 if ($response->successful()) {
                     $data = $response->json();
@@ -265,6 +295,8 @@ class PlexService implements MediaServer
             'Type' => ucfirst($item['type']),
             'ProductionYear' => $item['year'] ?? null,
             'PremiereDate' => $item['originallyAvailableAt'] ?? null,
+            // When the item was added to the library (Emby/Jellyfin shape)
+            'DateCreated' => ! empty($item['addedAt']) ? gmdate('Y-m-d\TH:i:s\Z', (int) $item['addedAt']) : null,
             'Path' => $item['Media'][0]['Part'][0]['file'] ?? null,
             'CommunityRating' => $communityRating,
             'OfficialRating' => $item['contentRating'] ?? null,
@@ -273,10 +305,18 @@ class PlexService implements MediaServer
             'IndexNumber' => $item['index'] ?? null,
             'ParentIndexNumber' => $item['parentIndex'] ?? null,
             'Genres' => array_map(fn ($g) => $g['tag'], $item['Genre'] ?? []),
+            // Plex has a single studio string (the network for shows); Emby/Jellyfin shape.
+            'Studios' => ! empty($item['studio']) ? [['Name' => $item['studio']]] : [],
             'People' => array_map(fn ($p) => [
                 'Name' => $p['tag'] ?? $p['name'] ?? null,
                 'Type' => 'Actor',
                 'Role' => $p['role'] ?? null,
+                // Plex exposes only its own agent id (tagKey), never a TMDB
+                // person id - left out so downstream cast_list keeps id = null.
+                // `thumb` is an absolute URL when present (metadata-static.plex.tv).
+                'PrimaryImageUrl' => isset($p['thumb']) && str_starts_with((string) $p['thumb'], 'http')
+                    ? $p['thumb']
+                    : null,
             ], $people),
             'Directors' => array_map(fn ($d) => $d['tag'], $directors),
             'ImageTags' => [
@@ -818,11 +858,24 @@ class PlexService implements MediaServer
         );
     }
 
-    public function getDirectImageUrl(string $itemId, string $imageType = 'Primary'): string
+    public function getDirectImageUrl(string $itemId, string $imageType = 'Primary', ?int $maxWidth = null): string
     {
         $thumb = $imageType === 'Primary' ? 'thumb' : 'art';
+        $path = "/library/metadata/{$itemId}/{$thumb}";
 
-        return "{$this->baseUrl}/library/metadata/{$itemId}/{$thumb}?X-Plex-Token={$this->apiKey}";
+        if (! $maxWidth) {
+            return "{$this->baseUrl}{$path}?X-Plex-Token={$this->apiKey}";
+        }
+
+        // Plex's photo transcoder fits the image inside width x height; a tall
+        // box makes the width the only real limit.
+        return "{$this->baseUrl}/photo/:/transcode?".http_build_query([
+            'width' => $maxWidth,
+            'height' => $maxWidth * 4,
+            'upscale' => 0,
+            'url' => $path,
+            'X-Plex-Token' => $this->apiKey,
+        ]);
     }
 
     public function extractGenres(array $item): array

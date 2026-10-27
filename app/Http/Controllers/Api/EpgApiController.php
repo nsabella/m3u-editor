@@ -3,16 +3,18 @@
 namespace App\Http\Controllers\Api;
 
 use App\Enums\ChannelLogoType;
-use App\Enums\PlaylistChannelId;
 use App\Facades\PlaylistFacade;
 use App\Http\Controllers\Controller;
 use App\Http\Controllers\LogoProxyController;
 use App\Http\Controllers\PlaylistGenerateController;
 use App\Models\AedProfile;
+use App\Models\CustomPlaylist;
 use App\Models\Epg;
 use App\Models\EpgChannel;
 use App\Models\Playlist;
+use App\Models\PlaylistAlias;
 use App\Services\AedExtractorService;
+use App\Services\ChannelNumberSequence;
 use App\Services\EpgCacheService;
 use Carbon\Carbon;
 use Exception;
@@ -276,7 +278,7 @@ class EpgApiController extends Controller
 
         if (Auth::check() && Auth::id() === $playlist->user_id) {
             $username = $user->name ?? 'admin';
-            $password = $playlist->uuid;
+            $password = $playlist->getInternalAuthPassword();
         } elseif ($requestedUsername && $requestedPassword) {
             $authResult = PlaylistFacade::authenticate($requestedUsername, $requestedPassword);
             $resolvedPlaylist = $authResult[0] ?? null;
@@ -308,7 +310,7 @@ class EpgApiController extends Controller
         ]);
         try {
             // Get enabled channels from the playlist
-            $playlistChannels = PlaylistGenerateController::getChannelQuery($playlist)
+            $pageQuery = PlaylistGenerateController::getChannelQuery($playlist)
                 ->when($search, function ($queryBuilder) use ($search) {
                     $search = Str::lower($search);
 
@@ -323,14 +325,22 @@ class EpgApiController extends Controller
                     return $queryBuilder->whereRaw('LOWER(COALESCE("channels"."group", "channels"."group_internal")) = LOWER(?)', [$group]);
                 })
                 ->limit($perPage)
-                ->offset($skip)
-                ->cursor();
+                ->offset($skip);
+
+            // Number each page as it is numbered in the full output, rather than
+            // restarting the sequence from the start number on every page.
+            $isCustomContext = ($playlist instanceof CustomPlaylist)
+                || ($playlist instanceof PlaylistAlias && ! empty($playlist->custom_playlist_id));
+            $numberSequence = new ChannelNumberSequence($playlist);
+            $pageNumbers = ($numberSequence->isPositional() && ($skip > 0 || $search || $group))
+                ? ChannelNumberSequence::numbersFor($playlist, PlaylistGenerateController::getChannelQuery($playlist), $pageQuery, $isCustomContext)
+                : null;
+
+            $playlistChannels = $pageQuery->cursor();
 
             // Check the proxy format
             $logoProxyEnabled = $playlist->enable_logo_proxy;
 
-            // If auto channel increment is enabled, set the starting channel number
-            $channelNumber = $playlist->auto_channel_increment ? $playlist->channel_start - 1 : 0;
             $idChannelBy = $playlist->id_channel_by;
             $dummyEpgEnabled = $playlist->dummy_epg;
             $dummyEpgLength = (int) ($playlist->dummy_epg_length ?? 120); // Default to 120 minutes if not set
@@ -356,10 +366,10 @@ class EpgApiController extends Controller
             $channelSortIndex = $skip;
             foreach ($playlistChannels as $channel) {
                 $epgId = $channel->epg_id ?? null;
-                $channelNo = $channel->channel;
-                if (! $channelNo && ($playlist->auto_channel_increment || $idChannelBy === PlaylistChannelId::Number)) {
-                    $channelNo = ++$channelNumber;
-                }
+                $channelNo = $channel->resolveChannelNumber($isCustomContext);
+                $channelNo = $pageNumbers !== null
+                    ? ($pageNumbers[$channel->id] ?? $channelNo)
+                    : $numberSequence->next($channelNo);
 
                 // Always use the database primary key as the array key to guarantee uniqueness.
                 // Duplicate channel numbers would otherwise overwrite earlier entries.
@@ -403,7 +413,7 @@ class EpgApiController extends Controller
                         'group' => $channel->group ?? $channel->group_internal,
                         'logo' => $logo ?? '',
                     ];
-                } elseif ($dummyEpgEnabled) {
+                } elseif ($dummyEpgEnabled || $aedProfileId) {
                     // Get the icon
                     $icon = $channel->logo ?? $channel->logo_internal ?? '';
                     if (empty($icon)) {
@@ -446,23 +456,7 @@ class EpgApiController extends Controller
                 }
 
                 // Get the TVG ID
-                switch ($idChannelBy) {
-                    case PlaylistChannelId::ChannelId:
-                        $tvgId = $channel->id;
-                        break;
-                    case PlaylistChannelId::Number:
-                        $tvgId = $channelNo;
-                        break;
-                    case PlaylistChannelId::Name:
-                        $tvgId = $channel->name_custom ?? $channel->name;
-                        break;
-                    case PlaylistChannelId::Title:
-                        $tvgId = $channel->title_custom ?? $channel->title;
-                        break;
-                    default:
-                        $tvgId = $channel->source_id ?? $channel->stream_id_custom ?? $channel->stream_id;
-                        break;
-                }
+                $tvgId = $channel->resolveTvgId($idChannelBy, $channelNo);
 
                 // Get the channel URL with embedded auth. XtreamStreamController routes
                 // to the channelPlayer method, which applies the in-app transcoding
@@ -602,33 +596,10 @@ class EpgApiController extends Controller
 
                                 // Only include programmes for channels in current page
                                 if (isset($channels[$playlistChannelId])) {
-                                    // Apply tvg_shift offset if set
-                                    $tvgShift = $channels[$playlistChannelId]['tvg_shift'] ?? 0;
-
-                                    if ($tvgShift !== 0) {
-                                        // Offset all programme times by tvg_shift hours
-                                        $shiftedProgrammes = array_map(function ($programme) use ($tvgShift) {
-                                            $shiftedProgramme = $programme;
-
-                                            // Shift start time
-                                            if (isset($programme['start'])) {
-                                                $startTime = Carbon::parse($programme['start']);
-                                                $shiftedProgramme['start'] = $startTime->addHours($tvgShift)->toIso8601String();
-                                            }
-
-                                            // Shift stop time
-                                            if (isset($programme['stop'])) {
-                                                $stopTime = Carbon::parse($programme['stop']);
-                                                $shiftedProgramme['stop'] = $stopTime->addHours($tvgShift)->toIso8601String();
-                                            }
-
-                                            return $shiftedProgramme;
-                                        }, $channelProgrammes);
-
-                                        $programmes[$playlistChannelId] = $shiftedProgrammes;
-                                    } else {
-                                        $programmes[$playlistChannelId] = $channelProgrammes;
-                                    }
+                                    $programmes[$playlistChannelId] = EpgCacheService::shiftProgrammes(
+                                        $channelProgrammes,
+                                        $channels[$playlistChannelId]['tvg_shift'] ?? 0
+                                    );
                                 }
                             }
                         }
@@ -678,6 +649,13 @@ class EpgApiController extends Controller
                         $event = $aedExtractor->extract($aedProfile, $rawTitle)
                             ?? $aedExtractor->fallback($aedProfile, $rawTitle);
 
+                        // No event found and no-event fallback is disabled: emit nothing for this channel
+                        if ($event === null) {
+                            $programmes[$playlistChannelId] = $dummyProgrammes;
+
+                            continue;
+                        }
+
                         $eventIcon = $aedProfile->logo_url ?: $icon;
                         $slotMinutes = $event->durationMinutes;
 
@@ -703,12 +681,14 @@ class EpgApiController extends Controller
                                 return $p;
                             };
 
-                            // Pre-event fill: window start → event start (skipped when pre_event_format is null)
+                            // Pre-event fill: window start → event start, capped at the window end so a
+                            // far-off event can't generate months of padding (skipped when pre_event_format is null)
+                            $preEventEnd = $event->start->lt($windowEnd) ? $event->start : $windowEnd;
                             $cursor = $windowStart->copy();
-                            while ($cursor->lt($event->start)) {
+                            while ($cursor->lt($preEventEnd)) {
                                 $slotEnd = $cursor->copy()->addMinutes($slotMinutes);
-                                if ($slotEnd->gt($event->start)) {
-                                    $slotEnd = $event->start->copy();
+                                if ($slotEnd->gt($preEventEnd)) {
+                                    $slotEnd = $preEventEnd->copy();
                                 }
                                 $preTitle = $aedExtractor->preEventTitle($aedProfile, $rawTitle, $event, $cursor);
                                 if ($preTitle !== null) {
@@ -717,8 +697,10 @@ class EpgApiController extends Controller
                                 $cursor = $slotEnd;
                             }
 
-                            // The event itself
-                            $dummyProgrammes[] = $buildProgramme($event->start, $event->end, $event->title, $event->description);
+                            // The event itself (only when it starts inside the window)
+                            if ($event->start->lt($windowEnd)) {
+                                $dummyProgrammes[] = $buildProgramme($event->start, $event->end, $event->title, $event->description);
+                            }
 
                             // Post-event fill: event end → window end (skipped when post_event_format is null)
                             if ($postTitle !== null) {

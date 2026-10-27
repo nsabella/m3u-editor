@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Http\Controllers\MediaServerProxyController;
 use App\Interfaces\MediaServer;
 use App\Models\MediaServerIntegration;
+use App\Traits\DoesNotSupportLibraryCreation;
 use Exception;
 use Illuminate\Http\Request;
 use Illuminate\Support\Collection;
@@ -19,6 +20,8 @@ use Illuminate\Support\Facades\Log;
  */
 class LocalMediaService implements MediaServer
 {
+    use DoesNotSupportLibraryCreation;
+
     protected MediaServerIntegration $integration;
 
     /**
@@ -424,7 +427,7 @@ class LocalMediaService implements MediaServer
     /**
      * Get direct image URL.
      */
-    public function getDirectImageUrl(string $itemId, string $imageType = 'Primary'): string
+    public function getDirectImageUrl(string $itemId, string $imageType = 'Primary', ?int $maxWidth = null): string
     {
         return '';
     }

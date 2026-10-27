@@ -4,6 +4,7 @@ namespace App\Filament\Resources\Plugins\Pages;
 
 use App\Filament\Resources\PluginInstallReviews\PluginInstallReviewResource;
 use App\Filament\Resources\Plugins\PluginResource;
+use App\Filament\Resources\QueueMonitor\QueueMonitorResource;
 use App\Jobs\ExecutePluginInvocation;
 use App\Models\Plugin;
 use App\Plugins\PluginManager;
@@ -142,7 +143,7 @@ class EditPlugin extends EditRecord
                         Notification::make()
                             ->title(__('File check complete'))
                             ->body($plugin->hasVerifiedIntegrity()
-                                ? __('No changes detected — plugin files match the trusted version.')
+                                ? __('No changes detected - plugin files match the trusted version.')
                                 : __('Files have been modified. Use Trust Plugin to approve the new version.'))
                             ->color($plugin->hasVerifiedIntegrity() ? 'success' : 'warning')
                             ->send();
@@ -183,13 +184,28 @@ class EditPlugin extends EditRecord
                             // without requiring a full page reload or a separate Validate click.
                             $this->record = $plugin;
 
-                            Notification::make()
+                            $staleWorkerRisk = $plugin->enabled && $reActivate;
+
+                            $notification = Notification::make()
                                 ->success()
                                 ->title($plugin->enabled ? __('Plugin trusted and activated') : __('Plugin trusted'))
-                                ->body($plugin->enabled
-                                    ? __('Updated files have been trusted and the plugin is now active.')
-                                    : __('The plugin is now trusted. You can enable it when you are ready.'))
-                                ->send();
+                                ->body(match (true) {
+                                    $staleWorkerRisk => __('Updated files have been trusted and the plugin is now active. A queue worker that already ran this plugin may keep executing the previous version until it recycles - use Reset Queue on the Queue Monitor page if you need the update to take effect immediately.'),
+                                    $plugin->enabled => __('Updated files have been trusted and the plugin is now active.'),
+                                    default => __('The plugin is now trusted. You can enable it when you are ready.'),
+                                });
+
+                            if ($staleWorkerRisk) {
+                                $notification
+                                    ->persistent()
+                                    ->actions([
+                                        Action::make('view_queue_monitor')
+                                            ->label(__('Reset Queue'))
+                                            ->url(QueueMonitorResource::getUrl('index')),
+                                    ]);
+                            }
+
+                            $notification->send();
 
                             $this->refreshFormData([
                                 'enabled',
@@ -317,7 +333,7 @@ class EditPlugin extends EditRecord
                             Notification::make()
                                 ->success()
                                 ->title(__('Update staged for review'))
-                                ->body(__('Review #:id is ready — check Plugin Installs to approve it.', ['id' => $review->id]))
+                                ->body(__('Review #:id is ready - check Plugin Installs to approve it.', ['id' => $review->id]))
                                 ->actions([
                                     Action::make('view_review')
                                         ->label(__('View Review'))
@@ -347,11 +363,24 @@ class EditPlugin extends EditRecord
                             return;
                         }
 
-                        Notification::make()
+                        $updateNotification = Notification::make()
                             ->success()
                             ->title(__(':plugin updated', ['plugin' => $record->name]))
-                            ->body(__('Version :version is now active.', ['version' => $record->latest_version]))
-                            ->send();
+                            ->body($record->enabled
+                                ? __('Version :version is now active. A queue worker that already ran this plugin may keep executing the previous version until it recycles - use Reset Queue on the Queue Monitor page if you need the update to take effect immediately.', ['version' => $record->latest_version])
+                                : __('Version :version is installed. The plugin remains disabled.', ['version' => $record->latest_version]));
+
+                        if ($record->enabled) {
+                            $updateNotification
+                                ->persistent()
+                                ->actions([
+                                    Action::make('view_queue_monitor')
+                                        ->label(__('Reset Queue'))
+                                        ->url(QueueMonitorResource::getUrl('index')),
+                                ]);
+                        }
+
+                        $updateNotification->send();
 
                         $this->refreshFormData([
                             'enabled',
@@ -380,7 +409,7 @@ class EditPlugin extends EditRecord
                         Notification::make()
                             ->success()
                             ->title(__('Security review created'))
-                            ->body(__('Review #:id is queued — check Plugin Installs to scan and approve it.', ['id' => $review->id]))
+                            ->body(__('Review #:id is queued - check Plugin Installs to scan and approve it.', ['id' => $review->id]))
                             ->send();
                     }),
                 Action::make('reinstall')

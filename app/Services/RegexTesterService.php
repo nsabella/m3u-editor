@@ -64,6 +64,12 @@ class RegexTesterService
                 ->limit($limit)
                 ->pluck('display_name'),
 
+            'urls' => Channel::where('user_id', $userId)
+                ->whereNotNull('url')
+                ->inRandomOrder()
+                ->limit($limit)
+                ->pluck('url'),
+
             default => collect(),
         };
     }
@@ -75,7 +81,12 @@ class RegexTesterService
      */
     public static function normalizeSamples(string $samples): array
     {
-        return array_values(array_filter(array_map('trim', explode("\n", $samples))));
+        // array_filter()'s default callback drops the valid sample line "0" along
+        // with truly empty lines, since PHP treats the string "0" as falsy.
+        return array_values(array_filter(
+            array_map('trim', explode("\n", $samples)),
+            fn (string $line): bool => $line !== ''
+        ));
     }
 
     /**

@@ -14,6 +14,18 @@ class MergedPlaylistPivot extends Pivot
 {
     protected $table = 'merged_playlist_playlist';
 
+    /**
+     * The attributes that should be cast to native types.
+     *
+     * @var array
+     */
+    protected $casts = [
+        'include_live' => 'boolean',
+        'include_vod' => 'boolean',
+        'include_series' => 'boolean',
+        'only_unmatched' => 'boolean',
+    ];
+
     public function playlist(): BelongsTo
     {
         return $this->belongsTo(Playlist::class);

@@ -2,12 +2,15 @@
 
 namespace App\Filament\Resources\Categories\Pages;
 
-use App\Facades\SortFacade;
+use App\Filament\Actions\FetchTmdbIdsForGroupsAction;
+use App\Filament\Actions\SortSeriesByDateAction;
 use App\Filament\Resources\Categories\CategoryResource;
 use App\Jobs\ProcessM3uImportSeriesEpisodes;
 use App\Jobs\SyncSeriesStrmFiles;
 use App\Models\Category;
+use App\Services\GenreGroupReclassifyService;
 use App\Services\PlaylistService;
+use App\Services\TmdbService;
 use Filament\Actions\Action;
 use Filament\Actions\ActionGroup;
 use Filament\Forms\Components\Select;
@@ -24,6 +27,7 @@ class EditCategory extends EditRecord
         return [
             ActionGroup::make([
                 PlaylistService::getAddGroupsToPlaylistAction('add', 'series'),
+                PlaylistService::getAddGroupsToBouquetAction(type: 'category'),
                 Action::make('move')
                     ->label(__('Move Series to Category'))
                     ->schema([
@@ -32,7 +36,7 @@ class EditCategory extends EditRecord
                             ->live()
                             ->label(__('Category'))
                             ->helperText(__('Select the category you would like to move the series to.'))
-                            ->options(fn (Get $get, $record) => Category::where(['user_id' => auth()->id(), 'playlist_id' => $record->playlist_id])->get(['name', 'id'])->pluck('name', 'id'))
+                            ->options(fn (Get $get, $record) => Category::query()->assignableTarget()->where(['user_id' => auth()->id(), 'playlist_id' => $record->playlist_id])->get(['name', 'id'])->pluck('name', 'id'))
                             ->searchable(),
                     ])
                     ->action(function ($record, array $data): void {
@@ -53,35 +57,36 @@ class EditCategory extends EditRecord
                     ->modalIcon('heroicon-o-arrows-right-left')
                     ->modalDescription(__('Move the series to another category.'))
                     ->modalSubmitActionLabel(__('Move now')),
-                Action::make('sort_release_date')
-                    ->label(__('Sort by Release Date'))
-                    ->icon('heroicon-o-calendar-days')
-                    ->schema([
-                        Select::make('sort')
-                            ->label(__('Sort Order'))
-                            ->options([
-                                'DESC' => 'Newest first (2026 to 1950)',
-                                'ASC' => 'Newest first (1950 to 2026)',
-                            ])
-                            ->default('DESC')
-                            ->required(),
-                    ])
-                    ->action(function (Category $record, array $data): void {
-                        SortFacade::bulkSortCategorySeriesByReleaseDate($record, $data['sort'] ?? 'DESC');
+                SortSeriesByDateAction::forCategory(refreshRelation: true),
+                Action::make('reclassify_tmdb_genres')
+                    ->label(__('Reclassify to TMDB Genres'))
+                    ->icon('heroicon-o-tag')
+                    ->action(function (Category $record, Action $action): void {
+                        if (! app(TmdbService::class)->isConfigured()) {
+                            Notification::make()
+                                ->danger()
+                                ->title(__('TMDB API Key Required'))
+                                ->body(__('Please configure your TMDB API key in Settings > TMDB before using this feature.'))
+                                ->duration(10000)
+                                ->send();
+                            $action->halt();
+                        }
+
+                        GenreGroupReclassifyService::reclassifyCategories($record->playlist);
                     })
-                    ->after(function ($livewire) {
+                    ->after(function ($livewire): void {
                         $livewire->dispatch('refreshRelation');
                         Notification::make()
                             ->success()
-                            ->title(__('Series Sorted by Release Date'))
-                            ->body(__('The series in this category have been sorted by release date.'))
+                            ->title(__('Categories Reclassified'))
+                            ->body(__('Series in non-genre-matching categories have been moved to Uncategorized.'))
                             ->send();
                     })
                     ->requiresConfirmation()
-                    ->modalIcon('heroicon-o-calendar-days')
-                    ->modalDescription(__('Sort all series in this category by release date? This will update the sort order.')),
+                    ->modalIcon('heroicon-o-tag')
+                    ->modalDescription(__('Reclassify this playlist\'s Series categories to TMDB genres now? Series in non-genre-matching categories will be moved to Uncategorized. Categories protected by an Auto-Add to Custom Playlist rule are skipped.')),
                 Action::make('process')
-                    ->label(__('Fetch Series Metadata'))
+                    ->label(__('Fetch Provider Metadata'))
                     ->icon('heroicon-o-arrow-down-tray')
                     ->action(function ($record) {
                         foreach ($record->enabled_series as $series) {
@@ -103,6 +108,7 @@ class EditCategory extends EditRecord
                     ->modalIcon('heroicon-o-arrow-down-tray')
                     ->modalDescription(__('Process series for this category now? Only enabled series will be processed. This will fetch all episodes and seasons for the category series. This may take a while depending on the number of series in the category.'))
                     ->modalSubmitActionLabel(__('Yes, process now')),
+                FetchTmdbIdsForGroupsAction::make('series'),
                 Action::make('sync')
                     ->label(__('Sync Series .strm files'))
                     ->action(function ($record) {

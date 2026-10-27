@@ -12,6 +12,7 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\MorphToMany;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection as SupportCollection;
 use Illuminate\Support\Str;
 
@@ -36,13 +37,19 @@ class Epg extends Model
         'cache_meta' => 'array',
         'source_type' => EpgSourceType::class,
         'sd_token_expires_at' => 'datetime',
+        'sd_login_cooldown_until' => 'datetime',
+        'sd_auth_blocked_code' => 'integer',
+        'sd_backoff_attempts' => 'integer',
         'sd_last_sync' => 'datetime',
         'sd_station_ids' => 'array',
+        'sd_lineup_ids' => 'array',
         'sd_errors' => 'array',
         'sd_days_to_import' => 'integer',
         'sd_metadata' => 'array',
         'sd_debug' => 'boolean',
         'is_merged' => 'boolean',
+        'playlist_id' => 'integer',
+        'optimize_import' => 'boolean',
         'auto_resync_on_failure' => 'boolean',
         'auto_resync_retries' => 'integer',
         'resync_attempt' => 'integer',
@@ -105,11 +112,71 @@ class Epg extends Model
         return $this->source_type === EpgSourceType::SCHEDULES_DIRECT;
     }
 
+    /**
+     * A stored Schedules Direct token is usable when it exists and still has a
+     * safety margin left before its real expiry. Schedules Direct tokens are
+     * valid for 24 hours; the small margin absorbs clock skew and keeps a
+     * long-running sync from having a token lapse mid-request.
+     */
     public function hasValidSchedulesDirectToken(): bool
     {
         return $this->sd_token &&
             $this->sd_token_expires_at &&
-            $this->sd_token_expires_at->isFuture();
+            $this->sd_token_expires_at->isAfter(now()->addSeconds(60));
+    }
+
+    /**
+     * True while a bounded cooldown from a Schedules Direct TOO_MANY_LOGINS
+     * (code 4009) rejection is still in effect. No /token request may be made
+     * for this account until it clears.
+     */
+    public function isInSchedulesDirectLoginCooldown(): bool
+    {
+        return $this->sd_login_cooldown_until
+            && $this->sd_login_cooldown_until->isFuture();
+    }
+
+    /**
+     * True when Schedules Direct permanently rejected this account's login
+     * (expired, invalid user, application disabled or inactive). No /token
+     * request is made until the credentials change or the user retries.
+     */
+    public function isSchedulesDirectAuthBlocked(): bool
+    {
+        return $this->sd_auth_blocked_code !== null;
+    }
+
+    /**
+     * Scope to the Schedules Direct EPGs that authenticate against one provider
+     * account: the same owner and the same username (case/whitespace-folded).
+     * A Schedules Direct token and its TOO_MANY_LOGINS (4009) cooldown belong to
+     * the provider account, so every row here shares both.
+     */
+    public function scopeSchedulesDirectAccount(Builder $query, string $username, ?int $userId = null): Builder
+    {
+        return $query
+            ->where('source_type', EpgSourceType::SCHEDULES_DIRECT)
+            ->whereRaw('LOWER(TRIM(sd_username)) = ?', [mb_strtolower(trim($username))])
+            ->when($userId !== null, fn (Builder $inner) => $inner->where('user_id', $userId));
+    }
+
+    /**
+     * The latest still-active Schedules Direct login cooldown (code 4009) across
+     * every EPG that shares this provider account, or null when none is active.
+     * The provider rate-limits logins per account, not per EPG row.
+     */
+    public function activeSchedulesDirectAccountCooldownUntil(): ?Carbon
+    {
+        if (empty($this->sd_username)) {
+            return $this->isInSchedulesDirectLoginCooldown() ? $this->sd_login_cooldown_until : null;
+        }
+
+        $until = static::query()
+            ->schedulesDirectAccount((string) $this->sd_username, $this->user_id)
+            ->where('sd_login_cooldown_until', '>', now())
+            ->max('sd_login_cooldown_until');
+
+        return $until ? Carbon::parse($until) : null;
     }
 
     public function hasSchedulesDirectCredentials(): bool
@@ -119,7 +186,7 @@ class Epg extends Model
 
     public function hasSchedulesDirectLineup(): bool
     {
-        return ! empty($this->sd_lineup_id);
+        return ! empty($this->sd_lineup_ids);
     }
 
     public function isMerged(): bool
@@ -130,6 +197,17 @@ class Epg extends Model
     public function user(): BelongsTo
     {
         return $this->belongsTo(User::class);
+    }
+
+    /**
+     * Optional "same provider" tie to a playlist. When set, DNS failover on the
+     * playlist keeps this EPG's URL in sync, and optimized import scopes cache
+     * generation to the channels that playlist (and any other playlist mapping
+     * this EPG) actually uses.
+     */
+    public function playlist(): BelongsTo
+    {
+        return $this->belongsTo(Playlist::class);
     }
 
     public function channels(): HasMany
@@ -186,6 +264,116 @@ class Epg extends Model
     public function mergedByEpgs(): BelongsToMany
     {
         return $this->belongsToMany(self::class, 'merged_epg_epg', 'epg_id', 'merged_epg_id');
+    }
+
+    /**
+     * Resolve which Playlist/CustomPlaylist owners have an enabled DVR setting.
+     * MergedPlaylist owners are expanded to their member playlist ids, since
+     * channels are only ever linked to the underlying playlists.
+     *
+     * Resolve once and pass to {@see hasDvrEnabled()} when checking many EPGs
+     * (e.g. a table render) to avoid repeating the lookup per row.
+     *
+     * @return array{playlist_ids: list<int>, custom_playlist_ids: list<int>}
+     */
+    public static function resolveDvrEnabledOwners(): array
+    {
+        $settings = DvrSetting::where('enabled', true)
+            ->get(['playlist_id', 'custom_playlist_id', 'merged_playlist_id']);
+
+        $playlistIds = $settings->pluck('playlist_id')->filter();
+        $mergedPlaylistIds = $settings->pluck('merged_playlist_id')->filter();
+
+        if ($mergedPlaylistIds->isNotEmpty()) {
+            $playlistIds = $playlistIds->concat(
+                Playlist::join('merged_playlist_playlist', 'merged_playlist_playlist.playlist_id', '=', 'playlists.id')
+                    ->whereIn('merged_playlist_playlist.merged_playlist_id', $mergedPlaylistIds)
+                    ->pluck('playlists.id')
+            );
+        }
+
+        return [
+            'playlist_ids' => $playlistIds->unique()->values()->all(),
+            'custom_playlist_ids' => $settings->pluck('custom_playlist_id')->filter()->unique()->values()->all(),
+        ];
+    }
+
+    /**
+     * Whether any Playlist/CustomPlaylist/MergedPlaylist with channels mapped to
+     * this EPG has DVR enabled (i.e. a cache regen also populates epg_programmes).
+     *
+     * @param  array{playlist_ids: list<int>, custom_playlist_ids: list<int>}|null  $dvrOwners  from {@see resolveDvrEnabledOwners()}
+     */
+    public function hasDvrEnabled(?array $dvrOwners = null): bool
+    {
+        // Already resolved in bulk via the withHasDvr() scope (e.g. a table render)
+        if (array_key_exists('has_dvr', $this->attributes)) {
+            return (bool) $this->attributes['has_dvr'];
+        }
+
+        return static::dvrEnabledChannelsQuery($dvrOwners ?? static::resolveDvrEnabledOwners())
+            ->where('epg_channels.epg_id', $this->id)
+            ->exists();
+    }
+
+    /**
+     * Add a `has_dvr` boolean column to the query (see {@see hasDvrEnabled()}),
+     * resolved in the same query so listing many EPGs needs no per-row lookups.
+     *
+     * @param  array{playlist_ids: list<int>, custom_playlist_ids: list<int>}|null  $dvrOwners  from {@see resolveDvrEnabledOwners()}
+     */
+    public function scopeWithHasDvr(Builder $query, ?array $dvrOwners = null): Builder
+    {
+        $dvrOwners ??= static::resolveDvrEnabledOwners();
+
+        return $query->withExists([
+            'channels as has_dvr' => fn (Builder $epgChannels) => $epgChannels->whereHas(
+                'channels',
+                fn (Builder $channels) => static::constrainToDvrOwners($channels, $dvrOwners)
+            ),
+        ]);
+    }
+
+    /**
+     * Channels mapped to an EPG channel that belong to one of the DVR-enabled owners.
+     *
+     * @param  array{playlist_ids: list<int>, custom_playlist_ids: list<int>}  $dvrOwners
+     */
+    protected static function dvrEnabledChannelsQuery(array $dvrOwners): Builder
+    {
+        return static::constrainToDvrOwners(
+            Channel::join('epg_channels', 'epg_channels.id', '=', 'channels.epg_channel_id'),
+            $dvrOwners
+        );
+    }
+
+    /**
+     * Limit a channels query to channels belonging to one of the DVR-enabled owners.
+     *
+     * @param  array{playlist_ids: list<int>, custom_playlist_ids: list<int>}  $dvrOwners
+     */
+    protected static function constrainToDvrOwners(Builder $channels, array $dvrOwners): Builder
+    {
+        $playlistIds = $dvrOwners['playlist_ids'];
+        $customPlaylistIds = $dvrOwners['custom_playlist_ids'];
+
+        if (empty($playlistIds) && empty($customPlaylistIds)) {
+            return $channels->whereRaw('1 = 0');
+        }
+
+        return $channels->where(function (Builder $query) use ($playlistIds, $customPlaylistIds): void {
+            if (! empty($playlistIds)) {
+                $query->orWhereIn('channels.playlist_id', $playlistIds);
+            }
+            if (! empty($customPlaylistIds)) {
+                $query->orWhereIn('channels.custom_playlist_id', $customPlaylistIds)
+                    ->orWhereIn('channels.id', function ($subQuery) use ($customPlaylistIds): void {
+                        $subQuery->select('channel_id')
+                            ->from('channel_custom_playlist')
+                            ->whereIn('custom_playlist_id', $customPlaylistIds);
+                    });
+            }
+        });
     }
 
     /**
@@ -279,7 +467,18 @@ class Epg extends Model
             ->where('epg_channels.epg_id', $this->id)
             ->pluck('playlist_aliases.id');
 
-        $ids = $idsFromPlaylist->concat($idsFromCustomPlaylist)->unique()->values()->all();
+        $idsFromMergedPlaylist = PlaylistAlias::join('merged_playlist_playlist', 'merged_playlist_playlist.merged_playlist_id', '=', 'playlist_aliases.merged_playlist_id')
+            ->join('channels', 'channels.playlist_id', '=', 'merged_playlist_playlist.playlist_id')
+            ->join('epg_channels', 'epg_channels.id', '=', 'channels.epg_channel_id')
+            ->where('epg_channels.epg_id', $this->id)
+            ->pluck('playlist_aliases.id');
+
+        $ids = $idsFromPlaylist
+            ->concat($idsFromCustomPlaylist)
+            ->concat($idsFromMergedPlaylist)
+            ->unique()
+            ->values()
+            ->all();
 
         return $ids ? PlaylistAlias::whereIn('id', $ids)->get() : collect();
     }
@@ -287,5 +486,57 @@ class Epg extends Model
     public function postProcesses(): MorphToMany
     {
         return $this->morphToMany(PostProcess::class, 'processable');
+    }
+
+    /**
+     * Playlist ids this EPG is scoped to for optimized import: the direct
+     * provider tie plus any playlist that has a mapping run against this EPG.
+     *
+     * @return array<int, int>
+     */
+    public function tiedPlaylistIds(): array
+    {
+        $ids = collect([$this->playlist_id])
+            ->merge($this->epgMaps()->pluck('playlist_id'))
+            ->filter()
+            ->unique()
+            ->values()
+            ->all();
+
+        return array_map('intval', $ids);
+    }
+
+    /**
+     * Distinct XMLTV channel ids that optimized import should keep programme
+     * data for: the `channel_id` of every EpgChannel this EPG owns that a tied
+     * playlist's channel is currently mapped to.
+     *
+     * Returns null when optimization is off or nothing is mapped yet, which
+     * callers treat as "no filtering" (cache the full guide).
+     *
+     * @return array<int, string>|null
+     */
+    public function optimizedChannelIdAllowList(): ?array
+    {
+        if (! $this->optimize_import) {
+            return null;
+        }
+
+        $playlistIds = $this->tiedPlaylistIds();
+        if (empty($playlistIds)) {
+            return null;
+        }
+
+        $channelIds = EpgChannel::query()
+            ->where('epg_channels.epg_id', $this->id)
+            ->whereNotNull('epg_channels.channel_id')
+            ->where('epg_channels.channel_id', '!=', '')
+            ->join('channels', 'channels.epg_channel_id', '=', 'epg_channels.id')
+            ->whereIn('channels.playlist_id', $playlistIds)
+            ->distinct()
+            ->pluck('epg_channels.channel_id')
+            ->all();
+
+        return empty($channelIds) ? null : $channelIds;
     }
 }

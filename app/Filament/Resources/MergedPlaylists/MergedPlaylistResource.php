@@ -9,6 +9,7 @@ use App\Filament\Resources\MergedPlaylists\Pages\EditMergedPlaylist;
 use App\Filament\Resources\MergedPlaylists\Pages\ListMergedPlaylists;
 use App\Filament\Resources\MergedPlaylists\Pages\ViewMergedPlaylist;
 use App\Filament\Resources\MergedPlaylists\RelationManagers\PlaylistsRelationManager;
+use App\Filament\Support\DefaultAuthFields;
 use App\Filament\Support\DvrRequestsAiostreamsTabs;
 use App\Models\MergedPlaylist;
 use App\Models\PlaylistAuth;
@@ -102,6 +103,11 @@ class MergedPlaylistResource extends Resource implements CopilotResource
                     ->sortable(),
                 TextColumn::make('name')
                     ->searchable()
+                    ->sortable(),
+                TextColumn::make('groups_count')
+                    ->label(__('Groups'))
+                    ->counts('groups')
+                    ->toggleable()
                     ->sortable(),
                 // Tables\Columns\TextColumn::make('channels_count')
                 //     ->label(__('Channels'))
@@ -233,10 +239,10 @@ class MergedPlaylistResource extends Resource implements CopilotResource
                                 Rule::unique('playlists', 'uuid')->ignore($record?->id),
                             ];
                         })
-                        ->helperText(__('3–36 characters. Only letters, numbers, hyphens, and underscores are allowed.'))
+                        ->helperText(__('3-36 characters. Only letters, numbers, hyphens, and underscores are allowed.'))
                         ->hintIcon(
                             'heroicon-m-exclamation-triangle',
-                            tooltip: 'Be careful changing this value as this will change the URLs for the Playlist, its EPG, and HDHR.'
+                            tooltip: __('Be careful changing this value as this will change the URLs for the Playlist, its EPG, and HDHR.')
                         )
                         ->hidden(fn ($get): bool => ! $get('edit_uuid'))
                         ->required(),
@@ -250,6 +256,7 @@ class MergedPlaylistResource extends Resource implements CopilotResource
                 ->collapsed($creating)
                 ->columns(2)
                 ->schema([
+                    ...PlaylistFacade::getOutputTogglesSchema(),
                     Toggle::make('disable_m3u_xtream_format')
                         ->label(__('Disable Xtream URL format in M3U output'))
                         ->columnSpan(1)
@@ -257,7 +264,7 @@ class MergedPlaylistResource extends Resource implements CopilotResource
                         ->default(false)
                         ->hintIcon(
                             'heroicon-m-question-mark-circle',
-                            tooltip: 'When enabled, the provider\'s original stream URL will be used directly in M3U output instead of the internal Xtream-format URL.'
+                            tooltip: __('When enabled, the provider\'s original stream URL will be used directly in M3U output instead of the internal Xtream-format URL.')
                         )
                         ->afterStateHydrated(function (Toggle $component) {
                             if (config('app.disable_m3u_xtream_format', false)) {
@@ -266,19 +273,19 @@ class MergedPlaylistResource extends Resource implements CopilotResource
                         })
                         ->dehydrated(fn (): bool => ! config('app.disable_m3u_xtream_format', false))
                         ->disabled(fn (): bool => config('app.disable_m3u_xtream_format', false))
-                        ->helperText(config('app.disable_m3u_xtream_format', false) ? 'Already set by environment variable!' : __('Output the provider URL directly in M3U instead of routing through the internal Xtream URL format.')),
+                        ->helperText(config('app.disable_m3u_xtream_format', false) ? __('Already set by environment variable!') : __('Output the provider URL directly in M3U instead of routing through the internal Xtream URL format.')),
                     Toggle::make('output_tvg_type')
                         ->label(__('Enable TVG Type Output'))
                         ->inline(false)
                         ->default(false)
                         ->hintIcon(
                             'heroicon-m-question-mark-circle',
-                            tooltip: 'This can be used by clients to better categorize channels.'
+                            tooltip: __('This can be used by clients to better categorize channels.')
                         )
                         ->helperText(__('When enabled, a <tvg-type> tag will be included in the M3U output based on the channel type (live, vod, series).')),
                     ComponentsGroup::make()
                         ->columnSpanFull()
-                        ->columns(2)
+                        ->columns(3)
                         ->schema([
                             Toggle::make('auto_channel_increment')
                                 ->label(__('Auto channel number increment'))
@@ -287,6 +294,18 @@ class MergedPlaylistResource extends Resource implements CopilotResource
                                 ->live()
                                 ->default(false)
                                 ->helperText(__('If no channel number is set, output an automatically incrementing number.')),
+                            Toggle::make('force_channel_numbering')
+                                ->label(__('Force channel number override'))
+                                ->columnSpan(1)
+                                ->inline(false)
+                                ->live()
+                                ->default(false)
+                                ->hidden(fn (Get $get): bool => ! $get('auto_channel_increment'))
+                                ->hintIcon(
+                                    'heroicon-m-question-mark-circle',
+                                    tooltip: __('When enabled, the incrementing channel number always replaces the number provided by the source feed, instead of only filling in missing numbers.')
+                                )
+                                ->helperText(__('Always assign an incrementing channel number, overriding any number provided by the source.')),
                             TextInput::make('channel_start')
                                 ->helperText(__('The starting channel number.'))
                                 ->columnSpan(1)
@@ -294,6 +313,16 @@ class MergedPlaylistResource extends Resource implements CopilotResource
                                 ->type('number')
                                 ->hidden(fn (Get $get): bool => ! $get('auto_channel_increment'))
                                 ->required(),
+                            Toggle::make('sort_by_channel_number')
+                                ->label(__('Sort by channel number'))
+                                ->columnSpan(1)
+                                ->inline(false)
+                                ->default(false)
+                                ->hintIcon(
+                                    'heroicon-m-question-mark-circle',
+                                    tooltip: __('Channels without a number are output last, in the standard group order.')
+                                )
+                                ->helperText(__('Output channels ordered by channel number instead of by group.')),
                         ]),
                 ]),
             Section::make(__('EPG Output'))
@@ -309,7 +338,7 @@ class MergedPlaylistResource extends Resource implements CopilotResource
                         ->live()
                         ->inline(false)
                         ->default(false)
-                        ->helperText(__('When enabled, dummy EPG data will be generated for the next 5 days. Thus, it is possible to assign channels for which no EPG data is available. As program information, the channel name and the set program length are used.')),
+                        ->helperText(__('When enabled, dummy EPG data will be generated for the number of days set below. Thus, it is possible to assign channels for which no EPG data is available. As program information, the channel name and the set program length are used.')),
                     Select::make('id_channel_by')
                         ->label(__('Preferred TVG ID output'))
                         ->helperText(__('How you would like to ID your channels in the EPG.'))
@@ -322,7 +351,7 @@ class MergedPlaylistResource extends Resource implements CopilotResource
                         ])
                         ->required()
                         ->default('stream_id') // Default to stream_id
-                        ->columnSpan(1),
+                        ->columnSpan(2),
                     TextInput::make('dummy_epg_length')
                         ->label(__('Dummy program length (in minutes)'))
                         ->columnSpan(1)
@@ -331,9 +360,17 @@ class MergedPlaylistResource extends Resource implements CopilotResource
                         ->default(120)
                         ->hidden(fn (Get $get): bool => ! $get('dummy_epg'))
                         ->required(),
+                    TextInput::make('dummy_epg_days')
+                        ->label(__('Dummy EPG length (in days)'))
+                        ->columnSpan(2)
+                        ->rules(['min:1', 'max:14'])
+                        ->type('number')
+                        ->default(5)
+                        ->helperText(__('How many days of dummy EPG data to generate. AED profiles can override this per profile.'))
+                        ->hidden(fn (Get $get): bool => ! $get('dummy_epg')),
                     Repeater::make('dummy_epg_fallback_order')
                         ->label(__('Dummy EPG Title Source'))
-                        ->helperText(__('Which field to use as the programme title for dummy EPG entries. Tried in order — first non-empty value wins. Leave empty to use the channel title.'))
+                        ->helperText(__('Which field to use as the programme title for dummy EPG entries. Tried in order - first non-empty value wins. Leave empty to use the channel title.'))
                         ->schema([
                             Select::make('method')
                                 ->label(__('Field'))
@@ -380,20 +417,15 @@ class MergedPlaylistResource extends Resource implements CopilotResource
                     TextInput::make('streams')
                         ->label(__('HDHR/Xtream API Streams'))
                         ->helperText(__('Number of streams available for HDHR and Xtream API service (if using).'))
-                        ->columnSpan(1)
+                        ->columnSpanfull()
                         ->hintIcon(
                             'heroicon-m-question-mark-circle',
-                            tooltip: 'This value is also used when generating the Xtream API user info response.'
+                            tooltip: __('This value is also used when generating the Xtream API user info response.')
                         )
                         ->rules(['min:1'])
                         ->type('number')
                         ->default(1) // Default to 1 stream
                         ->required(),
-                    TextInput::make('server_timezone')
-                        ->label(__('Provider Timezone'))
-                        ->helperText(__('The portal/provider timezone (DST-aware). Needed to correctly use timeshift functionality.'))
-                        ->placeholder(__('Etc/UTC')),
-
                     Grid::make()
                         ->columns(3)
                         ->schema([
@@ -462,7 +494,7 @@ class MergedPlaylistResource extends Resource implements CopilotResource
                                 ->nullable()
                                 ->hintIcon(
                                     'heroicon-m-question-mark-circle',
-                                    tooltip: 'Time seeking is not supported when transcoding VOD or Series streams. This is a limitation of live-transcoding. Leave empty to allow time seeking.'
+                                    tooltip: __('Time seeking is not supported when transcoding VOD or Series streams. This is a limitation of live-transcoding. Leave empty to allow time seeking.')
                                 )
                                 ->helperText(__('Select a transcoding profile to apply to VOD and Series streams for external clients (VLC, Kodi, etc.). Does not affect the in-app player. Leave empty for direct stream proxying.'))
                                 ->placeholder(__('Leave empty for direct stream proxying')),
@@ -603,6 +635,7 @@ class MergedPlaylistResource extends Resource implements CopilotResource
                                                     }
                                                 })
                                                 ->dehydrated(false), // Don't save this field directly
+                                            ...DefaultAuthFields::schema(),
                                         ]),
                                 ]),
                             Tab::make(__('Output'))

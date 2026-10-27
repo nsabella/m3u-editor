@@ -109,44 +109,7 @@ class DvrRecorderService
             throw new Exception("DvrSetting not found for recording {$recording->id}");
         }
 
-        // Resolve the raw source URL for the recording.
-        // If there's already an active stream on the proxy for this channel, piggyback
-        // off it by using the stream's local proxy URL as the broadcast source. This
-        // avoids creating a second upstream connection to the provider, which can cause
-        // circuit-breaker drops (provider kills one connection when a second opens).
-        $channel = $recording->channel;
-        if ($channel) {
-            $streamUrl = $channel->url_custom ?? $channel->url ?? $recording->stream_url;
-        } else {
-            $streamUrl = $recording->stream_url;
-        }
-
-        if (empty($streamUrl)) {
-            throw new Exception("Recording {$recording->id} has no stream_url - cannot start");
-        }
-
-        // Check if there's an existing stream for this channel to piggyback off.
-        // Use the channel's own real source playlist (not the DvrSetting's owner,
-        // which may be a Custom/Merged playlist spanning multiple real playlists)
-        // since that's what the proxy actually keys active streams by.
-        $playlistUuid = $channel?->getEffectivePlaylist()?->uuid;
-        if ($channel && $playlistUuid) {
-            $activeStreamId = $this->proxy->getActiveStreamIdForChannel($channel->id, $playlistUuid);
-            if ($activeStreamId) {
-                $proxyUrl = $this->proxy->getStreamProxyUrl($activeStreamId);
-                Log::info('DVR: Piggybacking off existing stream', [
-                    'recording_id' => $recording->id,
-                    'stream_id' => $activeStreamId,
-                    'proxy_url' => $proxyUrl,
-                ]);
-                $streamUrl = $proxyUrl;
-            }
-        }
-
-        if ($streamUrl !== $recording->stream_url) {
-            $recording->stream_url = $streamUrl;
-            $recording->saveQuietly();
-        }
+        $streamUrl = $this->resolveCaptureUrl($recording);
 
         Log::info('DVR: Starting proxy broadcast', [
             'recording_id' => $recording->id,
@@ -179,6 +142,135 @@ class DvrRecorderService
         }
 
         $recording->notifyTv(__('Recording Started'), 'info');
+    }
+
+    /**
+     * Restart a recording the proxy is no longer running, typically because the
+     * proxy restarted mid-recording.
+     *
+     * The proxy resumes into the recording's existing segment directory (its
+     * playlist is appended to, not replaced) and only records what's left of the
+     * airing window, so the result is still a single file with a short gap.
+     * This is the same airing attempt, so attempt_count is left alone.
+     */
+    public function resume(DvrRecording $recording): void
+    {
+        if ($recording->status !== DvrRecordingStatus::Recording) {
+            return;
+        }
+
+        $setting = $recording->dvrSetting;
+        if (! $setting) {
+            throw new Exception("DvrSetting not found for recording {$recording->id}");
+        }
+
+        $streamUrl = $this->resolveCaptureUrl($recording);
+
+        Log::warning('DVR: Resuming recording missing from the proxy', [
+            'recording_id' => $recording->id,
+            'proxy_network_id' => $recording->proxy_network_id,
+            'title' => $recording->title,
+        ]);
+
+        $networkId = $this->proxy->startDvrBroadcast($recording, $setting, $streamUrl);
+
+        if ($networkId !== $recording->proxy_network_id) {
+            $recording->update(['proxy_network_id' => $networkId]);
+        }
+    }
+
+    /**
+     * Resolve the URL the proxy should capture a recording from, persisting it to
+     * stream_url when it changed.
+     */
+    private function resolveCaptureUrl(DvrRecording $recording): string
+    {
+        // Resolve the raw source URL for the recording.
+        // If there's already an active stream on the proxy for this channel, piggyback
+        // off it by using the stream's local proxy URL as the broadcast source. This
+        // avoids creating a second upstream connection to the provider, which can cause
+        // circuit-breaker drops (provider kills one connection when a second opens).
+        $channel = $recording->channel;
+        if ($channel) {
+            $rawUrl = $channel->url_custom ?? $channel->url ?? $recording->stream_url;
+
+            // When the channel's source playlist pools provider profiles, resolve the
+            // URL through the proxy so a provider profile is selected and its capacity
+            // reserved - a DVR recording should draw from the pool exactly as a live
+            // viewer does. Fall back to the raw channel URL if resolution fails so a
+            // recording is never lost to a transient proxy/provider error.
+            $sourcePlaylist = $channel->playlist;
+            if ($sourcePlaylist instanceof Playlist && $sourcePlaylist->profiles_enabled) {
+                try {
+                    $streamUrl = $this->proxy->getChannelUrl(
+                        $sourcePlaylist,
+                        $channel,
+                        null,
+                        null,
+                        $recording->user?->name,
+                    );
+                    if (empty($streamUrl)) {
+                        $streamUrl = $rawUrl;
+                    }
+                } catch (\Throwable $e) {
+                    // UNRESOLVED - behavior still being decided.
+                    //
+                    // getChannelUrl() aborts (503) when every provider profile is at
+                    // capacity. Right now we swallow that and fall back to the raw
+                    // primary-account URL so the recording is never lost, relying on the
+                    // fact that most providers boot an older stream when a new one starts,
+                    // so DVR effectively wins.
+                    //
+                    // The counter-argument: the whole point of pooled profiles is to
+                    // manage the connection budget explicitly and reject at the limit.
+                    // Silently exceeding it here undermines that. The alternative is to
+                    // rethrow (or only catch genuinely transient errors) and let a
+                    // capacity-blocked recording fail loudly.
+                    //
+                    // TODO: decide between "DVR always wins (current)" vs "respect the
+                    // pool limit and fail the recording". Revisit once real-world pooled
+                    // DVR usage tells us which matters more.
+                    Log::warning('DVR: pooled-provider URL resolution failed, using raw channel URL', [
+                        'recording_id' => $recording->id,
+                        'exception' => $e->getMessage(),
+                    ]);
+                    $streamUrl = $rawUrl;
+                }
+            } else {
+                $streamUrl = $rawUrl;
+            }
+        } else {
+            $streamUrl = $recording->stream_url;
+        }
+
+        if (empty($streamUrl)) {
+            throw new Exception("Recording {$recording->id} has no stream_url - cannot start");
+        }
+
+        // Check if there's an existing stream for this channel to piggyback off.
+        // Use the channel's own real source playlist (not the DvrSetting's owner,
+        // which may be a Custom/Merged playlist spanning multiple real playlists)
+        // since that's what the proxy actually keys active streams by.
+        $playlistUuid = $channel?->getEffectivePlaylist()?->uuid;
+        if ($channel && $playlistUuid) {
+            $activeStreamId = $this->proxy->getActiveStreamIdForChannel($channel->id, $playlistUuid);
+            if ($activeStreamId) {
+                $proxyUrl = $this->proxy->getStreamProxyUrl($activeStreamId);
+                Log::info('DVR: Piggybacking off existing stream', [
+                    'recording_id' => $recording->id,
+                    'stream_id' => $activeStreamId,
+                    'proxy_url' => $proxyUrl,
+                ]);
+                $streamUrl = $proxyUrl;
+            }
+        }
+
+        if ($streamUrl !== $recording->stream_url) {
+            $recording->stream_url = $streamUrl;
+            $recording->saveQuietly();
+        }
+
+        return $streamUrl;
     }
 
     /**

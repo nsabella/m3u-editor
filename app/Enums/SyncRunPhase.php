@@ -23,6 +23,8 @@ enum SyncRunPhase: string
     case ChannelMerge = 'channel_merge';
     case LiveProbe = 'live_probe';
     case CustomPlaylistSync = 'custom_playlist_sync';
+    case DynamicGroups = 'dynamic_groups';
+    case MediaSourceMatch = 'media_source_match';
 
     case SyncCompleted = 'sync_completed';
 
@@ -45,6 +47,8 @@ enum SyncRunPhase: string
             self::ChannelMerge => 'Channel Merge',
             self::LiveProbe => 'Live Stream Probe',
             self::CustomPlaylistSync => 'Custom Playlist Sync',
+            self::DynamicGroups => 'Dynamic Groups',
+            self::MediaSourceMatch => 'Media Server Source Matching',
             self::SyncCompleted => 'Sync Completed',
         };
     }
@@ -67,7 +71,9 @@ enum SyncRunPhase: string
             self::ChannelEnableRules,
             self::ChannelMerge,
             self::LiveProbe,
-            self::CustomPlaylistSync => 'gray',
+            self::CustomPlaylistSync,
+            self::DynamicGroups,
+            self::MediaSourceMatch => 'gray',
             self::SyncCompleted => 'success',
         };
     }

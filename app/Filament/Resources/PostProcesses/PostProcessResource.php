@@ -174,11 +174,13 @@ class PostProcessResource extends Resource implements CopilotResource
                 ->grouped()
                 ->required()
                 ->columnSpanFull()
-                ->options([
+                // Local scripts run on the server, so only admins can pick them
+                // (RunPostProcess enforces the same rule at run time).
+                ->options(fn (): array => array_filter([
                     'url' => 'URL',
-                    'path' => 'Local file',
+                    'path' => auth()->user()?->isAdmin() ? 'Local file' : null,
                     'email' => 'Email',
-                ])
+                ]))
                 ->icons([
                     'url' => 'heroicon-s-link',
                     'path' => 'heroicon-s-document',
@@ -248,8 +250,8 @@ class PostProcessResource extends Resource implements CopilotResource
                                 ->schema([
                                     TextInput::make('header_name')
                                         ->label(__('Header name'))
-                                        ->placeholder(__('X-Emby-Token'))
-                                        ->helperText(__('Name of the HTTP header.'))
+                                        ->placeholder('Authorization')
+                                        ->helperText(__('Name of the HTTP header. Emby uses X-Emby-Token. Jellyfin 10.8+ uses Authorization with the value MediaBrowser Token="API_KEY".'))
                                         ->datalist([
                                             'X-Emby-Token',
                                             'X-Api-Key',

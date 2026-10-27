@@ -5,13 +5,16 @@ namespace App\Services;
 use App\Models\Category;
 use App\Models\Channel;
 use App\Models\DvrRecording;
+use App\Models\DvrSetting;
 use App\Models\Episode;
 use App\Models\Group;
+use App\Models\Playlist;
 use App\Models\Season;
 use App\Models\Series;
 use App\Support\EpisodeNumberParser;
 use Exception;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\URL;
 
 /**
  * DvrVodIntegrationService — Converts completed DVR recordings into VOD entries.
@@ -44,18 +47,23 @@ class DvrVodIntegrationService
             return;
         }
 
-        $playlistId = $setting->playlist_id;
+        $playlistId = $this->resolvePlaylistId($setting, $recording);
         $userId = $recording->user_id;
 
         if (! $playlistId || ! $userId) {
-            Log::warning("DvrVodIntegration: missing playlist_id or user_id for recording {$recording->id} — skipping");
+            Log::warning("DvrVodIntegration: cannot resolve playlist_id for recording {$recording->id} — skipping", [
+                'setting_id' => $setting->id,
+                'channel_id' => $recording->channel_id,
+                'resolved_playlist_id' => $playlistId,
+                'user_id' => $userId,
+            ]);
 
             return;
         }
 
         $tmdb = $recording->metadata['tmdb'] ?? null;
         $tvmaze = is_array($recording->metadata) ? ($recording->metadata['tvmaze'] ?? null) : null;
-        $isTv = $this->isTvContent($recording, $tmdb);
+        $isTv = $recording->isTvContent();
 
         try {
             if ($isTv) {
@@ -72,106 +80,74 @@ class DvrVodIntegrationService
     }
 
     /**
-     * Decide whether a completed recording should be classified as TV (Series/
-     * Episode) or as a movie (single Channel row).
+     * Resolve the real Playlist id used to key all VOD rows created from this
+     * recording.
      *
-     * Priority order (first match wins):
+     * DvrSetting uses polymorphic-ish ownership (playlist_id /
+     * custom_playlist_id / merged_playlist_id — exactly one non-null). Series,
+     * Channel, Episode, Group, and Category rows all require a real Playlist FK,
+     * so when the setting's owner is a CustomPlaylist or MergedPlaylist we fall
+     * back to the recording's channel's playlist_id. Channels always resolve
+     * through to a real Playlist (a merged/custom playlist is just a virtual
+     * aggregation of source playlists), so the recording's actual broadcast
+     * source is the correct semantic target.
      *
-     *   1. TMDB metadata type (definitive when present)
-     *   2. recording.season column (set from EPG at schedule time)
-     *   3. epg_programme_data.episode_num (raw XMLTV string — present even when
-     *      the EPG import predated our season/episode column parsing fix)
-     *   4. epg_programme_data.category — explicit "movie"/"film" → false
-     *   5. epg_programme_data.category — TV-ish keywords (series / episode /
-     *      tv / show / news / documentary / talk) → true
-     *   6. recording.subtitle non-empty AND a category was supplied (any
-     *      non-empty value other than the movie keywords above) → true.
-     *      Subtitle alone is not enough because some providers tag movies
-     *      with subtitles for director's cuts / extended editions; pairing
-     *      with the presence of any EPG category lets us trust it as a
-     *      "this aired with episodic context" hint.
+     * Returns null when neither path yields a real Playlist id — caller is
+     * expected to skip integration in that case.
      */
-    private function isTvContent(DvrRecording $recording, ?array $tmdb): bool
+    private function resolvePlaylistId(DvrSetting $setting, DvrRecording $recording): ?int
     {
-        if ($tmdb && isset($tmdb['type'])) {
-            return $tmdb['type'] === 'tv';
-        }
+        $playlistId = $setting->playlist_id ?? $recording->channel?->playlist_id;
 
-        if ($recording->season !== null) {
-            return true;
-        }
-
-        // episode_num present in stored EPG data is a reliable TV signal even
-        // when season/episode columns were not populated (pre-parseEpisodeNumbers fix).
-        if (! empty($recording->epg_programme_data['episode_num'])) {
-            return true;
-        }
-
-        $category = mb_strtolower(trim((string) ($recording->epg_programme_data['category'] ?? '')));
-
-        if ($category !== '') {
-            // Explicit movie/film category short-circuits to movie path.
-            if (str_contains($category, 'movie') || str_contains($category, 'film')) {
-                return false;
-            }
-
-            // TV-ish category keywords.
-            foreach (['series', 'episode', 'tv', 'show', 'news', 'documentary', 'talk'] as $needle) {
-                if (str_contains($category, $needle)) {
-                    return true;
-                }
-            }
-
-            // A non-movie EPG category was supplied (e.g. "sports",
-            // "entertainment").  If the recording also has a subtitle, treat
-            // it as TV — the EPG explicitly classified it as a programme,
-            // not a film, and the subtitle gives us per-episode context.
-            if (! empty(trim((string) $recording->subtitle))) {
-                return true;
-            }
-        }
-
-        return false;
+        return $playlistId !== null ? (int) $playlistId : null;
     }
 
     /**
-     * Build the authenticated stream URL for a DVR recording.
+     * Rewrite a playlist's DVR VOD stream URLs in the current signed form. Entries
+     * integrated before signed URLs stored the owner's name and playlist UUID, which
+     * stop working (and would leak the owner login) once UUID login is off.
+     */
+    public function refreshStreamUrls(Playlist $playlist): void
+    {
+        foreach ([Channel::class, Episode::class] as $model) {
+            $model::query()
+                ->where('playlist_id', $playlist->id)
+                ->whereNotNull('dvr_recording_id')
+                ->with('dvrRecording.dvrSetting')
+                ->lazyById()
+                ->each(function (Channel|Episode $item): void {
+                    if ($item->dvrRecording) {
+                        $item->updateQuietly(['url' => $this->buildStreamUrl($item->dvrRecording)]);
+                    }
+                });
+        }
+    }
+
+    /**
+     * Build the stream URL for a DVR recording:
+     *   /dvr/signed/{recording-uuid}.{ext}?signature=...
      *
-     * Generates the same URL format as the "Watch" action:
-     *   /dvr/{username}/{playlist-uuid}/{recording-uuid}.{ext}
-     *
-     * DvrStreamController authenticates via the playlist UUID (no session required),
-     * so this URL works in any media player without additional login.
+     * The URL is stored on the VOD entry and reaches whoever plays it (guests
+     * included, e.g. raw M3U output or the Xtream redirect when the proxy is off),
+     * so it is signed for this one recording rather than carrying the owner's
+     * credentials. It works in any media player without additional login.
      */
     private function buildStreamUrl(DvrRecording $recording): string
     {
-        $setting = $recording->dvrSetting;
-        $playlist = $setting?->playlist;
-        $user = $recording->user;
+        $signedPath = URL::signedRoute('dvr.recording.stream.signed', [
+            'uuid' => $recording->uuid,
+            'format' => $recording->dvrSetting?->dvr_output_format ?? 'ts',
+        ], absolute: false);
 
-        if ($playlist && $user) {
-            $ext = $setting->dvr_output_format ?? 'ts';
-
-            $params = [
-                'username' => $user->name,
-                'password' => $playlist->uuid,
-                'uuid' => $recording->uuid,
-                'format' => $ext,
-            ];
-
-            // DVR_STREAM_BASE_URL lets operators override APP_URL so that
-            // proxies running in separate containers can reach the editor
-            // using the internal Docker hostname rather than localhost.
-            $streamBase = config('dvr.stream_base_url');
-            if ($streamBase) {
-                return rtrim($streamBase, '/').route('dvr.recording.stream', $params, absolute: false);
-            }
-
-            return route('dvr.recording.stream', $params);
+        // DVR_STREAM_BASE_URL lets operators override APP_URL so that
+        // proxies running in separate containers can reach the editor
+        // using the internal Docker hostname rather than localhost.
+        $streamBase = config('dvr.stream_base_url');
+        if ($streamBase) {
+            return rtrim($streamBase, '/').$signedPath;
         }
 
-        // Fallback: path-only URL (playlist or user not resolvable)
-        return url('/dvr/recordings/'.$recording->uuid.'/stream');
+        return url($signedPath);
     }
 
     /**

@@ -25,6 +25,7 @@ use Filament\Tables\Filters\TernaryFilter;
 use Filament\Tables\Table;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Database\Eloquent\Model;
 
 class CandidatesRelationManager extends RelationManager
 {
@@ -32,9 +33,16 @@ class CandidatesRelationManager extends RelationManager
 
     protected static ?string $title = 'Review Candidates';
 
+    protected static bool $isBadgeDeferred = true;
+
     public function isReadOnly(): bool
     {
         return false;
+    }
+
+    public static function getBadge(Model $ownerRecord, string $pageClass): ?string
+    {
+        return (string) $ownerRecord->candidates()->count();
     }
 
     public function getTabs(): array
@@ -243,7 +251,7 @@ class CandidatesRelationManager extends RelationManager
             ->filter(fn (array $c): bool => $c['epg_channel_id'] !== null);
 
         $options = $allCandidates->mapWithKeys(fn (array $candidate): array => [
-            $candidate['epg_channel_id'] => __(':name — :confidence% — :reason', [
+            $candidate['epg_channel_id'] => __(':name - :confidence% - :reason', [
                 'name' => $candidate['display_name'] ?: __('(no name)'),
                 'confidence' => $candidate['confidence'],
                 'reason' => $candidate['reason'],
@@ -481,7 +489,10 @@ class CandidatesRelationManager extends RelationManager
         $candidateIds = array_values(array_unique(array_map('intval', $choices)));
         $validCandidateIds = EpgChannel::query()
             ->where('user_id', $map->user_id)
-            ->where('epg_id', $map->epg_id)
+            // A Merged EPG map matches against its source EPGs' channel rows (see
+            // Epg::matchableEpgIds()), so a legitimately offered candidate's epg_id is one of
+            // those sources, not the merged EPG's own id.
+            ->whereIn('epg_id', $map->epg->matchableEpgIds())
             ->whereIn('id', $candidateIds)
             ->pluck('id')
             ->flip();

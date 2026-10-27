@@ -2,11 +2,16 @@
 
 namespace App\Services;
 
+use App\Enums\DefaultAuthMode;
 use App\Jobs\AddGroupsToCustomPlaylist;
+use App\Jobs\AddItemsToCustomPlaylist;
+use App\Jobs\AddItemsToCustomPlaylistChunk;
+use App\Jobs\DetachItemsFromCustomPlaylistChunk;
 use App\Jobs\MergeChannels;
 use App\Jobs\MergeEpisodes;
 use App\Jobs\UnmergeChannels;
 use App\Jobs\UnmergeEpisodes;
+use App\Models\Bouquet;
 use App\Models\Category;
 use App\Models\Channel;
 use App\Models\CustomPlaylist;
@@ -15,11 +20,14 @@ use App\Models\MergedPlaylist;
 use App\Models\Playlist;
 use App\Models\PlaylistAlias;
 use App\Models\PlaylistAuth;
+use App\Models\Series;
+use App\Models\User;
 use App\Settings\GeneralSettings;
 use Carbon\Carbon;
 use Exception;
 use Filament\Actions\Action;
 use Filament\Actions\BulkAction;
+use Filament\Forms\Components\Field;
 use Filament\Forms\Components\Radio;
 use Filament\Forms\Components\Repeater;
 use Filament\Forms\Components\Select;
@@ -31,22 +39,45 @@ use Filament\Schemas\Components\Fieldset;
 use Filament\Schemas\Components\Utilities\Get;
 use Filament\Schemas\Components\Utilities\Set;
 use Filament\Support\Enums\Width;
+use Illuminate\Bus\Batch;
 use Illuminate\Contracts\Bus\Dispatcher;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
-use Illuminate\Database\Eloquent\ModelNotFoundException;
-use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Http\Request;
+use Illuminate\Support\Collection as SupportCollection;
+use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Spatie\Tags\Tag;
+use Throwable;
 
 /**
  * Service to handle playlist-related operations.
  */
 class PlaylistService
 {
+    /**
+     * Number of items processed per chunk job when bulk-updating custom playlist
+     * membership and tags.
+     */
+    public const CUSTOM_PLAYLIST_CHUNK_SIZE = 1000;
+
+    /**
+     * Kodi IPTV Simple catchup date specifiers mapped to PHP date() characters.
+     *
+     * @var array<string, string>
+     */
+    private const CATCHUP_DATE_SPECIFIERS = [
+        'Y' => 'Y',
+        'm' => 'm',
+        'd' => 'd',
+        'H' => 'H',
+        'M' => 'i',
+        'S' => 's',
+    ];
+
     /**
      * Get the base URL of the application, including port if set
      *
@@ -92,17 +123,8 @@ class PlaylistService
      */
     public static function getUrls($playlist)
     {
-        // Get the first enabled auth (URLs can only contain one set of credentials)
-        $playlistAuth = null;
-        if (method_exists($playlist, 'playlistAuths')) {
-            $playlistAuth = $playlist->playlistAuths()->where('enabled', true)->first();
-        }
-        // For PlaylistAlias, fall back to direct alias credentials if no PlaylistAuth found
-        if (! $playlistAuth && $playlist instanceof PlaylistAlias) {
-            $playlistAuth = $playlist->username && $playlist->password
-                ? (object) ['username' => $playlist->username, 'password' => $playlist->password]
-                : null;
-        }
+        // URLs can only contain one set of credentials
+        $playlistAuth = self::getOutputCredentials($playlist);
         $auth = null;
         if ($playlistAuth) {
             $auth = '?username='.urlencode($playlistAuth->username).'&password='.urlencode($playlistAuth->password);
@@ -169,27 +191,54 @@ class PlaylistService
     }
 
     /**
-     * Get Xtream API info for the given playlist
+     * The credentials to embed in a playlist's M3U/HDHR URLs: the first enabled
+     * Playlist Auth, then an alias' own credentials, then the owner's Custom
+     * Password login. UUID login leaves the URLs credential-free (the UUID in the
+     * path already grants access), and a disabled default login has none to give.
      *
-     * @param  Playlist|MergedPlaylist|CustomPlaylist  $playlist
-     * @return array
+     * @param  Playlist|MergedPlaylist|CustomPlaylist|PlaylistAlias  $playlist
+     * @return object{username: string, password: string}|null
+     */
+    public static function getOutputCredentials($playlist): ?object
+    {
+        if (method_exists($playlist, 'playlistAuths')) {
+            $playlistAuth = $playlist->playlistAuths()->where('enabled', true)->first();
+            if ($playlistAuth) {
+                return $playlistAuth;
+            }
+        }
+
+        if ($playlist instanceof PlaylistAlias && $playlist->authObject) {
+            return $playlist->authObject;
+        }
+
+        return $playlist->getDefaultAuthMode() === DefaultAuthMode::Custom
+            ? $playlist->getDefaultAuthCredentials()
+            : null;
+    }
+
+    /**
+     * Get Xtream API info for the given playlist: the owner's default login
+     * (password = UUID or custom password, null when disabled), or an alias'
+     * own credentials when set (mode is then null).
+     *
+     * @param  Playlist|MergedPlaylist|CustomPlaylist|PlaylistAlias  $playlist
+     * @return array{url: string, username: string, password: ?string, mode: ?DefaultAuthMode}
      */
     public static function getXtreamInfo($playlist)
     {
-        // For Xtream API, we use the playlist UUID as the password
-        // and the user's name as the username. This is valid of all playlist types.
         $auth = [
             'username' => $playlist->user->name,
-            'password' => $playlist->uuid,
+            'password' => $playlist->getDefaultAuthPassword(),
+            'mode' => $playlist->getDefaultAuthMode(),
         ];
-        if ($playlist instanceof PlaylistAlias) {
-            // For PlaylistAlias, override default auth if set
-            if ($playlist->username && $playlist->password) {
-                $auth = [
-                    'username' => $playlist->username,
-                    'password' => $playlist->password,
-                ];
-            }
+        // For PlaylistAlias, override default auth if set
+        if ($playlist instanceof PlaylistAlias && $playlist->authObject) {
+            $auth = [
+                'username' => $playlist->authObject->username,
+                'password' => $playlist->authObject->password,
+                'mode' => null,
+            ];
         }
 
         // Return the results
@@ -233,20 +282,12 @@ class PlaylistService
      * Get the media flow proxy URLs for the given playlist
      *
      * @param  Playlist|MergedPlaylist|CustomPlaylist|PlaylistAlias  $playlist
-     * @return array{m3u: string, epg: string, xtream: array{server: string, username: string, password: string}|null, authEnabled: bool}
+     * @return array{m3u: string, epg: string, xtream: array{server: string, default: array{username: string, password: string}|null, default_mode: ?DefaultAuthMode, auths: list<array{name: string, username: string, password: string}>}, authEnabled: bool}
      */
     public function getMediaFlowProxyUrls($playlist)
     {
-        // Get the first enabled auth (URLs can only contain one set of credentials)
-        $playlistAuth = null;
-        if (method_exists($playlist, 'playlistAuths')) {
-            $playlistAuth = $playlist->playlistAuths()->where('enabled', true)->first();
-        } elseif ($playlist instanceof PlaylistAlias) {
-            // If PlaylistAlias, check if direct authentication is set
-            $playlistAuth = $playlist->username && $playlist->password
-                ? (object) ['username' => $playlist->username, 'password' => $playlist->password]
-                : null;
-        }
+        // URLs can only contain one set of credentials
+        $playlistAuth = self::getOutputCredentials($playlist);
         $auth = '';
         if ($playlistAuth) {
             $auth = '?username='.urlencode($playlistAuth->username).'&password='.urlencode($playlistAuth->password);
@@ -281,20 +322,17 @@ class PlaylistService
         $appUrl = rtrim(url('/'), '/');
         $mfApiPassword = $settings['mediaflow_proxy_password'];
 
-        // Default credentials match getXtreamInfo(): user->name + uuid, or alias overrides if set.
-        $defaultXtreamUsername = $playlist->user->name;
-        $defaultXtreamPassword = $playlist->uuid;
-        if ($playlist instanceof PlaylistAlias && $playlist->username && $playlist->password) {
-            $defaultXtreamUsername = $playlist->username;
-            $defaultXtreamPassword = $playlist->password;
-        }
+        // Default credentials match getXtreamInfo(): the owner's default login, or alias overrides if set.
+        // Null when the default login is disabled.
+        $defaultXtream = self::getXtreamInfo($playlist);
 
         $xtream = [
             'server' => $proxyUrl,
-            'default' => [
-                'username' => base64_encode("{$appUrl}:{$defaultXtreamUsername}:{$mfApiPassword}"),
-                'password' => $defaultXtreamPassword,
+            'default' => $defaultXtream['password'] === null ? null : [
+                'username' => base64_encode("{$appUrl}:{$defaultXtream['username']}:{$mfApiPassword}"),
+                'password' => $defaultXtream['password'],
             ],
+            'default_mode' => $defaultXtream['mode'],
             'auths' => [],
         ];
 
@@ -354,7 +392,7 @@ class PlaylistService
     public static function getChannelBaseUrl(Playlist|PlaylistAlias $source, $channelId): string
     {
         $config = $source instanceof PlaylistAlias
-            ? $source->getPrimaryXtreamConfig()
+            ? $source->getPrimaryCredentialConfig()
             : $source->xtream_config;
 
         if (! $config) {
@@ -371,7 +409,7 @@ class PlaylistService
     public static function getSeriesBaseUrl(Playlist|PlaylistAlias $source, $seriesId): string
     {
         $config = $source instanceof PlaylistAlias
-            ? $source->getPrimaryXtreamConfig()
+            ? $source->getPrimaryCredentialConfig()
             : $source->xtream_config;
 
         if (! $config) {
@@ -490,7 +528,10 @@ class PlaylistService
      */
     public function authenticate($username, $password): array|bool
     {
-        if (empty($username) || empty($password)) {
+        // empty() treats the string "0" as empty, which would reject a deliberately
+        // saved Custom Password of "0" before it ever reaches the resolver below,
+        // even though every other default-login consumer accepts that value (#1761).
+        if (! filled($username) || ! filled($password)) {
             return false;
         }
 
@@ -525,7 +566,7 @@ class PlaylistService
         if (! $playlist) {
             $alias = PlaylistAlias::where('username', $username)
                 ->where('password', $password)
-                ->with(['user', 'playlist', 'customPlaylist'])
+                ->with(['user', 'playlist', 'customPlaylist', 'mergedPlaylist'])
                 ->first();
 
             if ($alias) {
@@ -541,68 +582,15 @@ class PlaylistService
             }
         }
 
-        // Method 2: Fall back to original authentication:
-        //      (username = playlist owner, password = playlist UUID)
+        // Method 2: Fall back to the owner's default login
+        //      (username = playlist owner, password = playlist UUID or custom password, per playlist)
         if (! $playlist) {
-            // Try to find playlist by UUID (password parameter)
-            try {
-                $playlist = Playlist::with([
-                    'user',
-                ])->where('uuid', $password)->firstOrFail();
-
-                // Verify username matches playlist owner's name
-                if ($playlist->user->name === $username) {
-                    $authMethod = 'owner_auth';
-                } else {
-                    $playlist = null;
-                }
-            } catch (ModelNotFoundException $e) {
-                // Try MergedPlaylist
-                try {
-                    $playlist = MergedPlaylist::with([
-                        'user',
-                    ])->where('uuid', $password)->firstOrFail();
-
-                    // Verify username matches playlist owner's name
-                    if ($playlist->user->name === $username) {
-                        $authMethod = 'owner_auth';
-                    } else {
-                        $playlist = null;
-                    }
-                } catch (ModelNotFoundException $e) {
-                    // Try CustomPlaylist
-                    try {
-                        $playlist = CustomPlaylist::with([
-                            'user',
-                        ])->where('uuid', $password)->firstOrFail();
-
-                        // Verify username matches playlist owner's name
-                        if ($playlist->user->name === $username) {
-                            $authMethod = 'owner_auth';
-                        } else {
-                            $playlist = null;
-                        }
-                    } catch (ModelNotFoundException $e) {
-                        // Try PlaylistAlias
-                        try {
-                            $playlist = PlaylistAlias::with([
-                                'user',
-                                'playlist',
-                                'customPlaylist',
-                            ])->where('uuid', $password)
-                                ->firstOrFail();
-
-                            // Verify username matches playlist alias owner's name
-                            if ($playlist->user->name === $username) {
-                                $authMethod = 'owner_auth';
-                            } else {
-                                $playlist = null;
-                            }
-                        } catch (ModelNotFoundException $e) {
-                            // No playlist found
-                        }
-                    }
-                }
+            $playlist = app(PlaylistCredentialResolver::class)->resolveDefaultLogin($username, $password);
+            if ($playlist instanceof PlaylistAlias) {
+                $playlist->load(['playlist', 'customPlaylist', 'mergedPlaylist']);
+            }
+            if ($playlist) {
+                $authMethod = 'owner_auth';
             }
         }
 
@@ -699,119 +687,47 @@ class PlaylistService
     }
 
     /**
+     * Whether the request asks for catchup (timeshift) rather than the live stream: Xtream
+     * timeshift_duration + timeshift_date (merged in by the /timeshift/ route) or the SIPTV/TiviMate
+     * utc (+ lutc) query. These are exactly the requests generateTimeshiftUrl() rewrites.
+     */
+    public static function isTimeshiftRequest(?Request $request): bool
+    {
+        return $request !== null
+            && ($request->filled('utc') || ($request->filled('timeshift_duration') && $request->filled('timeshift_date')));
+    }
+
+    /**
      * Generate a timeshift URL for a given stream.
      *
      * @param  Playlist|MergedPlaylist|CustomPlaylist|PlaylistAlias  $playlist
      */
     public static function generateTimeshiftUrl(Request $request, string $streamUrl, $playlist, ?Channel $channel = null): string
     {
-        // TiviMate sends utc/lutc as UNIX epochs (UTC). We only convert TZ + format.
-        $utcPresent = $request->filled('utc');
-
-        // Xtream API sends timeshift_duration (minutes) and timeshift_date (YYYY-MM-DD:HH-MM-SS)
-        $xtreamTimeshiftPresent = $request->filled('timeshift_duration') && $request->filled('timeshift_date');
-
-        // Use the portal/provider timezone (DST-aware). Prefer per-playlist; last resort UTC.
-        $providerTz = $playlist?->server_timezone ?? null;
-
-        // If no provider timezone set, attempt to get it from the Xtream config
-        if (! $providerTz) {
-            $providerTz = $playlist?->xtream_status['server_info']['timezone'] ?? 'Etc/UTC';
+        if (! self::isTimeshiftRequest($request)) {
+            return $streamUrl;
         }
 
-        /* ── Timeshift SETUP (TiviMate → portal format) ───────────────────── */
-        if ($utcPresent && ! $xtreamTimeshiftPresent) {
-            $utc = (int) $request->query('utc'); // programme start (UTC epoch)
-            $lutc = (int) ($request->query('lutc') ?? time()); // “live” now (UTC epoch)
+        // Xtream API sends timeshift_duration (minutes) and timeshift_date (YYYY-MM-DD:HH-MM-SS);
+        // SIPTV/TiviMate sends utc/lutc as UNIX epochs (UTC)
+        $xtreamTimeshiftPresent = $request->filled('timeshift_duration') && $request->filled('timeshift_date');
 
-            // duration (minutes) from start → now; ceil avoids off-by-one near edges
-            $offset = max(1, (int) ceil(max(0, $lutc - $utc) / 60));
+        // Use the portal/provider timezone (DST-aware). Resolve via the channel's own
+        // originating playlist first: a catchup failover can swap in a channel from a
+        // different provider than the credentials playlist, and the archive window must be
+        // built using that provider's timezone, not the one the client authenticated against.
+        // Custom/Merged/Alias playlists can likewise be composed of channels from several
+        // different source playlists. Last resort UTC.
+        $timezoneSource = $channel?->playlist ?? ($playlist instanceof Playlist ? $playlist : null);
+        $providerTz = $timezoneSource?->server_timezone
+            ?? $timezoneSource?->xtream_status['server_info']['timezone']
+            ?? 'Etc/UTC';
 
-            // "…://host/live/u/p/<id>.<ext>" >>> "…://host/streaming/timeshift.php?username=u&password=p&stream=id&start=stamp&duration=offset"
-            $rewrite = static function (string $url, string $stamp, int $offset) use ($channel, $utc, $lutc): string {
-                if (preg_match('~^(https?://[^/]+)/live/([^/]+)/([^/]+)/([^/]+)\.[^/]+$~', $url, $m)) {
-                    [$_, $base, $user, $pass, $id] = $m;
-
-                    return sprintf(
-                        '%s/streaming/timeshift.php?username=%s&password=%s&stream=%s&start=%s&duration=%d',
-                        $base,
-                        $user,
-                        $pass,
-                        $id,
-                        $stamp,
-                        $offset
-                    );
-                }
-
-                // Upstream isn't itself an Xtream server, so there's no `/timeshift/` endpoint to
-                // rewrite to. Fall back to the provider's own catchup-source URL template, if one
-                // was captured on import (e.g. plain M3U catch-up providers like EPGenius).
-                if ($channel?->catchup_source) {
-                    return self::applyCatchupSourceTemplate($channel->catchup_source, $utc, $lutc, $offset);
-                }
-
-                return $url; // fallback if pattern does not match and no catchup_source template available
-            };
-        } elseif ($xtreamTimeshiftPresent) {
+        if ($xtreamTimeshiftPresent) {
             /* ── Timeshift SETUP (Xtream API → Xtream API format) ─────────────────── */
-
-            // Handle Xtream API timeshift format
             $duration = (int) $request->get('timeshift_duration'); // Duration in minutes
             $date = $request->get('timeshift_date'); // Format: YYYY-MM-DD:HH-MM-SS
 
-            // Programme start as a UTC epoch, used only for the catchup_source template fallback
-            // below. Set once the date has been parsed, further down.
-            $startEpoch = null;
-
-            // "…://host/live/u/p/<id>.<ext>" >>> "…://host/timeshift/u/p/duration/stamp/<id>.<ext>"
-            $rewrite = static function (string $url, string $stamp, int $offset) use ($channel, &$startEpoch): string {
-                if (preg_match('~^(https?://[^/]+)/live/([^/]+)/([^/]+)/([^/]+)\.([^/]+)$~', $url, $m)) {
-                    [$_, $base, $user, $pass, $id, $ext] = $m;
-
-                    return sprintf(
-                        '%s/timeshift/%s/%s/%d/%s/%s.%s',
-                        $base,
-                        $user,
-                        $pass,
-                        $offset,
-                        $stamp,
-                        $id,
-                        $ext
-                    );
-                }
-
-                // Upstream isn't itself an Xtream server, so there's no `/timeshift/` endpoint to
-                // rewrite to. Fall back to the provider's own catchup-source URL template, if one
-                // was captured on import (e.g. plain M3U catch-up providers like EPGenius).
-                if ($channel?->catchup_source && $startEpoch !== null) {
-                    return self::applyCatchupSourceTemplate($channel->catchup_source, $startEpoch, $startEpoch + ($offset * 60), $offset);
-                }
-
-                return $url; // fallback if pattern does not match and no catchup_source template available
-            };
-        }
-        /* ─────────────────────────────────────────────────────────────────── */
-
-        // ── Apply timeshift rewriting AFTER we know the provider timezone ──
-        if ($utcPresent && ! $xtreamTimeshiftPresent) {
-            // Convert the absolute UTC epoch from TiviMate to provider-local time string expected by timeshift.php
-            $stamp = Carbon::createFromTimestampUTC($utc)
-                ->setTimezone($providerTz)
-                ->format('Y-m-d:H-i');
-
-            $streamUrl = $rewrite($streamUrl, $stamp, $offset);
-
-            // Helpful debug for verification
-            Log::debug(sprintf(
-                '[TIMESHIFT-M3U] utc=%d lutc=%d tz=%s start=%s offset(min)=%d final_url=%s',
-                $utc,
-                $lutc,
-                $providerTz,
-                $stamp,
-                $offset,
-                $streamUrl
-            ));
-        } elseif ($xtreamTimeshiftPresent) {
             // Convert Xtream API date format to timeshift URL format
             // Input: YYYY-MM-DD:HH-MM-SS, Output: YYYY-MM-DD:HH-MM
             if (preg_match('/^(\d{4})-(\d{2})-(\d{2}):(\d{2})-(\d{2})-(\d{2})$/', $date, $matches)) {
@@ -830,7 +746,9 @@ class PlaylistService
             $startEpoch = $startInstant->getTimestamp();
             $stamp = $startInstant->setTimezone($providerTz)->format('Y-m-d:H-i');
 
-            $streamUrl = $rewrite($streamUrl, $stamp, $duration);
+            $streamUrl = self::xtreamTimeshiftUrl($streamUrl, $duration, $stamp)
+                ?? self::buildProviderCatchupUrl($channel, $streamUrl, $startEpoch, $duration * 60, now()->getTimestamp(), $providerTz)
+                ?? $streamUrl;
 
             // Helpful debug for verification
             Log::debug(sprintf(
@@ -840,35 +758,244 @@ class PlaylistService
                 $stamp,
                 $streamUrl
             ));
+        } else {
+            /* ── Timeshift SETUP (TiviMate → portal format) ───────────────────── */
+            $utc = (int) $request->query('utc'); // programme start (UTC epoch)
+            $lutc = (int) ($request->query('lutc') ?? time()); // “live” now (UTC epoch)
+
+            // duration (minutes) from start → now; ceil avoids off-by-one near edges
+            $offset = max(1, (int) ceil(max(0, $lutc - $utc) / 60));
+
+            // Convert the absolute UTC epoch to the provider-local time string the timeshift URL expects
+            $stamp = Carbon::createFromTimestampUTC($utc)
+                ->setTimezone($providerTz)
+                ->format('Y-m-d:H-i');
+
+            $streamUrl = self::xtreamTimeshiftUrl($streamUrl, $offset, $stamp)
+                ?? self::buildProviderCatchupUrl($channel, $streamUrl, $utc, max(0, $lutc - $utc), $lutc, $providerTz)
+                ?? $streamUrl;
+
+            // Helpful debug for verification
+            Log::debug(sprintf(
+                '[TIMESHIFT-M3U] utc=%d lutc=%d tz=%s start=%s offset(min)=%d final_url=%s',
+                $utc,
+                $lutc,
+                $providerTz,
+                $stamp,
+                $offset,
+                $streamUrl
+            ));
         }
 
         return $streamUrl;
     }
 
     /**
-     * Fill a provider's catchup-source URL template with the requested timeshift window.
-     *
-     * Providers advertise their own catchup URL grammar via the M3U `catchup-source` attribute,
-     * using placeholder tokens in either `{token}` or `${token}` form (both are seen in the wild).
+     * Rewrite an Xtream live URL to its catchup URL:
+     * `…://host/live/u/p/<id>.<ext>` >>> `…://host/timeshift/u/p/<minutes>/<stamp>/<id>.<ext>`.
+     * Both catchup request styles use this form, which m3u-proxy recognises as catchup (not a
+     * live stream) by its `/timeshift/` path. Null when the URL isn't Xtream-shaped.
      */
-    private static function applyCatchupSourceTemplate(string $template, int $startEpoch, int $endEpoch, int $durationMinutes): string
+    private static function xtreamTimeshiftUrl(string $streamUrl, int $durationMinutes, string $stamp): ?string
     {
-        $tokens = [
-            'start' => $startEpoch,
+        if (! preg_match('~^(https?://[^/]+)/live/([^/]+)/([^/]+)/([^/]+)\.([^/]+)$~', $streamUrl, $m)) {
+            return null;
+        }
+
+        [$_, $base, $user, $pass, $id, $ext] = $m;
+
+        return sprintf('%s/timeshift/%s/%s/%d/%s/%s.%s', $base, $user, $pass, $durationMinutes, $stamp, $id, $ext);
+    }
+
+    /**
+     * Build the catchup URL for an upstream that isn't itself an Xtream server, so has no
+     * `/live/` URL to rewrite (e.g. plain M3U catch-up providers like EPGenius). Follows the
+     * channel's own `catchup` mode and `catchup-source` template captured on import, the way
+     * Kodi IPTV Simple does. Returns null when the channel has no usable catchup source.
+     */
+    private static function buildProviderCatchupUrl(?Channel $channel, string $streamUrl, int $startEpoch, int $durationSeconds, int $nowEpoch, string $timezone): ?string
+    {
+        $template = $channel ? self::resolveCatchupSourceTemplate($channel, $streamUrl) : null;
+
+        return $template === null
+            ? null
+            : self::applyCatchupSourceTemplate($template, $startEpoch, $durationSeconds, $nowEpoch, $timezone);
+    }
+
+    /**
+     * Resolve the catchup URL template for a channel from its `catchup` mode:
+     * - default (or unrecognised): the `catchup-source` is the whole URL
+     * - append: the `catchup-source` is appended to the stream URL
+     * - shift/timeshift: the SIPTV `utc={utc}&lutc={lutc}` query is appended to the stream URL
+     * - flussonic/flussonic-hls/flussonic-ts/fs: built from the Flussonic stream URL
+     * - xc: built from the Xtream Codes stream URL
+     *
+     * A relative `catchup-source` (`?utc=...`) is always appended and an absolute one always
+     * used as is, whatever the mode says, since neither is usable any other way.
+     */
+    private static function resolveCatchupSourceTemplate(Channel $channel, string $streamUrl): ?string
+    {
+        $mode = strtolower(trim((string) $channel->catchup));
+        $source = trim((string) $channel->catchup_source);
+        $isAbsoluteSource = preg_match('~^[a-z][a-z0-9+.-]*://~i', $source) === 1;
+
+        return match ($mode) {
+            'shift', 'timeshift' => $streamUrl.(str_contains($streamUrl, '?') ? '&' : '?').'utc={utc}&lutc={lutc}',
+            'flussonic', 'flussonic-hls', 'flussonic-ts', 'fs' => self::flussonicCatchupSource($streamUrl, in_array($mode, ['flussonic-ts', 'fs'], true)),
+            'xc' => self::xtreamCodesCatchupSource($streamUrl),
+            default => match (true) {
+                $source === '' => null,
+                $isAbsoluteSource => $source,
+                default => $streamUrl.$source,
+            },
+        };
+    }
+
+    /**
+     * Flussonic catchup template from a stream URL, e.g.
+     * `…/151/mpegts?token=t` >>> `…/151/timeshift_abs-${start}.ts?token=t`,
+     * `…/325/index.m3u8` >>> `…/325/timeshift_rel-{offset:1}.m3u8`,
+     * `…/325/mono.m3u8` >>> `…/325/mono-timeshift_rel-{offset:1}.m3u8`.
+     */
+    private static function flussonicCatchupSource(string $streamUrl, bool $isTsStream): ?string
+    {
+        if (preg_match('~^(https?://[^/]+)/(.*)/([^/]*)(mpegts|\.m3u8)(\?.+=.+)?$~', $streamUrl, $m)) {
+            [$host, $channelId, $listType, $streamType, $query] = [$m[1], $m[2], $m[3], $m[4], $m[5] ?? ''];
+
+            if ($streamType === 'mpegts') {
+                return "{$host}/{$channelId}/timeshift_abs-\${start}.ts{$query}";
+            }
+
+            return $listType === 'index'
+                ? "{$host}/{$channelId}/timeshift_rel-{offset:1}.m3u8{$query}"
+                : "{$host}/{$channelId}/{$listType}-timeshift_rel-{offset:1}.m3u8{$query}";
+        }
+
+        // Flussonic serves a stream under any name after the channel id
+        if (preg_match('~^(https?://[^/]+)/(.*)/([^?]*)(\?.+=.+)?$~', $streamUrl, $m)) {
+            [$host, $channelId, $query] = [$m[1], $m[2], $m[4] ?? ''];
+
+            return $isTsStream
+                ? "{$host}/{$channelId}/timeshift_abs-\${start}.ts{$query}"
+                : "{$host}/{$channelId}/timeshift_rel-{offset:1}.m3u8{$query}";
+        }
+
+        return null;
+    }
+
+    /**
+     * Xtream Codes catchup template from a stream URL, e.g.
+     * `…/live/u/p/1477.m3u8` (or `…/u/p/1477`) >>> `…/timeshift/u/p/{duration:60}/{Y}-{m}-{d}:{H}-{M}/1477.m3u8`.
+     */
+    private static function xtreamCodesCatchupSource(string $streamUrl): ?string
+    {
+        if (! preg_match('~^(https?://[^/]+)/(?:live/)?([^/]+)/([^/]+)/([^/.]+)(\.m3u8?)?$~', $streamUrl, $m)) {
+            return null;
+        }
+
+        $extension = ($m[5] ?? '') !== '' ? $m[5] : '.ts';
+
+        return "{$m[1]}/timeshift/{$m[2]}/{$m[3]}/{duration:60}/{Y}-{m}-{d}:{H}-{M}/{$m[4]}{$extension}";
+    }
+
+    /**
+     * Fill a catchup URL template with the requested timeshift window, using the Kodi IPTV
+     * Simple format specifiers (https://github.com/kodi-pvr/pvr.iptvsimple#catchup-format-specifiers):
+     * - `{utc}` / `${start}`: programme start, `{utcend}` / `${end}`: start + duration,
+     *   `{lutc}` / `${now}` / `${timestamp}`: now (all UNIX epochs)
+     * - `{Y}` `{m}` `{d}` `{H}` `{M}` `{S}`: programme start parts, in the provider timezone
+     * - `{utc:Y-m-d}`-style formats of any of the above timestamps
+     * - `{duration}` / `${duration}`: duration in seconds, `${offset}`: seconds from start to now
+     * - `{duration:X}` / `{offset:X}`: the same divided by X (e.g. `{duration:60}` for minutes)
+     *
+     * Bare `{start}`, `{end}`, `{now}`, `{timestamp}` and `{offset}` are also accepted.
+     */
+    private static function applyCatchupSourceTemplate(string $template, int $startEpoch, int $durationSeconds, int $nowEpoch, string $timezone): string
+    {
+        $endEpoch = $startEpoch + $durationSeconds;
+        $offsetSeconds = max(0, $nowEpoch - $startEpoch);
+
+        $timestamps = [
             'utc' => $startEpoch,
-            'timestamp' => $startEpoch,
+            'start' => $startEpoch,
+            'utcend' => $endEpoch,
             'end' => $endEpoch,
-            'offset' => $durationMinutes,
-            'duration' => $durationMinutes,
+            'lutc' => $nowEpoch,
+            'now' => $nowEpoch,
+            'timestamp' => $nowEpoch,
         ];
 
-        $replacements = [];
-        foreach ($tokens as $token => $value) {
+        $formatDate = static function (int $epoch, string $format) use ($timezone): string {
+            $date = Carbon::createFromTimestamp($epoch, $timezone);
+
+            return preg_replace_callback(
+                '/[YmdHMS]/',
+                static fn (array $m): string => $date->format(self::CATCHUP_DATE_SPECIFIERS[$m[0]]),
+                $format
+            );
+        };
+
+        // {Y}, {m}, ... (programme start)
+        $template = preg_replace_callback(
+            '/\{([YmdHMS])\}/',
+            static fn (array $m): string => $formatDate($startEpoch, $m[1]),
+            $template
+        );
+
+        // {utc:Y-m-d:H-M}, ${start:...}, {lutc:...}, ...
+        $template = preg_replace_callback(
+            '/\$?\{('.implode('|', array_keys($timestamps)).'):([^}]*)\}/',
+            static fn (array $m): string => $formatDate($timestamps[$m[1]], $m[2]),
+            $template
+        );
+
+        // {duration:60}, {offset:1}, ...
+        $template = preg_replace_callback(
+            '/\$?\{(duration|offset):(\d+)\}/',
+            static function (array $m) use ($durationSeconds, $offsetSeconds): string {
+                $divider = (int) $m[2];
+
+                return $divider > 0
+                    ? (string) intdiv($m[1] === 'duration' ? $durationSeconds : $offsetSeconds, $divider)
+                    : $m[0];
+            },
+            $template
+        );
+
+        $replacements = [
+            '{duration}' => $durationSeconds,
+            '${duration}' => $durationSeconds,
+            '{offset}' => $offsetSeconds,
+            '${offset}' => $offsetSeconds,
+        ];
+        foreach ($timestamps as $token => $value) {
             $replacements['{'.$token.'}'] = $value;
             $replacements['${'.$token.'}'] = $value;
         }
 
         return strtr($template, $replacements);
+    }
+
+    public static function getOutputTogglesSchema(): array
+    {
+        return [
+            Fieldset::make(__('Enabled output types'))
+                ->columns(4)
+                ->schema([
+                    Toggle::make('hdhr_enabled')
+                        ->label(__('HDHR'))
+                        ->default(true),
+                    Toggle::make('m3u_enabled')
+                        ->label(__('M3U'))
+                        ->default(true),
+                    Toggle::make('xapi_enabled')
+                        ->label(__('Xtream API'))
+                        ->default(true),
+                    Toggle::make('xmltv_enabled')
+                        ->label(__('XMLTV (EPG)'))
+                        ->default(true),
+                ]),
+        ];
     }
 
     /**
@@ -907,6 +1034,8 @@ class PlaylistService
 
             Select::make('category')
                 ->label("Select $groupLabel")
+                ->native(false)
+                ->placeholder("Select a $groupLabel")
                 ->required(fn (Get $get) => $get('mode') === 'select')
                 ->visible(fn (Get $get) => $get('playlist') && $get('mode') === 'select')
                 ->options(function (Get $get) use ($tagFunction) {
@@ -930,86 +1059,190 @@ class PlaylistService
     }
 
     /**
-     * Add items to a custom playlist and optionally tag them.
+     * Resolve the CustomPlaylist relation, tag, and pivot metadata for a given item type.
+     * Centralizes the isSeries/relation/tagType/pivot resolution duplicated across the
+     * custom-playlist add/detach/sync jobs.
      *
-     * @param  iterable|Relation|Builder  $items
-     * @param  array|string|null  $data
+     * @return array{isSeries: bool, relation: string, syncRelation: string, tagFunction: string, tagType: string, itemModel: string, pivotTable: string, pivotForeignKey: string, pivotRelatedKey: string}
      */
-    public static function addItemsToPlaylist(CustomPlaylist $playlist, $items, $data, string $type = 'channel'): void
+    public static function resolveCustomPlaylistRelationMeta(CustomPlaylist $playlist, string $type = 'channel'): array
     {
         $isSeries = $type === 'series';
-        $tagFunction = $isSeries ? 'categoryTags' : 'groupTags';
         $relation = $isSeries ? 'series' : 'channels';
+        $tagFunction = $isSeries ? 'categoryTags' : 'groupTags';
         $tagType = $isSeries ? $playlist->uuid.'-category' : $playlist->uuid;
+        $itemModel = $isSeries ? Series::class : Channel::class;
 
-        // Get IDs for syncing
-        $ids = [];
-        if ($items instanceof Relation || $items instanceof Builder) {
-            $ids = $items->pluck('id');
-        } elseif ($items instanceof Collection) {
-            $ids = $items->pluck('id');
-        } else {
-            foreach ($items as $item) {
-                $ids[] = $item->id;
-            }
+        $relationInstance = $playlist->$relation();
+
+        return [
+            'isSeries' => $isSeries,
+            'relation' => $relation,
+            'syncRelation' => $relation,
+            'tagFunction' => $tagFunction,
+            'tagType' => $tagType,
+            'itemModel' => $itemModel,
+            'pivotTable' => $relationInstance->getTable(),
+            'pivotForeignKey' => $relationInstance->getForeignPivotKeyName(),
+            'pivotRelatedKey' => $relationInstance->getRelatedPivotKeyName(),
+        ];
+    }
+
+    /**
+     * Resolve (creating if needed) the shared tag for 'select'/'create' mode form data,
+     * attaching it to the playlist. Returns null for 'original' mode (or when no tag name
+     * was given), signaling the caller to resolve a tag per item from each item's own
+     * group/category name instead of a single shared tag for the whole operation.
+     *
+     * @param  array<string, mixed>  $data
+     */
+    public static function resolveSharedTagForMode(CustomPlaylist $playlist, array $data, string $tagType): ?Tag
+    {
+        $mode = $data['mode'] ?? 'select';
+        $tagName = match ($mode) {
+            'select' => $data['category'] ?? null,
+            'create' => $data['new_category'] ?? null,
+            default => null,
+        };
+
+        if ($mode === 'original' || $tagName === null || trim((string) $tagName) === '') {
+            return null;
         }
 
-        $playlist->$relation()->syncWithoutDetaching($ids);
+        $tag = Tag::findOrCreate($tagName, $tagType);
+        $playlist->attachTag($tag);
 
-        // Parse data
-        $mode = 'select';
-        $tagName = null;
+        return $tag;
+    }
 
-        if (is_array($data)) {
-            $mode = $data['mode'] ?? 'select';
-            if ($mode === 'select') {
-                $tagName = $data['category'] ?? null;
-            } elseif ($mode === 'create') {
-                $tagName = $data['new_category'] ?? null;
-            }
-        } else {
-            $tagName = $data;
+    /**
+     * Retag a set of items with a single tag using set-based SQL, without hydrating any
+     * models. Removes any existing tag of the playlist's tag type from the given items
+     * first, so each item keeps at most one group/category tag per custom playlist.
+     *
+     * @param  array<string, mixed>  $meta  From resolveCustomPlaylistRelationMeta()
+     * @param  array<int>  $playlistTagIds  All tag IDs of the playlist's tag type
+     * @param  array<int>  $itemIds
+     */
+    public static function retagItems(array $meta, array $playlistTagIds, Tag $tag, array $itemIds): void
+    {
+        if (empty($itemIds)) {
+            return;
         }
 
-        $playlistTags = $playlist->$tagFunction()->get();
-        // Get iterator for tagging
-        $cursor = ($items instanceof Builder || $items instanceof Relation)
-            ? $items->cursor()
-            : $items;
+        DB::table('taggables')
+            ->where('taggable_type', $meta['itemModel'])
+            ->whereIn('taggable_id', $itemIds)
+            ->whereIn('tag_id', $playlistTagIds)
+            ->delete();
 
-        if ($mode === 'original') {
-            foreach ($cursor as $item) {
-                // Determine original name
-                $originalName = null;
-                if ($isSeries) {
-                    $originalName = $item->category->name ?? null;
-                } else {
-                    $originalName = $item->group;
+        DB::table('taggables')->insertOrIgnore(
+            array_map(fn (int $id): array => [
+                'tag_id' => $tag->id,
+                'taggable_id' => $id,
+                'taggable_type' => $meta['itemModel'],
+            ], $itemIds)
+        );
+    }
+
+    /**
+     * Pluck the primary keys of a Filament bulk-action selection without hydrating
+     * models, dropping the table's sort clauses and column selects (eager-load
+     * aggregates, tag-sort joins) so a "select all" over 100k+ rows stays fast
+     * during the request.
+     *
+     * @return array<int>
+     */
+    public static function selectedRecordIds(Builder $recordsQuery): array
+    {
+        $keyName = $recordsQuery->getModel()->getQualifiedKeyName();
+
+        return $recordsQuery
+            ->reorder()
+            ->select($keyName)
+            ->toBase()
+            ->pluck($keyName)
+            ->all();
+    }
+
+    /**
+     * Broadcast a notification about a queued custom playlist operation to the user
+     * and persist it to their database notifications. The database copy can carry a
+     * more detailed body (e.g. an exception message) than the transient broadcast.
+     */
+    public static function notifyCustomPlaylistOperation(int $userId, bool $success, string $title, string $body, ?string $databaseBody = null): void
+    {
+        $user = User::find($userId);
+        if (! $user) {
+            return;
+        }
+
+        Notification::make()
+            ->status($success ? 'success' : 'danger')
+            ->title($title)
+            ->body($body)
+            ->broadcast($user);
+
+        Notification::make()
+            ->status($success ? 'success' : 'danger')
+            ->title($title)
+            ->body($databaseBody ?? $body)
+            ->sendToDatabase($user);
+    }
+
+    /**
+     * Fan custom playlist chunk jobs out as a parallel Bus::batch() on the import
+     * queue (same pattern as ProcessChannelScrubber). allowFailures() keeps one
+     * failed chunk from cancelling the rest of the batch, so the user is notified
+     * exactly once, from finally(), after every chunk has run: then() only fires
+     * when every job succeeds (a permanently failed chunk keeps pending_jobs from
+     * ever reaching 0, so then() would never fire), and catch() fires on the first
+     * failure while other chunks are still running, which would misreport a
+     * partially-successful batch as a total failure. Chunk jobs must be
+     * idempotent and conflict-safe, since they run concurrently across workers.
+     *
+     * @param  array<int, AddItemsToCustomPlaylistChunk|DetachItemsFromCustomPlaylistChunk>  $chunkJobs
+     */
+    public static function dispatchCustomPlaylistBatch(
+        array $chunkJobs,
+        string $batchName,
+        int $userId,
+        string $completedTitle,
+        string $completedBody,
+        string $failedTitle,
+    ): void {
+        if ($chunkJobs === []) {
+            self::notifyCustomPlaylistOperation($userId, true, $completedTitle, $completedBody);
+
+            return;
+        }
+
+        Bus::batch($chunkJobs)
+            ->name($batchName)
+            ->onQueue('import')
+            ->allowFailures()
+            ->catch(function (Batch $batch, Throwable $e): void {
+                Log::error("Custom playlist batch [{$batch->id}] chunk failed: {$e->getMessage()}");
+            })
+            ->finally(function (Batch $batch) use ($userId, $completedTitle, $completedBody, $failedTitle): void {
+                if ($batch->failedJobs > 0) {
+                    self::notifyCustomPlaylistOperation(
+                        userId: $userId,
+                        success: false,
+                        title: $failedTitle,
+                        body: __('Please view your notifications for details.'),
+                        databaseBody: __(':failed of :total chunks failed to process. Check the logs for details.', [
+                            'failed' => $batch->failedJobs,
+                            'total' => $batch->totalJobs,
+                        ]),
+                    );
+
+                    return;
                 }
 
-                if ($originalName) {
-                    $tag = Tag::findOrCreate($originalName, $tagType);
-                    $playlist->attachTag($tag);
-
-                    // Original mode mirrors the source playlist — replace tags so a
-                    // channel that moved groups shows only its new group.
-                    $item->detachTags($playlistTags);
-                    $item->attachTag($tag);
-                }
-            }
-        } elseif ($tagName) {
-            // 'select' or 'create' mode: append the chosen tag on top of existing ones,
-            // preserving any groups the user has already assigned to these items.
-            $tag = Tag::findOrCreate($tagName, $tagType);
-            $playlist->attachTag($tag);
-
-            foreach ($cursor as $item) {
-                $item->attachTag($tag);
-            }
-        }
-
-        // Clear EPG cache so downstream services pick up the new tag assignments.
-        EpgCacheService::clearForCustomPlaylistId($playlist->id);
+                self::notifyCustomPlaylistOperation($userId, true, $completedTitle, $completedBody);
+            })
+            ->dispatch();
     }
 
     /**
@@ -1460,30 +1693,30 @@ class PlaylistService
     }
 
     /**
-     * Get the BulkAction for adding items to a custom playlist.
+     * Get the BulkAction for adding items to a custom playlist via a background job.
      *
-     * @param  \Closure|null  $resolveRecordsCallback  Returns the items to add from the records: fn($records) => $records->flatMap->channels
+     * Dispatches a queued job to avoid HTTP timeouts on large selections, and fetches only
+     * the selected record IDs (not hydrated models) to keep the request itself cheap.
      */
-    public static function getAddToPlaylistBulkAction(string $name = 'add', string $type = 'channel', ?\Closure $resolveRecordsCallback = null): BulkAction
+    public static function getAddToPlaylistBulkAction(string $name = 'add', string $type = 'channel'): BulkAction
     {
         return BulkAction::make($name)
             ->label('Add to Custom Playlist')
             ->schema(self::getAddToPlaylistSchema($type))
-            ->action(function (Collection $records, array $data) use ($type, $resolveRecordsCallback): void {
-                $playlist = CustomPlaylist::findOrFail($data['playlist']);
+            ->fetchSelectedRecords(false)
+            ->action(function (Builder $recordsQuery, array $data) use ($type): void {
+                AddItemsToCustomPlaylist::dispatch(
+                    userId: auth()->id(),
+                    itemIds: self::selectedRecordIds($recordsQuery),
+                    customPlaylistId: (int) $data['playlist'],
+                    data: $data,
+                    type: $type,
+                );
 
-                $items = $records;
-                if ($resolveRecordsCallback) {
-                    $items = $resolveRecordsCallback($records);
-                }
-
-                self::addItemsToPlaylist($playlist, $items, $data, $type);
-            })
-            ->after(function () {
                 Notification::make()
-                    ->success()
-                    ->title('Items added to custom playlist')
-                    ->body('The selected items have been added to the chosen custom playlist.')
+                    ->info()
+                    ->title(__('Adding items to custom playlist'))
+                    ->body(__('The selected items are being added to the chosen custom playlist in the background. You will be notified when complete.'))
                     ->send();
             })
             ->deselectRecordsAfterCompletion()
@@ -1495,30 +1728,26 @@ class PlaylistService
     }
 
     /**
-     * Get the Action for adding items to a custom playlist.
-     *
-     * @param  \Closure|null  $resolveRecordsCallback  Returns the items to add from the record: fn($record) => $record->channels()
+     * Get the Action for adding an item to a custom playlist via a background job.
      */
-    public static function getAddToPlaylistAction(string $name = 'add', string $type = 'channel', ?\Closure $resolveRecordsCallback = null): Action
+    public static function getAddToPlaylistAction(string $name = 'add', string $type = 'channel'): Action
     {
         return Action::make($name)
             ->label('Add to Custom Playlist')
             ->schema(self::getAddToPlaylistSchema($type))
-            ->action(function ($record, array $data) use ($type, $resolveRecordsCallback): void {
-                $playlist = CustomPlaylist::findOrFail($data['playlist']);
+            ->action(function ($record, array $data) use ($type): void {
+                AddItemsToCustomPlaylist::dispatch(
+                    userId: auth()->id(),
+                    itemIds: [$record->id],
+                    customPlaylistId: (int) $data['playlist'],
+                    data: $data,
+                    type: $type,
+                );
 
-                $items = $record;
-                if ($resolveRecordsCallback) {
-                    $items = $resolveRecordsCallback($record);
-                }
-
-                self::addItemsToPlaylist($playlist, $items, $data, $type);
-            })
-            ->after(function () {
                 Notification::make()
-                    ->success()
-                    ->title('Items added to custom playlist')
-                    ->body('The selected items have been added to the chosen custom playlist.')
+                    ->info()
+                    ->title(__('Adding items to custom playlist'))
+                    ->body(__('The selected item is being added to the chosen custom playlist in the background. You will be notified when complete.'))
                     ->send();
             })
             ->requiresConfirmation()
@@ -1595,5 +1824,138 @@ class PlaylistService
             ->modalIcon('heroicon-o-play')
             ->modalDescription('Add the items to the chosen custom playlist.')
             ->modalSubmitActionLabel('Add now');
+    }
+
+    /**
+     * Schema for the Add-to-Bouquet group/category actions: one bouquet select
+     * scoped to the user's standard-target bouquets. No inline create - a bulk
+     * selection's playlist is unknown until the action runs, so a quick-created
+     * bouquet could not be targeted; the action validates the match instead.
+     *
+     * @return array<int, Field>
+     */
+    public static function getAddToBouquetSchema(): array
+    {
+        return [
+            Select::make('bouquet')
+                ->label(__('Bouquet'))
+                ->required()
+                ->searchable()
+                ->options(fn (): array => Bouquet::query()
+                    ->where('user_id', auth()->id())
+                    ->whereNotNull('playlist_id')
+                    ->with('playlist')
+                    ->orderBy('name')
+                    ->get()
+                    ->mapWithKeys(fn (Bouquet $bouquet): array => [
+                        $bouquet->id => $bouquet->name.' ('.($bouquet->playlist?->name ?? 'N/A').')',
+                    ])
+                    ->all())
+                ->helperText(__('Bouquets are scoped to a single playlist; the selected groups must belong to it. Create bouquets under Playlist Bouquets.')),
+        ];
+    }
+
+    /**
+     * Merge the selected Group/Category records' provider-stable names into a
+     * bouquet's selections. Public static so tests can exercise the handler
+     * directly. $type: 'live' | 'vod' | 'category'.
+     */
+    public static function addGroupRecordsToBouquet(SupportCollection $records, int $bouquetId, string $type): void
+    {
+        $bouquet = Bouquet::where('user_id', auth()->id())->find($bouquetId);
+        if (! $bouquet || ! $bouquet->playlist_id) {
+            Notification::make()->danger()->title(__('Bouquet not found'))->send();
+
+            return;
+        }
+
+        // Custom groups (user-created, no matching SourceGroup row) only ever match
+        // is_custom channels via the fallback name path - provider channels moved into
+        // them never match. Adding them to a bouquet would make the staleness tooling
+        // falsely flag them, and "Clean up missing" would then delete a half-working
+        // selection. Category records have no `custom` column at all.
+        $originalCount = $records->count();
+        $records = $records->reject(fn ($record) => $record->custom ?? false)->values();
+        $skippedCustomCount = $originalCount - $records->count();
+
+        if ($records->isEmpty()) {
+            Notification::make()
+                ->danger()
+                ->title(__('Custom groups cannot be added to bouquets'))
+                ->send();
+
+            return;
+        }
+
+        $playlistIds = $records->pluck('playlist_id')->unique();
+        if ($playlistIds->count() !== 1 || (int) $playlistIds->first() !== $bouquet->playlist_id) {
+            Notification::make()
+                ->danger()
+                ->title(__('Playlist mismatch'))
+                ->body(__('Bouquets are scoped to a single playlist. Select groups from the bouquet\'s own playlist only.'))
+                ->send();
+
+            return;
+        }
+
+        $key = match ($type) {
+            'vod' => 'selected_vod_groups',
+            'category' => 'selected_categories',
+            default => 'selected_groups',
+        };
+
+        $names = $records
+            ->map(fn ($record) => $record->name_internal ?? $record->name)
+            ->filter()
+            ->unique()
+            ->values();
+
+        $selections = $bouquet->group_selections ?? [];
+        $current = $selections[$key] ?? [];
+        $updated = array_values(array_unique(array_merge($current, $names->all())));
+        $added = count($updated) - count($current);
+        $selections[$key] = $updated;
+        $bouquet->update(['group_selections' => $selections]);
+
+        $body = __(':added added, :existing already present.', [
+            'added' => $added,
+            'existing' => $names->count() - $added,
+        ]);
+        if ($skippedCustomCount > 0) {
+            $body .= ' '.__(':skipped custom group(s) skipped.', ['skipped' => $skippedCustomCount]);
+        }
+
+        Notification::make()
+            ->success()
+            ->title(__('Added to bouquet'))
+            ->body($body)
+            ->send();
+    }
+
+    public static function getAddGroupsToBouquetBulkAction(string $name = 'add_to_bouquet', string $type = 'live'): BulkAction
+    {
+        return BulkAction::make($name)
+            ->label(__('Add to Bouquet'))
+            ->schema(self::getAddToBouquetSchema())
+            ->action(fn (Collection $records, array $data) => self::addGroupRecordsToBouquet($records, (int) $data['bouquet'], $type))
+            ->deselectRecordsAfterCompletion()
+            ->requiresConfirmation()
+            ->icon('heroicon-o-rectangle-stack')
+            ->modalIcon('heroicon-o-rectangle-stack')
+            ->modalDescription(__('Add the selected group(s) to the chosen bouquet.'))
+            ->modalSubmitActionLabel(__('Add now'));
+    }
+
+    public static function getAddGroupsToBouquetAction(string $name = 'add_to_bouquet', string $type = 'live'): Action
+    {
+        return Action::make($name)
+            ->label(__('Add to Bouquet'))
+            ->schema(self::getAddToBouquetSchema())
+            ->action(fn ($record, array $data) => self::addGroupRecordsToBouquet(collect([$record]), (int) $data['bouquet'], $type))
+            ->requiresConfirmation()
+            ->icon('heroicon-o-rectangle-stack')
+            ->modalIcon('heroicon-o-rectangle-stack')
+            ->modalDescription(__('Add this group to the chosen bouquet.'))
+            ->modalSubmitActionLabel(__('Add now'));
     }
 }

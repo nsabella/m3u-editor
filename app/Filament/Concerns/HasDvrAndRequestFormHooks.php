@@ -30,6 +30,7 @@ trait HasDvrAndRequestFormHooks
         if ($dvr) {
             $data['dvr_enabled'] = $dvr->enabled;
             $data['dvr_output_format'] = $dvr->dvr_output_format ?? 'ts';
+            $data['dvr_transcode_recordings'] = $dvr->transcode_recordings;
             $data['dvr_max_concurrent_recordings'] = $dvr->max_concurrent_recordings;
             $data['dvr_default_start_early_seconds'] = $dvr->default_start_early_seconds;
             $data['dvr_default_end_late_seconds'] = $dvr->default_end_late_seconds;
@@ -41,9 +42,11 @@ trait HasDvrAndRequestFormHooks
             $data['dvr_include_disabled_channels'] = $dvr->include_disabled_channels;
             $data['dvr_default_series_mode'] = $dvr->default_series_mode?->value ?? DvrSeriesMode::UniqueSe->value;
             $data['dvr_default_series_keep_last'] = $dvr->default_series_keep_last;
+            $data['dvr_sports_dedup_days'] = $dvr->sports_dedup_days;
         } else {
             $data['dvr_enabled'] = false;
             $data['dvr_output_format'] = 'ts';
+            $data['dvr_transcode_recordings'] = false;
             $data['dvr_enable_metadata_enrichment'] = true;
             $data['dvr_generate_nfo_files'] = false;
             $data['dvr_enable_comskip'] = false;
@@ -90,6 +93,7 @@ trait HasDvrAndRequestFormHooks
                     'enabled' => $data['dvr_enabled'] ?? false,
                     'use_proxy' => true,
                     'dvr_output_format' => $data['dvr_output_format'] ?? 'ts',
+                    'transcode_recordings' => $data['dvr_transcode_recordings'] ?? false,
                     'max_concurrent_recordings' => $data['dvr_max_concurrent_recordings'] ?? 2,
                     'default_start_early_seconds' => $data['dvr_default_start_early_seconds'] ?? 30,
                     'default_end_late_seconds' => $data['dvr_default_end_late_seconds'] ?? 60,
@@ -101,6 +105,7 @@ trait HasDvrAndRequestFormHooks
                     'include_disabled_channels' => $data['dvr_include_disabled_channels'] ?? false,
                     'default_series_mode' => $data['dvr_default_series_mode'] ?? DvrSeriesMode::UniqueSe->value,
                     'default_series_keep_last' => ($data['dvr_default_series_keep_last'] > 0) ? $data['dvr_default_series_keep_last'] : null,
+                    'sports_dedup_days' => isset($data['dvr_sports_dedup_days']) && $data['dvr_sports_dedup_days'] !== '' && $data['dvr_sports_dedup_days'] !== null && (int) $data['dvr_sports_dedup_days'] >= 0 ? (int) $data['dvr_sports_dedup_days'] : null,
                 ]
             );
         }

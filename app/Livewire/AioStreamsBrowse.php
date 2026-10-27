@@ -504,52 +504,7 @@ class AioStreamsBrowse extends Component implements HasActions, HasSchemas
      */
     private function extractAioMovieDbIds(string $itemId, array $meta): array
     {
-        $imdbId = null;
-        $tmdbId = null;
-
-        if (preg_match('/^(tt\d+)/', $itemId, $matches)) {
-            $imdbId = $matches[1];
-        } elseif (preg_match('/^tmdb:(\d+)/', $itemId, $matches)) {
-            $tmdbId = (int) $matches[1];
-        }
-
-        $imdbId ??= is_string($meta['imdb_id'] ?? null) ? $meta['imdb_id'] : null;
-        $tmdbId ??= is_numeric($meta['moviedb_id'] ?? $meta['tmdb_id'] ?? null)
-            ? (int) ($meta['moviedb_id'] ?? $meta['tmdb_id'])
-            : null;
-
-        if ((! $imdbId || ! $tmdbId) && ! empty($meta['links']) && is_array($meta['links'])) {
-            foreach ($meta['links'] as $link) {
-                if (! is_array($link)) {
-                    continue;
-                }
-
-                $category = strtolower((string) ($link['category'] ?? ''));
-
-                if (! $imdbId && $category === 'imdb') {
-                    $name = $link['name'] ?? null;
-                    if (is_string($name) && preg_match('/^tt\d+$/', $name)) {
-                        $imdbId = $name;
-                    } elseif (is_string($link['url'] ?? null) && preg_match('/(tt\d+)/', $link['url'], $matches)) {
-                        $imdbId = $matches[1];
-                    }
-                }
-
-                if (! $tmdbId && in_array($category, ['tmdb', 'moviedb'], true)) {
-                    $name = $link['name'] ?? null;
-                    if (is_numeric($name)) {
-                        $tmdbId = (int) $name;
-                    } elseif (is_string($link['url'] ?? null) && preg_match('/(\d+)/', $link['url'], $matches)) {
-                        $tmdbId = (int) $matches[1];
-                    }
-                }
-            }
-        }
-
-        return [
-            'imdb' => $imdbId,
-            'tmdb' => $tmdbId,
-        ];
+        return AIOStreamsService::extractMovieDbIds($itemId, $meta);
     }
 
     /**
@@ -796,7 +751,7 @@ class AioStreamsBrowse extends Component implements HasActions, HasSchemas
         NotifyAioStreamsResolutionComplete::dispatch([$channel->id], [], $integration->user_id, $channel->title ?? $channel->name)
             ->delay(now()->addSeconds(15));
 
-        Notification::make()->success()->title(__('Added — resolving stream, check back shortly'))->send();
+        Notification::make()->success()->title(__('Added - resolving stream, check back shortly'))->send();
     }
 
     /**
@@ -822,7 +777,7 @@ class AioStreamsBrowse extends Component implements HasActions, HasSchemas
             return;
         }
 
-        Notification::make()->success()->title(__('Series added — add individual episodes to resolve their streams'))->send();
+        Notification::make()->success()->title(__('Series added - add individual episodes to resolve their streams'))->send();
     }
 
     /**
@@ -856,7 +811,7 @@ class AioStreamsBrowse extends Component implements HasActions, HasSchemas
                 ->delay(now()->addSeconds(15));
         }
 
-        Notification::make()->success()->title(__('Episode added — resolving stream, check back shortly'))->send();
+        Notification::make()->success()->title(__('Episode added - resolving stream, check back shortly'))->send();
     }
 
     public function toggleEpisodeSelected(int $season, int $episode): void

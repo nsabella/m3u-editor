@@ -20,6 +20,11 @@
         $auth = $this->getAuth();
         $username = $auth['username'] ?? null;
         $password = $auth['password'] ?? null;
+        $seriesRatingSuppressed = \App\Support\TmdbRating::isVoteCountBelowThreshold($record->metadata['vote_count'] ?? null);
+        $clearLogo = $record->metadata['clearlogo'] ?? null;
+        $castList = $record->metadata['cast_list'] ?? [];
+        $contentRating = $record->getContentRating();
+        $networkNames = collect($record->metadata['networks'] ?? [])->pluck('name')->filter()->values();
     @endphp
 
     @if ($backdropUrl)
@@ -53,7 +58,15 @@
 
                 {{-- Info --}}
                 <div class="flex-1 space-y-4 text-white">
-                    <h1 class="text-4xl font-bold">{{ $record->name }}</h1>
+                    @if ($clearLogo)
+                        <img
+                            src="{{ $clearLogo }}"
+                            alt="{{ $record->name }}"
+                            class="max-h-24 w-auto max-w-md object-contain drop-shadow-lg"
+                        />
+                    @else
+                        <h1 class="text-4xl font-bold">{{ $record->name }}</h1>
+                    @endif
 
                     {{-- Metadata Badges --}}
                     <div class="flex flex-wrap items-center gap-2 text-sm">
@@ -63,7 +76,7 @@
                         @if ($record->genre)
                             <span class="rounded-full bg-white/10 px-3 py-1">{{ $record->genre }}</span>
                         @endif
-                        @if ($record->rating)
+                        @if ($record->rating && ! $seriesRatingSuppressed)
                             <span class="flex items-center gap-1 rounded-full bg-yellow-500/20 px-3 py-1 text-yellow-300">
                                 <x-heroicon-s-star class="h-4 w-4" />
                                 {{ $record->rating }}
@@ -85,6 +98,9 @@
                             {{ $record->enabled ? 'Enabled' : 'Disabled' }}
                         </span>
                     </div>
+
+                    {{-- Content rating (TMDB's, else the media server's) and networks --}}
+                    <x-content-rating-badges :rating="$contentRating" :names="$networkNames" icon="heroicon-m-tv" />
 
                     {{-- Plot --}}
                     @if ($record->plot)
@@ -126,20 +142,21 @@
 
                     {{-- YouTube Trailer --}}
                     @if ($record->youtube_trailer)
-                        <div class="pt-2">
-                            <a
+                        <div class="flex flex-wrap gap-3 pt-2">
+                            <x-filament::button
+                                tag="a"
                                 href="https://www.youtube.com/watch?v={{ $record->youtube_trailer }}"
                                 target="_blank"
-                                class="inline-flex items-center gap-2 rounded-lg bg-red-600 px-4 py-2 text-white transition-colors hover:bg-red-700"
+                                color="danger"
+                                icon="heroicon-s-play"
                             >
-                                <x-heroicon-s-play class="h-5 w-5" />
-                                Watch Trailer
-                            </a>
+                                {{ __('Watch Trailer') }}
+                            </x-filament::button>
                         </div>
                     @endif
 
-                    {{-- Cast & Director --}}
-                    @if ($record->director || $record->cast)
+                    {{-- Cast & Director (plain-text cast only when there's no rich cast row below) --}}
+                    @if ($record->director || ($record->cast && empty($castList)))
                         <div class="space-y-2 border-t border-white/10 pt-4">
                             @if ($record->director)
                                 <p class="text-sm">
@@ -147,7 +164,7 @@
                                     <span class="text-white">{{ $record->director }}</span>
                                 </p>
                             @endif
-                            @if ($record->cast)
+                            @if ($record->cast && empty($castList))
                                 <p class="text-sm">
                                     <span class="text-gray-400">Cast:</span>
                                     <span class="text-white">{{ Str::limit($record->cast, 200) }}</span>
@@ -189,7 +206,7 @@
                         @if ($record->genre)
                             <span class="rounded bg-gray-200 px-2 py-1 dark:bg-gray-700">{{ $record->genre }}</span>
                         @endif
-                        @if ($record->rating)
+                        @if ($record->rating && ! $seriesRatingSuppressed)
                             <span class="flex items-center gap-1 rounded bg-yellow-100 px-2 py-1 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-300">
                                 <x-heroicon-s-star class="h-3 w-3" />
                                 {{ $record->rating }}
@@ -200,16 +217,19 @@
                         </span>
                     </div>
 
+                    {{-- Content rating (TMDB's, else the media server's) and networks --}}
+                    <x-content-rating-badges :rating="$contentRating" :names="$networkNames" icon="heroicon-m-tv" />
+
                     @if ($record->plot)
                         <p class="text-gray-600 dark:text-gray-300">{{ Str::limit($record->plot, 300) }}</p>
                     @endif
 
-                    @if ($record->director || $record->cast)
+                    @if ($record->director || ($record->cast && empty($castList)))
                         <div class="space-y-1 text-sm">
                             @if ($record->director)
                                 <p><span class="text-gray-500">Director:</span> {{ $record->director }}</p>
                             @endif
-                            @if ($record->cast)
+                            @if ($record->cast && empty($castList))
                                 <p><span class="text-gray-500">Cast:</span> {{ Str::limit($record->cast, 150) }}</p>
                             @endif
                         </div>
@@ -218,6 +238,25 @@
             </div>
         </div>
     @endif
+
+    {{-- Cast (clickable: each tile navigates to the actor's filmography page,
+         scoped to this playlist so it only shows items available locally) --}}
+    @php
+        // Detect the active panel without crashing when no panel context is
+        // available (e.g. Livewire tests that don't set up a Filament panel).
+        // Default to 'admin' so admin tests resolve the right Filmography class
+        // and admin ownership checks still run; production URLs pick up the
+        // real panel id.
+        $activePanelId = \Filament\Facades\Filament::getCurrentPanel()?->getId() ?? 'admin';
+        $isAdminPanel = $activePanelId === 'admin';
+    @endphp
+    @include('filament.partials.cast-section', [
+        'cast' => $castList,
+        'filmographyPage' => $isAdminPanel
+            ? \App\Filament\Pages\ActorFilmography::class
+            : \App\Filament\GuestPanel\Pages\GuestActorFilmography::class,
+        'playlistId' => $isAdminPanel ? ($record->playlist_id ?? null) : null,
+    ])
 
     {{-- Probed Stream Info (aggregated across episodes) --}}
     @include('filament.partials.probed-stream-info-series', ['record' => $record])
@@ -243,7 +282,7 @@
                 @foreach ($episodesBySeason as $seasonNumber => $episodes)
                     @php
                         $season = $seasonsLookup->get($seasonNumber);
-                        $cover = $season?->cover_big ?? $season?->cover;
+                        $cover = $season?->display_cover;
                         $seasonName = $season?->name ?? 'Season '.str_pad($seasonNumber, 2, '0', STR_PAD_LEFT);
                         $totalEpisodes = $episodes->count();
                         $enabledEpisodes = $episodes->where('enabled', true)->count();
@@ -349,7 +388,7 @@
                                         @endif
 
                                         <div class="flex items-center gap-2 pt-1">
-                                            @if (! empty($info['rating']))
+                                            @if (! empty($info['rating']) && ! \App\Support\TmdbRating::isVoteCountBelowThreshold($info['vote_count'] ?? null))
                                                 <span class="inline-flex items-center gap-1 text-xs text-yellow-600 dark:text-yellow-400">
                                                     <x-heroicon-s-star class="h-3 w-3" />
                                                     {{ $info['rating'] }}

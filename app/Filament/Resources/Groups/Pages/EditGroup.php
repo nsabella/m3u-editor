@@ -5,6 +5,7 @@ namespace App\Filament\Resources\Groups\Pages;
 use App\Facades\SortFacade;
 use App\Filament\Resources\Groups\GroupResource;
 use App\Models\Group;
+use App\Services\GroupChannelStateService;
 use App\Services\PlaylistService;
 use Filament\Actions\Action;
 use Filament\Actions\ActionGroup;
@@ -25,6 +26,7 @@ class EditGroup extends EditRecord
         return [
             ActionGroup::make([
                 PlaylistService::getAddGroupsToPlaylistAction('add', 'channel'),
+                PlaylistService::getAddGroupsToBouquetAction(type: 'live'),
                 Action::make('move')
                     ->label(__('Move to Group'))
                     ->schema([
@@ -33,7 +35,7 @@ class EditGroup extends EditRecord
                             ->live()
                             ->label(__('Group'))
                             ->helperText(__('Select the group you would like to move the channels to.'))
-                            ->options(fn (Get $get, $record) => Group::where([
+                            ->options(fn (Get $get, $record) => Group::query()->assignableTarget()->where([
                                 'type' => 'live',
                                 'user_id' => auth()->id(),
                                 'playlist_id' => $record->playlist_id,
@@ -61,7 +63,7 @@ class EditGroup extends EditRecord
                     ->modalSubmitActionLabel(__('Move now')),
 
                 Action::make('recount')
-                    ->label(__('Recount This Group'))
+                    ->label(__('Renumber This Group'))
                     ->icon('heroicon-o-hashtag')
                     ->schema([
                         TextInput::make('start')
@@ -81,13 +83,13 @@ class EditGroup extends EditRecord
                         $livewire->dispatch('refreshRelation');
                         Notification::make()
                             ->success()
-                            ->title(__('Channels Recounted'))
-                            ->body(__('The channels in this group have been recounted.'))
+                            ->title(__('Channels Renumbered'))
+                            ->body(__('The channels in this group have been renumbered.'))
                             ->send();
                     })
                     ->requiresConfirmation()
                     ->modalIcon('heroicon-o-hashtag')
-                    ->modalDescription(__('Recount channels only in this group sequentially. Channel numbers will be assigned based on the current sort order of this group.')),
+                    ->modalDescription(__('Renumber channels only in this group sequentially. Channel numbers will be assigned based on the current sort order of this group.')),
                 Action::make('sort_alpha')
                     ->label(__('Sort Alpha'))
                     ->icon('heroicon-o-bars-arrow-down')
@@ -148,10 +150,8 @@ class EditGroup extends EditRecord
 
                 Action::make('enable')
                     ->label(__('Enable group channels'))
-                    ->action(function ($record): void {
-                        $record->channels()->update([
-                            'enabled' => true,
-                        ]);
+                    ->action(function (Group $record): void {
+                        app(GroupChannelStateService::class)->enable($record);
                     })->after(function ($livewire) {
                         $livewire->dispatch('refreshRelation');
                         Notification::make()
@@ -168,10 +168,8 @@ class EditGroup extends EditRecord
                     ->modalSubmitActionLabel(__('Yes, enable now')),
                 Action::make('disable')
                     ->label(__('Disable group channels'))
-                    ->action(function ($record): void {
-                        $record->channels()->update([
-                            'enabled' => false,
-                        ]);
+                    ->action(function (Group $record): void {
+                        app(GroupChannelStateService::class)->disable($record);
                     })->after(function ($livewire) {
                         $livewire->dispatch('refreshRelation');
                         Notification::make()

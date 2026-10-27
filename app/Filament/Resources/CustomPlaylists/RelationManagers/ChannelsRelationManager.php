@@ -5,9 +5,13 @@ namespace App\Filament\Resources\CustomPlaylists\RelationManagers;
 use App\Facades\SortFacade;
 use App\Filament\Resources\Channels\ChannelResource;
 use App\Filament\Resources\CustomPlaylists\RelationManagers\Concerns\ReordersCustomPlaylistPivotSort;
+use App\Jobs\AddItemsToCustomPlaylist;
+use App\Jobs\DetachItemsFromCustomPlaylist;
 use App\Jobs\SyncPlexDvrJob;
 use App\Models\Channel;
 use App\Services\EpgCacheService;
+use App\Services\PlaylistService;
+use App\Support\ChannelNumber;
 use Filament\Actions\AttachAction;
 use Filament\Actions\BulkAction;
 use Filament\Actions\CreateAction;
@@ -119,21 +123,21 @@ class ChannelsRelationManager extends RelationManager
                     default => 'CAST(tags.name AS TEXT)'
                 };
 
-                return $query
-                    ->leftJoin('taggables', function ($join) {
-                        $join->on('channels.id', '=', 'taggables.taggable_id')
-                            ->where('taggables.taggable_type', '=', Channel::class);
-                    })
-                    ->leftJoin('tags', function ($join) use ($ownerRecord) {
-                        $join->on('taggables.tag_id', '=', 'tags.id')
-                            ->where('tags.type', '=', $ownerRecord->uuid);
-                    })
-                    ->orderByRaw("{$orderByClause} {$direction}")
-                    ->select(
-                        'channels.*',
-                        DB::raw("{$orderByClause} as tag_name_sort"),
-                        DB::raw('COALESCE(channel_custom_playlist.sort, channels.sort) as pivot_sort'))
-                    ->distinct();
+                // Order by a correlated subquery rather than joining taggables/tags: one row per
+                // item, so no DISTINCT over json columns (which Postgres cannot compare) and no
+                // duplicate rows for items carrying more than one tag. The inner orderBy makes the
+                // limit(1) pick deterministic when an item carries more than one relevant tag.
+                return $query->orderBy(
+                    DB::table('taggables')
+                        ->join('tags', 'taggables.tag_id', '=', 'tags.id')
+                        ->selectRaw($orderByClause)
+                        ->whereColumn('taggables.taggable_id', 'channels.id')
+                        ->where('taggables.taggable_type', Channel::class)
+                        ->where('tags.type', $ownerRecord->uuid)
+                        ->orderBy('tags.id')
+                        ->limit(1),
+                    $direction,
+                );
             });
         $defaultColumns = ChannelResource::getTableColumns(showGroup: true, showPlaylist: true);
 
@@ -142,20 +146,21 @@ class ChannelsRelationManager extends RelationManager
             if (method_exists($column, 'getName') && $column->getName() === 'channel') {
                 $defaultColumns[$i] = TextInputColumn::make('custom_channel_number')
                     ->label(__('Channel'))
-                    ->type('number')
-                    ->rules(['nullable', 'numeric', 'min:0'])
-                    ->placeholder(fn ($record) => (string) $record->channel)
+                    ->rules(['nullable', 'regex:'.ChannelNumber::PATTERN])
+                    ->validationMessages(['regex' => __('Use a whole number, or a sub-channel like 5.1.')])
+                    ->placeholder(fn ($record) => (string) $record->resolveChannelNumber())
                     ->getStateUsing(function ($record) {
-                        return $record->pivot?->channel_number ?? null;
+                        return ChannelNumber::format($record->pivot?->channel_number, $record->pivot?->channel_minor);
                     })
                     ->updateStateUsing(function ($record, $state) use ($ownerRecord): void {
                         $ownerRecord->channels()->updateExistingPivot(
                             $record->id,
-                            ['channel_number' => ($state !== '' && $state !== null) ? (int) $state : null]
+                            ChannelNumber::toPivotAttributes($state)
                         );
                     })
                     ->sortable(query: function (Builder $query, string $direction): Builder {
-                        return $query->orderBy('channel_custom_playlist.channel_number', $direction);
+                        return $query->orderBy('channel_custom_playlist.channel_number', $direction)
+                            ->orderByRaw('COALESCE(channel_custom_playlist.channel_minor, 0) '.($direction === 'desc' ? 'desc' : 'asc'));
                     });
             }
             if (method_exists($column, 'getName') && $column->getName() === 'sort') {
@@ -352,7 +357,7 @@ class ChannelsRelationManager extends RelationManager
             ->toolbarActions([
                 ...ChannelResource::getTableBulkActions(addToCustom: false, includeRecount: false),
                 BulkAction::make('recount_custom')
-                    ->label(__('Recount Channels'))
+                    ->label(__('Renumber Channels'))
                     ->icon('heroicon-o-hashtag')
                     ->schema([
                         Forms\Components\TextInput::make('start')
@@ -369,14 +374,14 @@ class ChannelsRelationManager extends RelationManager
                     ->after(function () {
                         Notification::make()
                             ->success()
-                            ->title(__('Custom Playlist Channels Recounted'))
-                            ->body(__('The selected channels were recounted for this custom playlist only.'))
+                            ->title(__('Custom Playlist Channels Renumbered'))
+                            ->body(__('The selected channels were renumbered for this custom playlist only.'))
                             ->send();
                     })
                     ->requiresConfirmation()
                     ->modalIcon('heroicon-o-hashtag')
-                    ->modalDescription(__('Recount the selected channels only inside this custom playlist. The original channel numbers will not change.'))
-                    ->modalSubmitActionLabel(__('Recount now')),
+                    ->modalDescription(__('Renumber the selected channels only inside this custom playlist. The original channel numbers will not change.'))
+                    ->modalSubmitActionLabel(__('Renumber now')),
                 BulkAction::make('sort_alpha_custom')
                     ->label(__('Sort Alpha'))
                     ->icon('heroicon-o-bars-arrow-down')
@@ -419,17 +424,19 @@ class ChannelsRelationManager extends RelationManager
                     ->modalSubmitActionLabel(__('Sort now')),
                 BulkAction::make('detach')
                     ->label(__('Detach Selected'))
-                    ->action(function (Collection $records) use ($ownerRecord): void {
-                        $tags = $ownerRecord->groupTags()->get();
-                        foreach ($records as $record) {
-                            $record->detachTags($tags);
-                        }
-                        $ownerRecord->channels()->detach($records->pluck('id'));
-                    })->after(function () {
+                    ->fetchSelectedRecords(false)
+                    ->action(function (Builder $recordsQuery) use ($ownerRecord): void {
+                        DetachItemsFromCustomPlaylist::dispatch(
+                            userId: auth()->id(),
+                            itemIds: PlaylistService::selectedRecordIds($recordsQuery),
+                            customPlaylistId: $ownerRecord->id,
+                            type: 'channel',
+                        );
+
                         Notification::make()
-                            ->success()
-                            ->title(__('Detached from playlist'))
-                            ->body(__('The selected channels have been detached from the custom playlist.'))
+                            ->info()
+                            ->title(__('Detaching from playlist'))
+                            ->body(__('The selected channels are being detached from the custom playlist in the background. You will be notified when complete.'))
                             ->send();
                     })
                     ->color('danger')
@@ -457,19 +464,32 @@ class ChannelsRelationManager extends RelationManager
                             ->searchable()
                             ->required(),
                     ])
-                    ->action(function (Collection $records, $data) use ($ownerRecord): void {
-                        $tagIds = $data['groups'] ?? [];
-                        $tags = $ownerRecord->groupTags()->whereIn('id', $tagIds)->get();
-                        foreach ($records as $record) {
-                            $record->attachTags($tags); // Append, not replace
+                    ->fetchSelectedRecords(false)
+                    ->action(function (Builder $recordsQuery, array $data) use ($ownerRecord): void {
+                        // Dispatch one chunked background job per selected group so a
+                        // channel can join several custom groups at once. 'select' mode
+                        // appends the tag (preserving existing groups and their
+                        // taggables.sort) rather than replacing.
+                        $itemIds = PlaylistService::selectedRecordIds($recordsQuery);
+                        foreach ($data['groups'] ?? [] as $groupId) {
+                            $tag = $ownerRecord->groupTags()->where('id', $groupId)->first();
+                            if (! $tag) {
+                                continue;
+                            }
+
+                            AddItemsToCustomPlaylist::dispatch(
+                                userId: auth()->id(),
+                                itemIds: $itemIds,
+                                customPlaylistId: $ownerRecord->id,
+                                data: ['mode' => 'select', 'category' => $tag->getAttributeValue('name')],
+                                type: 'channel',
+                            );
                         }
-                        // Clear EPG cache for this custom playlist
-                        EpgCacheService::clearForCustomPlaylistId($ownerRecord->id);
-                    })->after(function () {
+
                         Notification::make()
-                            ->success()
-                            ->title(__('Added to group'))
-                            ->body(__('The selected channels have been added to the custom groups.'))
+                            ->info()
+                            ->title(__('Adding to group'))
+                            ->body(__('The selected channels are being added to the custom groups in the background. You will be notified when complete.'))
                             ->send();
                     })
                     ->deselectRecordsAfterCompletion()

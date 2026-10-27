@@ -7,15 +7,16 @@ use App\Filament\Concerns\HasCopilotSupport;
 use App\Filament\Resources\Groups\Pages\EditGroup;
 use App\Filament\Resources\Groups\Pages\ListGroups;
 use App\Filament\Resources\Groups\RelationManagers\ChannelsRelationManager;
+use App\Filament\Resources\Groups\RelationManagers\ChildGroupsRelationManager;
 use App\Jobs\GroupFindAndReplace;
 use App\Jobs\GroupFindAndReplaceReset;
 use App\Jobs\SyncPlexDvrJob;
-use App\Models\Channel;
 use App\Models\Group;
-use App\Models\Playlist;
 use App\Models\StreamProfile;
 use App\Services\DateFormatService;
 use App\Services\FindReplaceService;
+use App\Services\GroupChannelStateService;
+use App\Services\MergedGroupService;
 use App\Services\PlaylistService;
 use App\Traits\HasUserFiltering;
 use EslamRedaDiv\FilamentCopilot\Contracts\CopilotResource;
@@ -39,9 +40,11 @@ use Filament\Tables\Columns\TextColumn;
 use Filament\Tables\Columns\TextInputColumn;
 use Filament\Tables\Columns\ToggleColumn;
 use Filament\Tables\Enums\RecordActionsPosition;
+use Filament\Tables\Filters\TernaryFilter;
 use Filament\Tables\Table;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Support\Facades\DB;
 
 class GroupResource extends Resource implements CopilotResource
 {
@@ -92,9 +95,15 @@ class GroupResource extends Resource implements CopilotResource
         return $table->persistFiltersInSession()
             ->persistSortInSession()
             ->modifyQueryUsing(function (Builder $query) {
-                $query->withCount('live_channels')
+                $query->with(['parent', 'playlist'])
+                    ->withCount('live_channels')
                     ->withCount('enabled_live_channels')
-                    ->where('type', 'live');
+                    ->withCount('children')
+                    ->withCount([
+                        'descendantChannels as descendant_live_channels_count' => fn (Builder $subQuery) => $subQuery->where('channels.is_vod', false),
+                        'descendantChannels as enabled_descendant_live_channels_count' => fn (Builder $subQuery) => $subQuery->where('channels.is_vod', false)->where('channels.enabled', true),
+                    ])
+                    ->where('groups.type', 'live');
             })
             ->filtersTriggerAction(function ($action) {
                 return $action->button()->label(__('Filters'));
@@ -129,9 +138,8 @@ class GroupResource extends Resource implements CopilotResource
                 ToggleColumn::make('enabled')
                     ->label(__('Auto Enable'))
                     ->toggleable()
-                    ->tooltip(__('Auto enable newly added group channels'))
-                    ->tooltip(fn ($record) => $record->playlist?->enable_channels ? 'Playlist auto-enable new channels is enabled, all group channels will automatically be enabled on next sync.' : 'Auto enable newly added group channels')
-                    ->disabled(fn ($record) => $record->playlist?->enable_channels)
+                    ->tooltip(fn ($record) => $record->playlist?->enable_channels ? __('Playlist "Enable new Live channels" is on, so all new channels added to this group will be enabled on sync.') : __('Auto enable newly added group channels'))
+                    ->disabled(fn ($record) => (bool) $record->playlist?->enable_channels)
                     ->getStateUsing(fn ($record) => $record->playlist?->enable_channels ? true : $record->enabled)
                     ->sortable(),
                 TextColumn::make('name_internal')
@@ -140,7 +148,12 @@ class GroupResource extends Resource implements CopilotResource
                     ->sortable(),
                 TextColumn::make('live_channels_count')
                     ->label(__('Live Channels'))
-                    ->description(fn (Group $record): string => "Enabled: {$record->enabled_live_channels_count}")
+                    ->state(fn (Group $record): int => $record->is_merged
+                        ? (int) $record->descendant_live_channels_count
+                        : (int) $record->live_channels_count)
+                    ->description(fn (Group $record): string => 'Enabled: '.($record->is_merged
+                        ? (int) $record->enabled_descendant_live_channels_count
+                        : (int) $record->enabled_live_channels_count))
                     ->toggleable()
                     ->sortable(),
                 IconColumn::make('custom')
@@ -154,6 +167,35 @@ class GroupResource extends Resource implements CopilotResource
                         '0' => 'danger',
                         '' => 'danger',
                     })->toggleable()->sortable(),
+                IconColumn::make('is_merged')
+                    ->label(__('Merged Group'))
+                    ->boolean()
+                    ->tooltip(fn (Group $record): ?string => $record->is_merged ? __('This group combines the groups merged into it.') : null)
+                    ->toggleable()
+                    ->sortable(),
+                TextColumn::make('parent.name')
+                    ->label(__('Parent'))
+                    ->placeholder('-')
+                    ->badge()
+                    ->color('gray')
+                    ->searchable()
+                    ->sortable(query: function (Builder $query, string $direction): Builder {
+                        return $query->orderBy(
+                            DB::table('groups as parent_groups')
+                                ->select('parent_groups.name')
+                                ->whereColumn('parent_groups.id', 'groups.parent_id'),
+                            $direction,
+                        );
+                    })
+                    ->toggleable(),
+                TextColumn::make('children_count')
+                    ->label(__('Children'))
+                    ->state(fn (Group $record): ?int => $record->is_merged ? (int) $record->children_count : null)
+                    ->placeholder('-')
+                    ->badge()
+                    ->color('gray')
+                    ->sortable()
+                    ->toggleable(),
                 TextColumn::make('created_at')
                     ->formatStateUsing(fn ($state) => app(DateFormatService::class)->format($state))
                     ->sortable()
@@ -164,15 +206,17 @@ class GroupResource extends Resource implements CopilotResource
                     ->toggleable(isToggledHiddenByDefault: true),
             ])
             ->filters([
-                // SelectFilter::make('playlist')
-                //     ->relationship('playlist', 'name')
-                //     ->multiple()
-                //     ->preload()
-                //     ->searchable(),
+                TernaryFilter::make('is_merged')
+                    ->label(__('Merged groups'))
+                    ->placeholder(__('All groups'))
+                    ->trueLabel(__('Merged groups only'))
+                    ->falseLabel(__('Exclude merged groups')),
             ])
             ->recordActions([
                 ActionGroup::make([
                     PlaylistService::getAddGroupsToPlaylistAction('add', 'channel'),
+                    PlaylistService::getAddGroupsToBouquetAction(type: 'live'),
+                    MergedGroupService::manageChildrenAction(),
                     Action::make('move')
                         ->label(__('Move Channels to Group'))
                         ->schema([
@@ -181,7 +225,7 @@ class GroupResource extends Resource implements CopilotResource
                                 ->live()
                                 ->label(__('Group'))
                                 ->helperText(__('Select the group you would like to move the channels to.'))
-                                ->options(fn (Get $get, $record) => Group::where([
+                                ->options(fn (Get $get, $record) => Group::query()->assignableTarget()->where([
                                     'type' => 'live',
                                     'user_id' => auth()->id(),
                                     'playlist_id' => $record->playlist_id,
@@ -254,7 +298,7 @@ class GroupResource extends Resource implements CopilotResource
                         ->modalSubmitActionLabel(__('Apply')),
 
                     Action::make('recount')
-                        ->label(__('Recount This Group'))
+                        ->label(__('Renumber This Group'))
                         ->icon('heroicon-o-hashtag')
                         ->schema([
                             TextInput::make('start')
@@ -273,13 +317,13 @@ class GroupResource extends Resource implements CopilotResource
                         ->after(function () {
                             Notification::make()
                                 ->success()
-                                ->title(__('Channels Recounted'))
-                                ->body(__('The channels in this group have been recounted.'))
+                                ->title(__('Channels Renumbered'))
+                                ->body(__('The channels in this group have been renumbered.'))
                                 ->send();
                         })
                         ->requiresConfirmation()
                         ->modalIcon('heroicon-o-hashtag')
-                        ->modalDescription(__('Recount channels only in this group sequentially. Channel numbers will be assigned based on the current sort order of this group.')),
+                        ->modalDescription(__('Renumber channels only in this group sequentially. Channel numbers will be assigned based on the current sort order of this group.')),
                     Action::make('sort_alpha')
                         ->label(__('Sort Alpha'))
                         ->icon('heroicon-o-bars-arrow-down')
@@ -338,20 +382,8 @@ class GroupResource extends Resource implements CopilotResource
 
                     Action::make('enable')
                         ->label(__('Enable group channels'))
-                        ->action(function (Group $record): void {
-                            $record->channels()->update([
-                                'enabled' => true,
-                            ]);
-
-                            $maxChannel = Channel::query()
-                                ->where('playlist_id', $record->playlist_id)
-                                ->where('group_id', '!=', $record->id)
-                                ->where('enabled', true)
-                                ->max('channel') ?? 0;
-
-                            SortFacade::bulkRecountGroupChannels($record, $maxChannel + 1);
-                        })->after(function () {
-                            SyncPlexDvrJob::dispatchIfConfigured(trigger: 'group_enable');
+                        ->action(fn (Group $record) => app(GroupChannelStateService::class)->enable($record))
+                        ->after(function () {
                             Notification::make()
                                 ->success()
                                 ->title(__('Group channels enabled'))
@@ -366,12 +398,8 @@ class GroupResource extends Resource implements CopilotResource
                         ->modalSubmitActionLabel(__('Yes, enable now')),
                     Action::make('disable')
                         ->label(__('Disable group channels'))
-                        ->action(function ($record): void {
-                            $record->channels()->update([
-                                'enabled' => false,
-                            ]);
-                        })->after(function () {
-                            SyncPlexDvrJob::dispatchIfConfigured(trigger: 'group_disable');
+                        ->action(fn (Group $record) => app(GroupChannelStateService::class)->disable($record))
+                        ->after(function () {
                             Notification::make()
                                 ->success()
                                 ->title(__('Group channels disabled'))
@@ -394,6 +422,7 @@ class GroupResource extends Resource implements CopilotResource
             ->toolbarActions([
                 BulkActionGroup::make([
                     PlaylistService::getAddGroupsToPlaylistBulkAction('add', 'channel'),
+                    PlaylistService::getAddGroupsToBouquetBulkAction(type: 'live'),
                     BulkAction::make('move')
                         ->label(__('Move Channels to Group'))
                         ->schema([
@@ -404,6 +433,7 @@ class GroupResource extends Resource implements CopilotResource
                                 ->helperText(__('Select the group you would like to move the channels to.'))
                                 ->options(
                                     fn () => Group::query()
+                                        ->assignableTarget()
                                         ->with(['playlist'])
                                         ->where(['user_id' => auth()->id(), 'type' => 'live'])
                                         ->get(['name', 'id', 'playlist_id'])
@@ -446,6 +476,7 @@ class GroupResource extends Resource implements CopilotResource
                         ->modalIcon('heroicon-o-arrows-right-left')
                         ->modalDescription(__('Move the group channels to the another group.'))
                         ->modalSubmitActionLabel(__('Move now')),
+                    MergedGroupService::addToMergedGroupBulkAction('live'),
                     BulkAction::make('set-stream-profile')
                         ->label(__('Set Stream Profile'))
                         ->schema([
@@ -499,20 +530,11 @@ class GroupResource extends Resource implements CopilotResource
                         ->label(__('Enable Group Channels'))
                         ->action(function (Collection $records): void {
                             foreach ($records as $record) {
-                                $record->channels()->update([
-                                    'enabled' => true,
-                                ]);
-
-                                $maxChannel = Channel::query()
-                                    ->where('playlist_id', $record->playlist_id)
-                                    ->where('group_id', '!=', $record->id)
-                                    ->where('enabled', true)
-                                    ->max('channel') ?? 0;
-
-                                SortFacade::bulkRecountGroupChannels($record, $maxChannel + 1);
+                                app(GroupChannelStateService::class)->enable($record, dispatchSync: false);
                             }
-                        })->after(function () {
+
                             SyncPlexDvrJob::dispatchIfConfigured(trigger: 'group_bulk_enable');
+                        })->after(function () {
                             Notification::make()
                                 ->success()
                                 ->title(__('Selected group channels enabled'))
@@ -529,12 +551,11 @@ class GroupResource extends Resource implements CopilotResource
                         ->label(__('Disable Group Channels'))
                         ->action(function (Collection $records): void {
                             foreach ($records as $record) {
-                                $record->channels()->update([
-                                    'enabled' => false,
-                                ]);
+                                app(GroupChannelStateService::class)->disable($record, dispatchSync: false);
                             }
-                        })->after(function () {
+
                             SyncPlexDvrJob::dispatchIfConfigured(trigger: 'group_bulk_disable');
+                        })->after(function () {
                             Notification::make()
                                 ->success()
                                 ->title(__('Selected group channels disabled'))
@@ -594,7 +615,7 @@ class GroupResource extends Resource implements CopilotResource
                         ->modalDescription(__('Disable the selected group(s) now?'))
                         ->modalSubmitActionLabel(__('Yes, disable now')),
                     BulkAction::make('recount_channels')
-                        ->label(__('Recount Selected Groups'))
+                        ->label(__('Renumber Selected Groups'))
                         ->icon('heroicon-o-hashtag')
                         ->form([
                             TextInput::make('start')
@@ -617,14 +638,14 @@ class GroupResource extends Resource implements CopilotResource
                         ->after(function () {
                             Notification::make()
                                 ->success()
-                                ->title(__('Channels Recounted'))
-                                ->body(__('The channels in the selected groups have been recounted sequentially.'))
+                                ->title(__('Channels Renumbered'))
+                                ->body(__('The channels in the selected groups have been renumbered sequentially.'))
                                 ->send();
                         })
                         ->deselectRecordsAfterCompletion()
                         ->requiresConfirmation()
                         ->modalIcon('heroicon-o-hashtag')
-                        ->modalDescription(__('Recount channels across the selected groups. Groups are processed by sort order, then name, then id, while channels in each group are processed by sort.')),
+                        ->modalDescription(__('Renumber channels across the selected groups. Groups are processed by sort order, then name, then id, while channels in each group are processed by sort.')),
                     BulkAction::make('find-replace')
                         ->label(__('Find & Replace'))
                         ->schema(fn () => FindReplaceService::getBulkActionSchema('groups'))
@@ -679,6 +700,7 @@ class GroupResource extends Resource implements CopilotResource
     {
         return [
             ChannelsRelationManager::class,
+            ChildGroupsRelationManager::class,
         ];
     }
 
@@ -701,7 +723,8 @@ class GroupResource extends Resource implements CopilotResource
                 ->inline(false)
                 ->label(__('Auto Enable New Channels'))
                 ->helperText(__('Automatically enable newly added channels to this group.'))
-                ->default(true),
+                ->default(true)
+                ->hidden(fn (?Group $record): bool => (bool) $record?->is_merged),
             Select::make('playlist_id')
                 ->required()
                 ->label(__('Playlist'))
@@ -727,7 +750,8 @@ class GroupResource extends Resource implements CopilotResource
                 ->searchable()
                 ->preload()
                 ->nullable()
-                ->placeholder(__('None — use standard dummy EPG')),
+                ->placeholder(__('None - use standard dummy EPG'))
+                ->hidden(fn (?Group $record): bool => (bool) $record?->is_merged),
         ];
 
         return [

@@ -9,6 +9,7 @@ use App\Models\Epg;
 use App\Models\PostProcess;
 use App\Models\PostProcessLog;
 use App\Settings\GeneralSettings;
+use App\Support\PrivateNetworkGuard;
 use Exception;
 use Filament\Notifications\Notification;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -168,6 +169,12 @@ class RunPostProcess implements ShouldQueue
                     Log::warning('RunPostProcess blocked SSRF attempt to private/reserved URL', ['url' => $url]);
                     throw new Exception("Webhook URL '{$url}' resolves to a private or reserved address and cannot be used.");
                 }
+
+                // Redirects get the same check as $url, otherwise a public
+                // host could 302 the webhook onto a private address.
+                $redirectOptions = config('proxy.allow_private_webhook_urls', false)
+                    ? []
+                    : PrivateNetworkGuard::redirectGuardOptions();
                 $jsonBody = (bool) ($metadata['json_body'] ?? false);
                 $noBody = (bool) ($metadata['no_body'] ?? false);
                 $queryVars = [];
@@ -198,7 +205,7 @@ class RunPostProcess implements ShouldQueue
                 if ($post && $noBody) {
                     // POST request without body (e.g., for triggering Emby/Jellyfin tasks)
                     // Use withBody with empty string to avoid Laravel sending []
-                    $response = Http::withHeaders($headers)
+                    $response = Http::withOptions($redirectOptions)->withHeaders($headers)
                         ->withBody('', 'text/plain')
                         ->post($url);
                 } elseif ($post && $jsonBody) {
@@ -207,23 +214,25 @@ class RunPostProcess implements ShouldQueue
                     $jsonContent = json_encode($queryVars);
 
                     // Make the request with raw JSON body
-                    $response = Http::withHeaders($headers)
+                    $response = Http::withOptions($redirectOptions)->withHeaders($headers)
                         ->withBody($jsonContent, 'application/json')
                         ->post($url);
                 } elseif ($post && ! empty($queryVars)) {
-                    // Send variables as form data or JSON based on jsonBody setting
-                    if ($jsonBody) {
-                        $headers['Content-Type'] = 'application/json';
-                    }
-                    $response = Http::withHeaders($headers)
+                    // $jsonBody is always false here (the $jsonBody branch above
+                    // already handles that case), so this always sends form data.
+                    // Laravel's HTTP client sends ->post() bodies as JSON by
+                    // default; asForm() is required to get form-data encoding.
+                    $response = Http::withOptions($redirectOptions)->withHeaders($headers)
+                        ->asForm()
                         ->post($url, $queryVars);
                 } elseif ($post) {
                     // POST request with empty variables (sends as form data)
-                    $response = Http::withHeaders($headers)
+                    $response = Http::withOptions($redirectOptions)->withHeaders($headers)
+                        ->asForm()
                         ->post($url, $queryVars);
                 } else {
                     // GET request with query parameters
-                    $response = Http::withHeaders($headers)->get($url, $queryVars);
+                    $response = Http::withOptions($redirectOptions)->withHeaders($headers)->get($url, $queryVars);
                 }
 
                 // If results ok, log the results
@@ -263,9 +272,22 @@ class RunPostProcess implements ShouldQueue
                         ->sendToDatabase($user);
                 }
             } else {
-                // If the metadata is not a URL, then we're running a script
-                $cmd = $metadata['path'];
-                $process = SymfonyProcess::fromShellCommandline($cmd);
+                // If the metadata is not a URL, then we're running a script.
+                // Scripts run as the worker's OS user, so only an admin may
+                // own one. Checked here, not just in the form, because records
+                // can be written without form validation (e.g. Copilot tools).
+                if (! $postProcess->user?->isAdmin()) {
+                    throw new Exception('Local scripts can only be run by post processes owned by an admin.');
+                }
+
+                $scriptPath = $metadata['path'];
+                if (! is_file($scriptPath)) {
+                    throw new Exception("Local script '{$scriptPath}' was not found.");
+                }
+
+                // Argument array, not a shell command line, so the path can
+                // never be interpreted as extra shell commands.
+                $process = new SymfonyProcess([$scriptPath]);
                 $process->setTimeout(60);
                 $exportVars = [];
                 $vars = $metadata['script_vars'] ?? [];
@@ -389,7 +411,7 @@ class RunPostProcess implements ShouldQueue
 
         $ip = gethostbyname($host);
 
-        return ! filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE);
+        return PrivateNetworkGuard::ipIsPrivate($ip);
     }
 
     /**
@@ -460,7 +482,7 @@ class RunPostProcess implements ShouldQueue
             'name' => $this->model->name,
             'url' => $this->model->url ?? null,
             'status' => $this->model->status?->value ?? $this->model->status,
-            'synctime' => $this->model->sync_time,
+            'time' => $this->model->sync_time,
             'added_groups' => $this->model->added_groups ?? null,
             'removed_groups' => $this->model->removed_groups ?? null,
             'added_channels' => $this->model->added_channels ?? null,

@@ -156,13 +156,9 @@
             >
                 {{-- Header --}}
                 <div class="flex items-center gap-2.5 border-b border-gray-200 bg-gray-50/80 px-4 py-3.5 dark:border-gray-700 dark:bg-white/5">
-                    <button
-                        wire:click="clearBrowse"
-                        class="inline-flex items-center gap-1.5 rounded-md border border-gray-200 bg-gray-100 px-2.5 py-1.5 text-xs font-medium text-gray-600 transition-colors hover:bg-gray-200 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700"
-                    >
-                        <x-heroicon-o-arrow-left class="h-3.5 w-3.5" />
+                    <x-filament::button wire:click="clearBrowse" color="gray" size="xs" icon="heroicon-o-arrow-left">
                         {{ __('All Genres') }}
-                    </button>
+                    </x-filament::button>
                     <span class="h-4 w-px bg-gray-200 dark:bg-gray-700"></span>
                     <h3 class="flex-1 text-sm font-semibold text-gray-900 dark:text-gray-100">
                         {{ $browseName }}
@@ -256,7 +252,7 @@
                                         placeholder="{{ __('From') }}"
                                         class="focus:border-primary-500 focus:ring-primary-500 w-full rounded-md border border-gray-300 bg-white px-2.5 py-1.5 text-xs text-gray-900 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
                                     />
-                                    <span class="flex-shrink-0 text-xs text-gray-400">—</span>
+                                    <span class="flex-shrink-0 text-xs text-gray-400">-</span>
                                     <input
                                         type="number"
                                         wire:model="yearTo"
@@ -314,7 +310,7 @@
                                         placeholder="{{ __('Min') }}"
                                         class="focus:border-primary-500 focus:ring-primary-500 w-full rounded-md border border-gray-300 bg-white px-2.5 py-1.5 text-xs text-gray-900 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
                                     />
-                                    <span class="flex-shrink-0 text-xs text-gray-400">—</span>
+                                    <span class="flex-shrink-0 text-xs text-gray-400">-</span>
                                     <input
                                         type="number"
                                         wire:model="maxRuntime"

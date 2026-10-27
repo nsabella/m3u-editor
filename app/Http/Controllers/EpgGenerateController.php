@@ -3,7 +3,6 @@
 namespace App\Http\Controllers;
 
 use App\Enums\ChannelLogoType;
-use App\Enums\PlaylistChannelId;
 use App\Facades\PlaylistFacade;
 use App\Models\AedProfile;
 use App\Models\CustomPlaylist;
@@ -13,9 +12,11 @@ use App\Models\Network;
 use App\Models\Playlist;
 use App\Models\PlaylistAlias;
 use App\Services\AedExtractorService;
+use App\Services\ChannelNumberSequence;
 use App\Services\EpgCacheService;
 use App\Services\EpisodeNumberNormalizer;
 use App\Services\NetworkEpgService;
+use App\Support\EpgProgrammeArtwork;
 use Carbon\Carbon;
 use DOMDocument;
 use DOMElement;
@@ -42,6 +43,15 @@ class EpgGenerateController extends Controller
         return htmlspecialchars((string) $value, ENT_XML1 | ENT_QUOTES, 'UTF-8');
     }
 
+    private function outputDisabledResponse(bool $outputEnabled)
+    {
+        if ($outputEnabled) {
+            return null;
+        }
+
+        return response()->json(['Error' => 'Output disabled'], 403);
+    }
+
     /**
      * Generate the EPG XML file
      *
@@ -58,6 +68,11 @@ class EpgGenerateController extends Controller
         // Handle network playlists - generate EPG from networks
         if ($playlist instanceof Playlist && $playlist->is_network_playlist) {
             return $this->generateNetworkPlaylistEpg($playlist);
+        }
+
+        // Ensure XMLTV output is enabled
+        if ($response = $this->outputDisabledResponse($playlist->xmltv_enabled)) {
+            return $response;
         }
 
         // Check if we have a valid cached file
@@ -80,6 +95,11 @@ class EpgGenerateController extends Controller
         $playlist = PlaylistFacade::resolvePlaylistByUuid($uuid);
         if (! $playlist) {
             return response()->json(['Error' => 'Playlist Not Found'], 404);
+        }
+
+        // Ensure XMLTV output is enabled
+        if ($response = $this->outputDisabledResponse($playlist->xmltv_enabled)) {
+            return $response;
         }
 
         // Check if we have a valid cached file
@@ -117,7 +137,7 @@ class EpgGenerateController extends Controller
             ->all();
 
         // Get playlist settings
-        $channelNumber = $playlist->auto_channel_increment ? $playlist->channel_start - 1 : 0;
+        $numberSequence = new ChannelNumberSequence($playlist);
         $idChannelBy = $playlist->id_channel_by;
         $dummyEpgEnabled = $playlist->dummy_epg;
         $dummyEpgLength = (int) ($playlist->dummy_epg_length ?? 120); // Default to 120 minutes if not set
@@ -144,31 +164,10 @@ class EpgGenerateController extends Controller
             }
 
             // Get/set the channel number (use pivot channel_number for custom playlists)
-            $channelNo = ($isCustomContext && ! empty($channel->pivot?->channel_number))
-                ? (int) $channel->pivot->channel_number
-                : $channel->channel;
-            if (! $channelNo && ($playlist->auto_channel_increment || $idChannelBy === PlaylistChannelId::Number)) {
-                $channelNo = ++$channelNumber;
-            }
+            $channelNo = $numberSequence->next($channel->resolveChannelNumber($isCustomContext));
 
             // Get the `tvg-id` based on the playlist setting
-            switch ($idChannelBy) {
-                case PlaylistChannelId::ChannelId:
-                    $tvgId = $channel->id;
-                    break;
-                case PlaylistChannelId::Number:
-                    $tvgId = $channelNo;
-                    break;
-                case PlaylistChannelId::Name:
-                    $tvgId = $channel->name_custom ?? $channel->name;
-                    break;
-                case PlaylistChannelId::Title:
-                    $tvgId = $channel->title_custom ?? $channel->title;
-                    break;
-                default:
-                    $tvgId = $channel->stream_id_custom ?? $channel->source_id ?? $channel->stream_id;
-                    break;
-            }
+            $tvgId = $channel->resolveTvgId($idChannelBy, $channelNo);
 
             // Ultimate last resort
             if (empty($tvgId)) {
@@ -230,7 +229,7 @@ class EpgGenerateController extends Controller
                     echo PHP_EOL.'    <icon src="'.$this->escapeXml($icon).'"/>';
                 }
                 echo PHP_EOL.'  </channel>'.PHP_EOL;
-            } elseif ($dummyEpgEnabled) {
+            } elseif ($dummyEpgEnabled || $aedProfileId) {
                 // Get the icon
                 $icon = $channel->logo ?? $channel->logo_internal ?? '';
                 if (empty($icon)) {
@@ -349,6 +348,8 @@ class EpgGenerateController extends Controller
                         }
 
                         foreach ($programmes as $programme) {
+                            // Artwork doesn't depend on the mapped channel, so build it once.
+                            $artworkXml = $this->programmeArtworkXml($programme, $epg, $logoProxyEnabled);
                             foreach ($channelMapping[$channelId] as $mappedData) {
                                 $mappedChannelId = $mappedData['tvg_id'];
                                 $tvgShift = $mappedData['tvg_shift'];
@@ -384,42 +385,20 @@ class EpgGenerateController extends Controller
                                 if ($programme['category']) {
                                     $progXml .= '    <category>'.$this->escapeXml($programme['category']).'</category>'.PHP_EOL;
                                 }
+                                $progXml .= $artworkXml['icons'];
                                 foreach (EpisodeNumberNormalizer::forProgramme($programme) as $episodeNumber) {
                                     $systemAttribute = ($episodeNumber['system'] !== null && $episodeNumber['system'] !== '')
                                         ? ' system="'.$this->escapeXml($episodeNumber['system']).'"'
                                         : '';
                                     $progXml .= '    <episode-num'.$systemAttribute.'>'.$this->escapeXml($episodeNumber['value']).'</episode-num>'.PHP_EOL;
                                 }
-                                if ($programme['icon']) {
-                                    $icon = $logoProxyEnabled
-                                        ? LogoProxyController::generateProxyUrl($programme['icon'])
-                                        : $programme['icon'];
-                                    $progXml .= '    <icon src="'.$this->escapeXml($icon).'"/>'.PHP_EOL;
-                                }
-                                // Program artwork images (NEW)
-                                if (! empty($programme['images'] ?? null) && is_array($programme['images'])) {
-                                    foreach ($programme['images'] as $image) {
-                                        $rawUrl = $image['url'] ?? '';
-                                        $proxiedUrl = $logoProxyEnabled && $rawUrl
-                                            ? LogoProxyController::generateProxyUrl($rawUrl)
-                                            : $rawUrl;
-
-                                        $url = $this->escapeXml($proxiedUrl);
-                                        $type = $this->escapeXml($image['type']);
-                                        $width = $this->escapeXml($image['width']);
-                                        $height = $this->escapeXml($image['height']);
-                                        $orient = $this->escapeXml($image['orient']);
-                                        $size = $this->escapeXml($image['size']);
-
-                                        $progXml .= "    <icon src=\"{$url}\" type=\"{$type}\" width=\"{$width}\" height=\"{$height}\" orient=\"{$orient}\" size=\"{$size}\" />\n";
-                                    }
+                                if (! empty($programme['new']) && $programme['new']) {
+                                    $progXml .= '    <new />'.PHP_EOL;
                                 }
                                 if ($programme['rating']) {
                                     $progXml .= '    <rating><value>'.$this->escapeXml($programme['rating']).'</value></rating>'.PHP_EOL;
                                 }
-                                if (! empty($programme['new']) && $programme['new']) {
-                                    $progXml .= '    <new />'.PHP_EOL;
-                                }
+                                $progXml .= $artworkXml['images'];
 
                                 $progXml .= '  </programme>'.PHP_EOL;
                                 echo $progXml;
@@ -444,8 +423,9 @@ class EpgGenerateController extends Controller
         if (count($dummyEpgChannels) > 0) {
             // Pre-calculate standard repeating time slots once (used for non-AED channels)
             $timeSlots = [];
+            $dummyEpgDays = (int) ($playlist->dummy_epg_days ?? 5);
             $startTime = Carbon::now()->startOf('day')->subMinutes($dummyEpgLength);
-            $iterations = (int) ((5 * 24 * 60) / $dummyEpgLength);
+            $iterations = (int) (($dummyEpgDays * 24 * 60) / $dummyEpgLength);
 
             for ($i = 0; $i < $iterations; $i++) {
                 $startTime->addMinutes($dummyEpgLength);
@@ -481,6 +461,12 @@ class EpgGenerateController extends Controller
                     $aedEvent = $aedExtractor->extract($aedProfile, $rawTitle)
                         ?? $aedExtractor->fallback($aedProfile, $rawTitle);
 
+                    // No event found and no-event fallback is disabled: emit nothing for this channel
+                    // ($buffer is still empty here, so there is nothing to flush)
+                    if ($aedEvent === null) {
+                        continue;
+                    }
+
                     $aedIcon = $aedProfile->logo_url
                         ? $this->escapeXml($aedProfile->logo_url)
                         : null;
@@ -496,7 +482,7 @@ class EpgGenerateController extends Controller
 
                         $slotMinutes = $aedProfile->event_duration_minutes;
                         $windowStart = Carbon::now()->startOfDay();
-                        $windowEnd = Carbon::now()->startOfDay()->addDays(5);
+                        $windowEnd = Carbon::now()->startOfDay()->addDays($aedProfile->dummy_epg_days ?? $playlist->dummy_epg_days ?? 5);
                         $postTitle = $aedExtractor->postEventTitle($aedProfile, $rawTitle, $aedEvent);
                         $postTitleEscaped = $postTitle !== null ? $this->escapeXml($postTitle) : null;
 
@@ -515,12 +501,14 @@ class EpgGenerateController extends Controller
                             $buffer .= '  </programme>'.PHP_EOL;
                         };
 
-                        // Pre-event fill: window start → event start (skipped when pre_event_format is null)
+                        // Pre-event fill: window start → event start, capped at the window end so a
+                        // far-off event can't generate months of padding (skipped when pre_event_format is null)
+                        $preEventEnd = $aedEvent->start->lt($windowEnd) ? $aedEvent->start : $windowEnd;
                         $cursor = $windowStart->copy();
-                        while ($cursor->lt($aedEvent->start)) {
+                        while ($cursor->lt($preEventEnd)) {
                             $slotEnd = $cursor->copy()->addMinutes($slotMinutes);
-                            if ($slotEnd->gt($aedEvent->start)) {
-                                $slotEnd = $aedEvent->start->copy();
+                            if ($slotEnd->gt($preEventEnd)) {
+                                $slotEnd = $preEventEnd->copy();
                             }
                             $preTitle = $aedExtractor->preEventTitle($aedProfile, $rawTitle, $aedEvent, $cursor);
                             if ($preTitle !== null) {
@@ -529,19 +517,21 @@ class EpgGenerateController extends Controller
                             $cursor = $slotEnd;
                         }
 
-                        // The event itself
-                        $start = str_replace(':', '', $aedEvent->start->format('YmdHis P'));
-                        $stop = str_replace(':', '', $aedEvent->end->format('YmdHis P'));
-                        $buffer .= '  <programme channel="'.$tvgId.'" start="'.$start.'" stop="'.$stop.'">'.PHP_EOL;
-                        $buffer .= '    <title>'.$aedTitle.'</title>'.PHP_EOL;
-                        if ($aedIcon) {
-                            $buffer .= '    <icon src="'.$aedIcon.'"/>'.PHP_EOL;
+                        // The event itself (only when it starts inside the window)
+                        if ($aedEvent->start->lt($windowEnd)) {
+                            $start = str_replace(':', '', $aedEvent->start->format('YmdHis P'));
+                            $stop = str_replace(':', '', $aedEvent->end->format('YmdHis P'));
+                            $buffer .= '  <programme channel="'.$tvgId.'" start="'.$start.'" stop="'.$stop.'">'.PHP_EOL;
+                            $buffer .= '    <title>'.$aedTitle.'</title>'.PHP_EOL;
+                            if ($aedIcon) {
+                                $buffer .= '    <icon src="'.$aedIcon.'"/>'.PHP_EOL;
+                            }
+                            $buffer .= '    <desc>'.$aedDesc.'</desc>'.PHP_EOL;
+                            if ($aedCategory) {
+                                $buffer .= '    <category lang="en">'.$aedCategory.'</category>'.PHP_EOL;
+                            }
+                            $buffer .= '  </programme>'.PHP_EOL;
                         }
-                        $buffer .= '    <desc>'.$aedDesc.'</desc>'.PHP_EOL;
-                        if ($aedCategory) {
-                            $buffer .= '    <category lang="en">'.$aedCategory.'</category>'.PHP_EOL;
-                        }
-                        $buffer .= '  </programme>'.PHP_EOL;
 
                         // Post-event fill: event end → window end (skipped when post_event_format is null)
                         if ($postTitleEscaped !== null) {
@@ -562,8 +552,9 @@ class EpgGenerateController extends Controller
                             ? $this->escapeXml($aedEvent->description)
                             : $aedTitle;
                         $aedSlotLength = $aedProfile->event_duration_minutes;
+                        $aedDays = (int) ($aedProfile->dummy_epg_days ?? $playlist->dummy_epg_days ?? 5);
                         $aedStart = Carbon::now()->startOf('day')->subMinutes($aedSlotLength);
-                        $aedIterations = (int) ((5 * 24 * 60) / $aedSlotLength);
+                        $aedIterations = (int) (($aedDays * 24 * 60) / $aedSlotLength);
 
                         for ($i = 0; $i < $aedIterations; $i++) {
                             $aedStart->addMinutes($aedSlotLength);
@@ -702,28 +693,10 @@ class EpgGenerateController extends Controller
         $filename = Str::slug($playlist->name).($compressed ? '.xml.gz' : '.xml');
         $contentType = $compressed ? 'application/gzip' : 'application/xml';
 
-        if ($compressed) {
-            // For compressed, keep existing behaviour (generate then compress)
-            // NOTE: streaming gzip on-the-fly is more complex; keep as-is for safety
-            ob_start();
-            $this->generate($playlist);
-            $content = ob_get_clean();
-            $compressedContent = gzencode($content, 9);
-
-            // Save to cache
-            $disk->put($cacheFilePath, $compressedContent);
-
-            return response($compressedContent, 200, [
-                'Access-Control-Allow-Origin' => '*',
-                'Cache-Control' => 'no-store, no-cache, must-revalidate',
-                'Content-Disposition' => "attachment; filename=\"$filename\"",
-                'Content-Type' => $contentType,
-                'X-EPG-Cache' => 'MISS',
-            ]);
-        }
-
-        // For regular XML, stream generation directly to the client and write cache incrementally
-        return response()->stream(function () use ($playlist, $disk, $cacheFilePath) {
+        // Stream generation directly to the client and write the cache incrementally.
+        // The compressed variant gzips each chunk on the fly, so neither path ever
+        // holds the whole document (which can run to gigabytes) in memory.
+        return response()->stream(function () use ($playlist, $disk, $cacheFilePath, $compressed) {
             // Resolve full path for cache and ensure directory exists
             $fullPath = $disk->path($cacheFilePath);
             $dir = dirname($fullPath);
@@ -761,22 +734,31 @@ class EpgGenerateController extends Controller
             };
             register_shutdown_function($cleanupShutdown);
 
+            // If the cache can't be written, still stream (and compress) to the client
             $fh = @fopen($tmpPath, 'w');
-            if ($fh === false) {
-                // Fallback: if we can't write cache, just stream without caching
-                $this->generate($playlist);
 
-                return;
-            }
+            // Incremental gzip context; the final chunk (with the gzip trailer) is
+            // emitted when the output buffer is closed.
+            $deflate = $compressed ? deflate_init(ZLIB_ENCODING_GZIP, ['level' => 6]) : null;
 
-            // Start an output buffer with a callback that writes each flushed chunk to cache
-            ob_start(function ($buffer) use ($fh) {
-                // Write chunk to cache file
-                @fwrite($fh, $buffer);
+            // Start an output buffer with a callback that compresses (if needed) each
+            // flushed chunk, writes it to the cache file and passes it to the client
+            $outerBufferLevel = ob_get_level();
+            ob_start(function (string $buffer, int $phase) use (&$fh, $deflate) {
+                if ($deflate !== null) {
+                    $isFinal = (bool) ($phase & PHP_OUTPUT_HANDLER_FINAL);
+                    $buffer = deflate_add($deflate, $buffer, $isFinal ? ZLIB_FINISH : ZLIB_NO_FLUSH);
+                }
+
+                // Guard: the handle is closed in `finally`, but a buffer left open by a
+                // failed generation is only flushed (and calls back here) afterwards
+                if (is_resource($fh)) {
+                    @fwrite($fh, $buffer);
+                }
 
                 // Return buffer so it is sent to the client
                 return $buffer;
-            }, 4096);
+            }, 65536);
 
             try {
                 // Generate will echo directly; each echo will be passed through the ob callback
@@ -785,8 +767,9 @@ class EpgGenerateController extends Controller
                 // Mark completed only after successful generation
                 $completed = true;
 
-                // Flush any remaining buffers
-                while (ob_get_level() > 0) {
+                // Flush our buffer (and anything generate() left open above it) so the
+                // final gzip chunk is written before the cache file is closed
+                while (ob_get_level() > $outerBufferLevel) {
                     ob_end_flush();
                 }
             } finally {
@@ -794,12 +777,10 @@ class EpgGenerateController extends Controller
                 if (is_resource($fh)) {
                     fclose($fh);
                 }
-                if ($completed) {
+                if ($completed && $fh !== false) {
                     @rename($tmpPath, $fullPath);
-                } else {
-                    if (file_exists($tmpPath)) {
-                        @unlink($tmpPath);
-                    }
+                } elseif (file_exists($tmpPath)) {
+                    @unlink($tmpPath);
                 }
             }
         }, 200, [
@@ -809,33 +790,6 @@ class EpgGenerateController extends Controller
             'Content-Type' => $contentType,
             'X-EPG-Cache' => 'MISS',
         ]);
-    }
-
-    /**
-     * Gzip the file
-     *
-     * @param  string  $filename
-     * @param  string  $disk
-     * @param  bool  $delete_original
-     * @return bool
-     */
-    private function gzip($filename, $disk = 'local', $delete_original = false)
-    {
-        $disk = Storage::disk($disk);
-        $data = $disk->get($filename);
-        $out_file = "$filename.gz";
-
-        $gzdata = gzencode($data, 9);
-        $disk->put($out_file, $gzdata);
-        $fp = fopen($disk->path($out_file), 'w');
-        $result = fwrite($fp, $gzdata);
-        fclose($fp);
-
-        if ($result && $delete_original) {
-            $disk->delete($filename);
-        }
-
-        return $result > 0;
     }
 
     /**
@@ -861,6 +815,128 @@ class EpgGenerateController extends Controller
     }
 
     /**
+     * Determine whether an artwork URL is the current EPG's first-party
+     * Schedules Direct image proxy route.
+     *
+     * Matched on path shape alone (not host/scheme/port): the cached URL is
+     * built by SchedulesDirectService::buildImageUrl() during the queued
+     * import job, while this is evaluated during a live HTTP request, and
+     * those two contexts can legitimately resolve the app's base URL
+     * differently (e.g. APP_URL vs. the request's actual Host header).
+     * The epg-scoped uuid in the path already makes the match unambiguous.
+     */
+    private function isSchedulesDirectImageUrl(string $url, Epg $epg): bool
+    {
+        if (! $epg->isSchedulesDirect()) {
+            return false;
+        }
+
+        $parts = parse_url($url);
+
+        if ($parts === false
+            || isset($parts['user']) || isset($parts['pass'])
+            || isset($parts['query']) || isset($parts['fragment'])
+            || ! isset($parts['path'])) {
+            return false;
+        }
+
+        $pattern = '#/schedules-direct/'.preg_quote($epg->uuid, '#').'/image/([A-Za-z0-9._-]+)$#D';
+
+        if (preg_match($pattern, $parts['path'], $matches) !== 1) {
+            return false;
+        }
+
+        return ! in_array($matches[1], ['.', '..'], true);
+    }
+
+    /**
+     * A programme's XMLTV artwork: the plain <icon> list (placed before
+     * <episode-num>) and the role-qualified <image> list (placed last), per
+     * the XMLTV DTD element order.
+     *
+     * @param  array<string, mixed>  $programme
+     * @return array{icons: string, images: string}
+     */
+    private function programmeArtworkXml(array $programme, Epg $epg, bool $logoProxyEnabled): array
+    {
+        $icons = '';
+        $roleImages = '';
+        $images = is_array($programme['images'] ?? null) ? $programme['images'] : [];
+        if ($programme['icon']) {
+            $icons .= '    <icon src="'.$this->escapeXml($this->programmeImageUrl($programme['icon'], $epg, $logoProxyEnabled)).'"/>'.PHP_EOL;
+        }
+        foreach ($images as $image) {
+            $rawUrl = trim((string) ($image['url'] ?? ''));
+            if ($rawUrl === '') {
+                continue;
+            }
+            $width = (int) ($image['width'] ?? 0);
+            $height = (int) ($image['height'] ?? 0);
+            $dimensions = $width > 0 && $height > 0 ? ' width="'.$width.'" height="'.$height.'"' : '';
+            $icons .= '    <icon src="'.$this->escapeXml($this->programmeImageUrl($rawUrl, $epg, $logoProxyEnabled)).'"'.$dimensions.'/>'.PHP_EOL;
+        }
+        foreach ($this->programmeRoleImages($images) as $image) {
+            $attributes = ' type="'.$image['type'].'"';
+            if ($image['size'] !== null) {
+                $attributes .= ' size="'.$image['size'].'"';
+            }
+            if ($image['orient'] !== null) {
+                $attributes .= ' orient="'.$image['orient'].'"';
+            }
+            $roleImages .= '    <image'.$attributes.'>'.$this->escapeXml($this->programmeImageUrl($image['url'], $epg, $logoProxyEnabled)).'</image>'.PHP_EOL;
+        }
+
+        return ['icons' => $icons, 'images' => $roleImages];
+    }
+
+    /**
+     * Route programme artwork through the logo proxy when enabled, except
+     * first-party Schedules Direct images that are already served locally.
+     */
+    private function programmeImageUrl(string $url, Epg $epg, bool $logoProxyEnabled): string
+    {
+        return $logoProxyEnabled && ! $this->isSchedulesDirectImageUrl($url, $epg)
+            ? LogoProxyController::generateProxyUrl($url)
+            : $url;
+    }
+
+    /**
+     * Role-qualified XMLTV <image> entries: the portrait poster and the
+     * landscape backdrop picked by {@see EpgProgrammeArtwork}, plus any
+     * still/person/character artwork as declared. Emitted in addition to
+     * the plain <icon> list so legacy consumers keep working.
+     *
+     * @param  array<int, mixed>  $images
+     * @return list<array{url: string, type: string, size: int|null, orient: string|null}>
+     */
+    private function programmeRoleImages(array $images): array
+    {
+        $roleImages = [];
+        $add = function (?array $image, string $type) use (&$roleImages): void {
+            $url = trim((string) ($image['url'] ?? ''));
+            if ($image === null || $url === '' || isset($roleImages[$url.'|'.$type])) {
+                return;
+            }
+            $roleImages[$url.'|'.$type] = [
+                'url' => $url,
+                'type' => $type,
+                'size' => EpgProgrammeArtwork::size($image),
+                'orient' => EpgProgrammeArtwork::orientation($image),
+            ];
+        };
+
+        $add(EpgProgrammeArtwork::poster($images), 'poster');
+        $add(EpgProgrammeArtwork::backdrop($images), 'backdrop');
+        foreach ($images as $image) {
+            if (is_array($image) && in_array(EpgProgrammeArtwork::type($image), ['still', 'person', 'character'], true)) {
+                $add($image, EpgProgrammeArtwork::type($image));
+            }
+        }
+
+        return array_values($roleImages);
+    }
+
+    /**
      * Process EPG using XMLReader (fallback method)
      *
      * @param  Epg  $epg
@@ -871,6 +947,7 @@ class EpgGenerateController extends Controller
     {
         // Get the content
         $filePath = null;
+        $error = null;
         if ($epg->url && str_starts_with($epg->url, 'http')) {
             $localPath = Storage::disk('local')->path($epg->file_path);
             if (! file_exists($localPath)) {
@@ -883,11 +960,19 @@ class EpgGenerateController extends Controller
             $filePath = Storage::disk('local')->path($epg->uploads);
         } elseif ($epg->url) {
             $filePath = $epg->url;
+        } elseif ($epg->isSchedulesDirect()) {
+            $localPath = Storage::disk('local')->path($epg->file_path);
+            if (file_exists($localPath)) {
+                $filePath = $localPath;
+            } else {
+                Log::warning("SchedulesDirect EPG source file not found on disk for EPG \"{$epg->name}\": {$localPath}");
+                $error = 'SchedulesDirect EPG source file is missing from local storage. Please sync the EPG and try again.';
+            }
         }
 
         if (! $filePath) {
             // Send notification
-            $error = 'Invalid EPG file. Unable to read or download an associated EPG file. Please check the URL or uploaded file and try again.';
+            $error ??= 'Invalid EPG file. Unable to read or download an associated EPG file. Please check the URL or uploaded file and try again.';
             Notification::make()
                 ->danger()
                 ->title("Error generating epg data for playlist \"{$playlist->name}\" using EPG \"{$epg->name}\"")
@@ -910,6 +995,11 @@ class EpgGenerateController extends Controller
             return;
         }
 
+        // Binary hashes of programmes already emitted, so a feed repeating the
+        // exact same <programme> (matching the cache build's dedupe) is only
+        // output once per mapped channel. Only mapped programmes are tracked.
+        $seenProgrammes = [];
+
         // Loop through the XML data
         while (@$programReader->read()) {
             // Only consider XML elements and programme nodes
@@ -925,11 +1015,19 @@ class EpgGenerateController extends Controller
                 if (! count($filtered)) {
                     continue;
                 }
+
+                $programmeXml = $programReader->readOuterXML();
+                $programmeHash = md5($programmeXml, true);
+                if (isset($seenProgrammes[$programmeHash])) {
+                    continue;
+                }
+                $seenProgrammes[$programmeHash] = true;
+
                 // Channel program found, output the <programme> tag
                 // First, we need to make sure the channel is correct
                 // Replace `channel="<channel_id>"` with `channel="<stream_id>"`
                 $itemDom = new DOMDocument;
-                $itemDom->loadXML($programReader->readOuterXML());
+                $itemDom->loadXML($programmeXml);
 
                 // Get the item element
                 $item = $itemDom->documentElement;

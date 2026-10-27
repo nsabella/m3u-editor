@@ -7,10 +7,12 @@ use App\Facades\SortFacade;
 use App\Filament\Actions\AssetPickerAction;
 use App\Filament\Actions\BulkModalActionGroup;
 use App\Filament\Actions\RegexTesterAction;
+use App\Filament\Clusters\Settings\Pages\ManageSyncSettings;
 use App\Filament\Concerns\HasCopilotSupport;
 use App\Filament\Resources\VodResource\Pages;
 use App\Filament\Resources\Vods\Pages\ListVod;
 use App\Filament\Resources\Vods\Pages\ViewVod;
+use App\Filament\Tables\CacheStateColumn;
 use App\Filament\Tables\ProbeStatusColumn;
 use App\Forms\Components\TmdbSearchResults;
 use App\Jobs\ChannelFindAndReplace;
@@ -19,6 +21,7 @@ use App\Jobs\FetchTmdbIds;
 use App\Jobs\ProbeStreamsChunk;
 use App\Jobs\ProbeStreamsComplete;
 use App\Jobs\ProcessVodChannels;
+use App\Jobs\QueueCachedContentDownloads;
 use App\Jobs\SyncPlexDvrJob;
 use App\Jobs\SyncVodStrmFiles;
 use App\Models\Channel;
@@ -28,6 +31,7 @@ use App\Models\Group;
 use App\Models\Playlist;
 use App\Models\StreamProfile;
 use App\Rules\CheckIfUrlOrLocalPath;
+use App\Services\CachedContentDispatchService;
 use App\Services\DateFormatService;
 use App\Services\LogoCacheService;
 use App\Services\PlaylistService;
@@ -167,9 +171,10 @@ class VodResource extends Resource implements CopilotResource
             ->modifyQueryUsing(function (Builder $query) {
                 $query->with([
                     'epgChannel' => fn ($q) => $q->select('id', 'name', 'icon', 'icon_custom'),
-                    'playlist' => fn ($q) => $q->select('id', 'name', 'uuid', 'auto_sort', 'enable_proxy', 'user_id')
+                    // prefer_media_server_sources: the Cached column reads it.
+                    'playlist' => fn ($q) => $q->select('id', 'name', 'uuid', 'auto_sort', 'enable_proxy', 'enable_logo_proxy', 'user_id', 'prefer_media_server_sources')
                         ->with(['user' => fn ($uq) => $uq->select('id', 'is_admin', 'permissions')]),
-                    'customPlaylist' => fn ($q) => $q->select('id', 'name', 'uuid', 'enable_proxy', 'user_id')
+                    'customPlaylist' => fn ($q) => $q->select('id', 'name', 'uuid', 'enable_proxy', 'enable_logo_proxy', 'user_id')
                         ->with(['user' => fn ($uq) => $uq->select('id', 'is_admin', 'permissions')]),
                     'streamProfile' => fn ($q) => $q->select('id', 'name'),
                 ])
@@ -186,7 +191,7 @@ class VodResource extends Resource implements CopilotResource
             ->toolbarActions(self::getTableBulkActions());
     }
 
-    public static function getTableColumns($showGroup = true, $showPlaylist = true): array
+    public static function getTableColumns($showGroup = true, $showPlaylist = true, $minimal = false): array
     {
         return [
             ImageColumn::make('logo')
@@ -206,10 +211,10 @@ class VodResource extends Resource implements CopilotResource
                 })
                 ->getStateUsing(function ($record) {
                     $info = $record->info;
-                    $title = $record->title_custom ?: $record->title;
+                    $title = e($record->title_custom ?: $record->title, false);
                     $html = "<span class='fi-ta-text-item-label whitespace-normal text-sm leading-6 text-gray-950 dark:text-white'>{$title}</span>";
                     if (is_array($info)) {
-                        $description = Str::limit($info['description'] ?? $info['plot'] ?? '', 200);
+                        $description = e(Str::limit($info['description'] ?? $info['plot'] ?? '', 200), false);
                         if (! empty($description)) {
                             $html .= "<p class='text-sm text-gray-500 dark:text-gray-400 whitespace-normal mt-2'>{$description}</p>";
                         }
@@ -241,11 +246,14 @@ class VodResource extends Resource implements CopilotResource
                 ->counts('failovers')
                 ->badge()
                 ->toggleable()
-                ->sortable(),
+                ->sortable()
+                ->hidden($minimal),
             IconColumn::make('has_metadata')
                 ->label(__('Metadata'))
                 ->icon(fn ($record): string => $record->has_metadata ? 'heroicon-o-check-circle' : 'heroicon-o-minus')
                 ->color(fn ($record): string => $record->has_metadata ? 'success' : 'gray'),
+            CacheStateColumn::make(),
+            CacheStateColumn::radarrManaged(),
             ToggleColumn::make('probe_enabled')
                 ->label(__('Probe Enabled'))
                 ->disabled(fn (Channel $record): bool => (bool) $record->aio_integration_id)
@@ -327,12 +335,13 @@ class VodResource extends Resource implements CopilotResource
                 })
                 ->toggleable(),
             TextInputColumn::make('channel')
-                ->rules(['numeric', 'min:0'])
+                ->rules(['nullable', 'integer', 'min:0'])
                 ->type('number')
                 ->placeholder(__('Channel No.'))
                 ->toggleable()
                 ->sortable(),
             TextInputColumn::make('url_custom')
+                ->extraInputAttributes(['class' => 'privacy-sensitive'])
                 ->label(__('URL'))
                 ->rules(['url'])
                 ->type('url')
@@ -413,6 +422,7 @@ class VodResource extends Resource implements CopilotResource
                 })
                 ->toggleable(isToggledHiddenByDefault: true),
             TextColumn::make('url')
+                ->extraAttributes(['class' => 'privacy-sensitive'])
                 ->label(__('Default URL'))
                 ->sortable()
                 ->searchable(query: function (Builder $query, string $search): Builder {
@@ -508,17 +518,73 @@ class VodResource extends Resource implements CopilotResource
         ];
     }
 
+    public static function getCacheNowAction(): Action
+    {
+        return Action::make('cache_now')
+            ->label(__('Cache Now'))
+            ->icon('heroicon-o-arrow-down-tray')
+            ->color('gray')
+            ->visible(function (Channel $record): bool {
+                $service = app(CachedContentDispatchService::class);
+
+                return $service->isEnabled() && $service->canCache($record);
+            })
+            ->requiresConfirmation()
+            ->modalHeading(__('Cache this VOD?'))
+            ->modalDescription(fn (Channel $record): string => __('Dispatch a background job to download ":title" to local storage for offline playback, or add it to Radarr if Radarr is set up for caching.', ['title' => $record->display_title]))
+            ->modalSubmitActionLabel(__('Cache now'))
+            ->action(function (Channel $record): void {
+                $result = app(CachedContentDispatchService::class)->dispatch($record);
+                CachedContentDispatchService::cacheNowNotification($record, $result)->send();
+            });
+    }
+
+    /**
+     * Bulk variant of `getCacheNowAction()`. The selection is queued from a
+     * background job (see `QueueCachedContentDownloads`), which sends one
+     * summary notification when it finishes.
+     */
+    public static function getCacheNowBulkAction(): BulkAction
+    {
+        return BulkAction::make('cache_now')
+            ->label(__('Cache Now'))
+            ->icon('heroicon-o-arrow-down-tray')
+            ->color('gray')
+            ->visible(fn (): bool => app(CachedContentDispatchService::class)->isEnabled())
+            ->requiresConfirmation()
+            ->modalIcon('heroicon-o-arrow-down-tray')
+            ->modalHeading(__('Cache selected VODs?'))
+            ->modalDescription(__('Queue background downloads of every selected VOD to local storage, or add them to Radarr if Radarr is set up for caching. VODs that are already cached, queued, or have no cacheable source URL are skipped.'))
+            ->modalSubmitActionLabel(__('Cache now'))
+            ->action(function (Collection $records): void {
+                QueueCachedContentDownloads::dispatch('vod', $records->modelKeys(), auth()->id());
+            })->after(function () {
+                Notification::make()
+                    ->success()
+                    ->title(__('Caching started'))
+                    ->body(__('Cache downloads are being queued in the background. You will be notified once the process is complete.'))
+                    ->send();
+            })
+            ->deselectRecordsAfterCompletion();
+    }
+
     public static function getTableActions(): array
     {
         return [
             ActionGroup::make([
                 Action::make('fetch_tmdb_ids')
-                    ->label(__('Fetch TMDB/TVDB IDs'))
+                    ->label(__('Fetch TMDB Metadata'))
                     ->icon('heroicon-o-film')
                     ->modalIcon('heroicon-o-film')
-                    ->modalDescription(__('Fetch TMDB, TVDB, and IMDB IDs for this series from The Movie Database.'))
-                    ->modalSubmitActionLabel(__('Fetch IDs now'))
-                    ->action(function ($record) {
+                    ->modalDescription(__('Fetch full metadata (plot, artwork, cast, genres, episodes) plus TMDB, TVDB and IMDB IDs for this title from The Movie Database.'))
+                    ->modalSubmitActionLabel(__('Fetch metadata now'))
+                    ->schema([
+                        Toggle::make('overwrite_existing')
+                            ->label(__('Overwrite Existing Metadata'))
+                            ->helperText(__('Overwrite existing TMDB metadata? If disabled, only items missing metadata are fetched.'))
+                            ->default(false),
+                    ])
+                    ->action(function ($record, array $data) {
                         $settings = app(GeneralSettings::class);
                         if (empty($settings->tmdb_api_key)) {
                             Notification::make()
@@ -534,14 +600,14 @@ class VodResource extends Resource implements CopilotResource
                         app('Illuminate\Contracts\Bus\Dispatcher')
                             ->dispatch(new FetchTmdbIds(
                                 vodChannelIds: [$record->id],
-                                overwriteExisting: true,
+                                overwriteExisting: (bool) ($data['overwrite_existing'] ?? false),
                                 user: auth()->user(),
                             ));
 
                         Notification::make()
                             ->success()
                             ->title(__('TMDB Search Started'))
-                            ->body(__('Searching for TMDB/TVDB IDs. Check the logs or refresh the page in a few seconds.'))
+                            ->body(__('Fetching metadata from TMDB. Check the logs or refresh the page in a few seconds.'))
                             ->duration(8000)
                             ->send();
                     })
@@ -636,7 +702,7 @@ class VodResource extends Resource implements CopilotResource
                             ]),
                     ]),
                 Action::make('process_vod')
-                    ->label(__('Fetch Metadata'))
+                    ->label(__('Fetch Provider Metadata'))
                     ->icon('heroicon-o-arrow-down-tray')
                     ->schema([
                         Toggle::make('overwrite_existing')
@@ -706,6 +772,7 @@ class VodResource extends Resource implements CopilotResource
                     ->modalIcon('heroicon-o-signal')
                     ->modalDescription(__('Probe this VOD with ffprobe to collect stream metadata (codec, resolution, bitrate, HDR). This data enables Trash Guide naming with stream-stat-based detection.'))
                     ->modalSubmitActionLabel(__('Start probing')),
+                self::getCacheNowAction(),
                 DeleteAction::make()
                     ->modalIcon('heroicon-o-trash')
                     ->modalDescription(__('Are you sure you want to delete this VOD channel? This action cannot be undone.'))
@@ -778,7 +845,7 @@ class VodResource extends Resource implements CopilotResource
                             ->live()
                             ->label(__('Group'))
                             ->helperText(fn (Get $get) => $get('playlist') === null ? 'Select a playlist first...' : 'Select the group you would like to move the items to.')
-                            ->options(fn (Get $get) => Group::where([
+                            ->options(fn (Get $get) => Group::query()->assignableTarget()->where([
                                 'type' => 'vod',
                                 'user_id' => auth()->id(),
                                 'playlist_id' => $get('playlist'),
@@ -810,7 +877,7 @@ class VodResource extends Resource implements CopilotResource
                     ->modalSubmitActionLabel(__('Move now')),
                 ...($includeRecount ? [
                     BulkAction::make('recount')
-                        ->label(__('Recount Channels'))
+                        ->label(__('Renumber Channels'))
                         ->icon('heroicon-o-hashtag')
                         ->schema([
                             TextInput::make('start')
@@ -826,13 +893,13 @@ class VodResource extends Resource implements CopilotResource
                         ->after(function ($livewire) {
                             Notification::make()
                                 ->success()
-                                ->title(__('Channels Recounted'))
-                                ->body(__('The selected channels have been recounted.'))
+                                ->title(__('Channels Renumbered'))
+                                ->body(__('The selected channels have been renumbered.'))
                                 ->send();
                         })
                         ->requiresConfirmation()
                         ->modalIcon('heroicon-o-hashtag')
-                        ->modalDescription(__('Recount the selected channels sequentially? Channel numbers will be assigned based on the current sort order.')),
+                        ->modalDescription(__('Renumber the selected channels sequentially? Channel numbers will be assigned based on the current sort order.')),
                 ] : []),
             ]),
 
@@ -933,7 +1000,7 @@ class VodResource extends Resource implements CopilotResource
             // -- VOD Metadata --
             BulkModalActionGroup::section('VOD Metadata', [
                 BulkAction::make('process_vod')
-                    ->label(__('Fetch Metadata'))
+                    ->label(__('Fetch Provider Metadata'))
                     ->icon('heroicon-o-arrow-down-tray')
                     ->schema([
                         Toggle::make('overwrite_existing')
@@ -968,12 +1035,12 @@ class VodResource extends Resource implements CopilotResource
                     ->modalDescription(__('Fetch and process VOD metadata for the selected channels? Only enabled VOD channels will be processed.'))
                     ->modalSubmitActionLabel(__('Yes, process now')),
                 BulkAction::make('fetch_tmdb_ids')
-                    ->label(__('Fetch TMDB IDs'))
+                    ->label(__('Fetch TMDB Metadata'))
                     ->icon('heroicon-o-magnifying-glass')
                     ->schema([
                         Toggle::make('overwrite_existing')
-                            ->label(__('Overwrite Existing IDs'))
-                            ->helperText(__('Overwrite existing TMDB/IMDB IDs? If disabled, it will only fetch IDs for items that don\'t already have them.'))
+                            ->label(__('Overwrite Existing Metadata'))
+                            ->helperText(__('Overwrite existing TMDB metadata? If disabled, only items missing metadata are fetched.'))
                             ->default(false),
                     ])
                     ->action(function ($records, $data) {
@@ -1002,15 +1069,15 @@ class VodResource extends Resource implements CopilotResource
                         Notification::make()
                             ->success()
                             ->title('Fetching TMDB IDs for '.count($vodIds).' VOD channel(s)')
-                            ->body(__('The TMDB ID lookup has been started. You will be notified when it is complete.'))
+                            ->body(__('The TMDB metadata fetch has been started. You will be notified when it is complete.'))
                             ->duration(10000)
                             ->send();
                     })
                     ->deselectRecordsAfterCompletion()
                     ->requiresConfirmation()
                     ->modalIcon('heroicon-o-magnifying-glass')
-                    ->modalDescription(__('Search TMDB for matching movies and populate TMDB/IMDB IDs for the selected VOD channels? This enables Trash Guides compatibility for Radarr/Sonarr.'))
-                    ->modalSubmitActionLabel(__('Yes, fetch IDs now')),
+                    ->modalDescription(__('Search TMDB for matching movies and fetch full metadata (plot, artwork, cast, genres) plus TMDB and IMDB IDs for the selected VOD channels? This also enables Trash Guides compatibility for Radarr/Sonarr.'))
+                    ->modalSubmitActionLabel(__('Yes, fetch metadata now')),
                 BulkAction::make('sync')
                     ->label(__('Sync VOD .strm files'))
                     ->action(function ($records) {
@@ -1436,6 +1503,11 @@ class VodResource extends Resource implements CopilotResource
                     ->modalSubmitActionLabel(__('Start probing')),
             ]),
 
+            // -- Caching --
+            BulkModalActionGroup::section('Caching', [
+                self::getCacheNowBulkAction(),
+            ])->visible(fn (): bool => app(CachedContentDispatchService::class)->isEnabled()),
+
             // -- Enable / Disable --
             BulkModalActionGroup::section('Enable / Disable', [
                 BulkAction::make('enable')
@@ -1514,8 +1586,10 @@ class VodResource extends Resource implements CopilotResource
                     ->columns(2)
                     ->schema([
                         TextEntry::make('url')
+                            ->extraAttributes(['class' => 'privacy-sensitive'])
                             ->label(__('URL'))->columnSpanFull(),
                         TextEntry::make('proxy_url')
+                            ->extraAttributes(['class' => 'privacy-sensitive'])
                             ->label(__('Proxy URL'))->columnSpanFull(),
                         TextEntry::make('stream_id')
                             ->label(__('ID')),
@@ -1628,7 +1702,7 @@ class VodResource extends Resource implements CopilotResource
                         ->hint(__('tvc-guide-stationid'))
                         ->hintIcon(
                             'heroicon-m-question-mark-circle',
-                            tooltip: 'Gracenote station ID is a unique identifier for a TV channel in the Gracenote database. It is used to associate the channel with its metadata, such as program listings and other information.'
+                            tooltip: __('Gracenote station ID is a unique identifier for a TV channel in the Gracenote database. It is used to associate the channel with its metadata, such as program listings and other information.')
                         )
                         ->columnSpan(1)
                         ->helperText(__('Gracenote station ID'))
@@ -1638,13 +1712,13 @@ class VodResource extends Resource implements CopilotResource
                         ->label(__('Channel No.'))
                         ->hint(__('tvg-chno'))
                         ->columnSpan(1)
-                        ->rules(['numeric', 'min:0']),
+                        ->rules(['nullable', 'integer', 'min:0']),
                     TextInput::make('shift')
                         ->label(__('Time Shift'))
                         ->hint(__('timeshift'))
                         ->hintIcon(
                             'heroicon-m-question-mark-circle',
-                            tooltip: 'Time-shift is features that enable you to access content that has already been broadcast or is currently being broadcast, but at a different time than the original schedule. Time-shift allows you to pause, rewind, or fast-forward live TV, giving you more control over your viewing experience. Your provider must support this feature for it to work.'
+                            tooltip: __('Time-shift is features that enable you to access content that has already been broadcast or is currently being broadcast, but at a different time than the original schedule. Time-shift allows you to pause, rewind, or fast-forward live TV, giving you more control over your viewing experience. Your provider must support this feature for it to work.')
                         )
                         ->type('number')
                         ->placeholder(0)
@@ -1657,7 +1731,10 @@ class VodResource extends Resource implements CopilotResource
                             Select::make('group_id')
                                 ->label(__('Group'))
                                 ->hint(__('group-title'))
-                                ->options(fn (Get $get) => Group::where('playlist_id', $get('playlist_id'))->get(['name', 'id'])->pluck('name', 'id'))
+                                ->options(fn (Get $get) => Group::query()->assignableTarget()->where([
+                                    'type' => 'vod',
+                                    'playlist_id' => $get('playlist_id'),
+                                ])->get(['name', 'id'])->pluck('name', 'id'))
                                 ->columnSpanFull()
                                 ->placeholder(__('Select a group'))
                                 ->searchable()
@@ -1679,24 +1756,26 @@ class VodResource extends Resource implements CopilotResource
             Fieldset::make(__('URL Settings'))
                 ->schema([
                     TextInput::make('url')
+                        ->extraInputAttributes(['class' => 'privacy-sensitive'])
                         ->label(fn (Get $get) => $get('is_custom') ? 'URL' : 'Provider URL')
                         ->columnSpan(1)
                         ->prefixIcon('heroicon-m-globe-alt')
                         ->hintIcon(
                             icon: fn (Get $get) => $get('is_custom') ? null : 'heroicon-m-question-mark-circle',
-                            tooltip: fn (Get $get) => $get('is_custom') ? null : 'The original URL from the playlist provider. This is read-only and cannot be modified. This URL is automatically updated on Playlist sync.'
+                            tooltip: fn (Get $get) => $get('is_custom') ? null : __('The original URL from the playlist provider. This is read-only and cannot be modified. This URL is automatically updated on Playlist sync.')
                         )
                         ->formatStateUsing(fn ($record) => $record?->url)
                         ->disabled(fn (Get $get) => ! $get('is_custom')) // make it read-only but copyable for non-custom channels
                         ->dehydrated(fn (Get $get) => $get('is_custom')) // don't save the value in the database for custom channels
                         ->type('url'),
                     TextInput::make('url_custom')
+                        ->extraInputAttributes(['class' => 'privacy-sensitive'])
                         ->label(__('URL Override'))
                         ->columnSpan(1)
                         ->prefixIcon('heroicon-m-globe-alt')
                         ->hintIcon(
                             'heroicon-m-question-mark-circle',
-                            tooltip: 'Override the provider URL with your own custom URL. This URL will be used instead of the provider URL.'
+                            tooltip: __('Override the provider URL with your own custom URL. This URL will be used instead of the provider URL.')
                         )
                         ->helperText(__('Leave empty to use provider URL.'))
                         ->rules(['min:1'])
@@ -1709,7 +1788,7 @@ class VodResource extends Resource implements CopilotResource
                         ->hint(__('tvg-logo'))
                         ->hintIcon(
                             icon: fn (Get $get) => $get('is_custom') ? null : 'heroicon-m-question-mark-circle',
-                            tooltip: fn (Get $get) => $get('is_custom') ? null : 'The original logo from the playlist provider. This is read-only and cannot be modified. This URL is automatically updated on Playlist sync.'
+                            tooltip: fn (Get $get) => $get('is_custom') ? null : __('The original logo from the playlist provider. This is read-only and cannot be modified. This URL is automatically updated on Playlist sync.')
                         )
                         ->formatStateUsing(fn ($record) => $record?->logo_internal)
                         ->disabled(fn (Get $get) => ! $get('is_custom')) // make it read-only but copyable for non-custom channels
@@ -1728,7 +1807,7 @@ class VodResource extends Resource implements CopilotResource
                         ->hint(__('tvg-logo'))
                         ->hintIcon(
                             'heroicon-m-question-mark-circle',
-                            tooltip: 'Override the provider logo with your own custom logo. This logo will be used instead of the provider logo.'
+                            tooltip: __('Override the provider logo with your own custom logo. This logo will be used instead of the provider logo.')
                         )
                         ->helperText(__('Leave empty to use provider logo.'))
                         ->rules(['min:1'])
@@ -1739,12 +1818,13 @@ class VodResource extends Resource implements CopilotResource
                             AssetPickerAction::browse('logo'),
                         ]),
                     TextInput::make('proxy_url')
+                        ->extraInputAttributes(['class' => 'privacy-sensitive'])
                         ->label(__('Proxy URL'))
                         ->columnSpan(2)
                         ->prefixIcon('heroicon-m-globe-alt')
                         ->hintIcon(
                             'heroicon-m-question-mark-circle',
-                            tooltip: 'Use m3u editor proxy to access this channel.'
+                            tooltip: __('Use m3u editor proxy to access this channel.')
                         )
                         ->formatStateUsing(fn ($record) => $record?->getProxyUrl())
                         ->helperText(__('m3u editor proxy url.'))
@@ -1826,7 +1906,7 @@ class VodResource extends Resource implements CopilotResource
                         ->hint(__('tvg-shift'))
                         ->hintIcon(
                             'heroicon-m-question-mark-circle',
-                            tooltip: 'The "tvg-shift" attribute is used in your generated M3U playlist to shift the EPG (Electronic Program Guide) time for specific channels by a certain number of hours. This allows for adjusting the EPG data for individual channels rather than applying a global shift.'
+                            tooltip: __('The "tvg-shift" attribute is used in your generated M3U playlist to shift the EPG (Electronic Program Guide) time for specific channels by a certain number of hours. This allows for adjusting the EPG data for individual channels rather than applying a global shift.')
                         )
                         ->columnSpan(1)
                         ->placeholder(__('0'))
@@ -1919,7 +1999,7 @@ class VodResource extends Resource implements CopilotResource
                     TextInput::make('info.age')
                         ->label(__('Age Rating'))
                         ->helperText(__('Age rating or classification.'))
-                        ->placeholder(__('PG-13, R, etc.'))
+                        ->placeholder(__('12+, 16+, 18+'))
                         ->rules(['nullable', 'string', 'max:10']),
                     TextInput::make('info.mpaa_rating')
                         ->label(__('MPAA Rating'))
@@ -2012,6 +2092,7 @@ class VodResource extends Resource implements CopilotResource
                         ->columnSpanFull()
                         ->simple(
                             TextInput::make('url')
+                                ->extraInputAttributes(['class' => 'privacy-sensitive'])
                                 ->label(__('Image URL'))
                                 ->placeholder(__('https://example.com/backdrop.jpg'))
                                 ->type('url')
@@ -2114,7 +2195,7 @@ class VodResource extends Resource implements CopilotResource
                                         ->icon('heroicon-o-cog-6-tooth')
                                         ->iconPosition('after')
                                         ->size('sm')
-                                        ->url('/preferences?tab=sync-options%3A%3Adata%3A%3Atab')
+                                        ->url(ManageSyncSettings::getUrl())
                                         ->openUrlInNewTab(false)
                                 )
                                 ->helperText(__('Select a Stream File Setting profile to override global/group settings for this VOD channel. Leave empty to use group or global settings. Priority: VOD > Group > Global.')),

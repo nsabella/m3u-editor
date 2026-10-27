@@ -28,6 +28,9 @@ class MapPlaylistChannelsToEpg implements ShouldQueue
     // Giving a timeout of 120 minutes to the Job to process the mapping
     public $timeout = 60 * 120;
 
+    // Channels handed to each MapPlaylistChannelsToEpgChunk job
+    public const CHUNK_SIZE = 50;
+
     /**
      * Create a new job instance.
      */
@@ -62,7 +65,6 @@ class MapPlaylistChannelsToEpg implements ShouldQueue
 
         // Create the record
         $playlist = $this->playlist ? Playlist::find($this->playlist) : null;
-        $subtext = $playlist ? ' -> '.$playlist->name.' mapping' : ' custom channel mapping';
         if ($this->epgMapId) {
             // Fetch and update existing map record
             $map = EpgMap::find($this->epgMapId);
@@ -79,6 +81,7 @@ class MapPlaylistChannelsToEpg implements ShouldQueue
             $claimed = EpgMap::where('id', $map->id)
                 ->where('processing', false)
                 ->update([
+                    'name' => EpgMap::buildName($epg->name, $playlist?->name),
                     'uuid' => $batchNo,
                     'progress' => 0,
                     'status' => Status::Processing,
@@ -108,7 +111,7 @@ class MapPlaylistChannelsToEpg implements ShouldQueue
             }
         } else {
             $map = EpgMap::create([
-                'name' => $epg->name.$subtext,
+                'name' => EpgMap::buildName($epg->name, $playlist?->name),
                 'epg_id' => $epg->id,
                 'playlist_id' => $playlist ? $playlist->id : null,
                 'user_id' => $epg->user_id,
@@ -179,7 +182,7 @@ class MapPlaylistChannelsToEpg implements ShouldQueue
 
                 Notification::make()
                     ->danger()
-                    ->title("Error processing \"{$epg->name}\" mapping")
+                    ->title("Error processing \"{$map->name}\"")
                     ->body($error)
                     ->broadcast($epg->user)
                     ->sendToDatabase($epg->user);
@@ -201,10 +204,9 @@ class MapPlaylistChannelsToEpg implements ShouldQueue
             // Create jobs array for batch processing
             $jobs = [];
 
-            // Process channels in chunks of 50
-            $chunkSize = 50;
+            // Process channels in chunks
             $channelIds = $channels->pluck('id')->toArray();
-            $chunks = array_chunk($channelIds, $chunkSize);
+            $chunks = array_chunk($channelIds, self::CHUNK_SIZE);
 
             // Create a processing job for each chunk
             foreach ($chunks as $chunk) {
@@ -230,15 +232,15 @@ class MapPlaylistChannelsToEpg implements ShouldQueue
                 ->onConnection('redis') // force to use redis connection
                 ->onQueue('import')
                 ->catch(function (Throwable $e) use ($epg, $map) {
-                    $error = "Error processing \"{$epg->name}\" mapping: {$e->getMessage()}";
+                    $error = "Error processing \"{$map->name}\": {$e->getMessage()}";
                     Notification::make()
                         ->danger()
-                        ->title("Error processing \"{$epg->name}\" mapping")
+                        ->title("Error processing \"{$map->name}\"")
                         ->body('Please view your notifications for details.')
                         ->broadcast($epg->user);
                     Notification::make()
                         ->danger()
-                        ->title("Error processing \"{$epg->name}\" mapping")
+                        ->title("Error processing \"{$map->name}\"")
                         ->body($error)
                         ->sendToDatabase($epg->user);
                     $map->update([
@@ -251,17 +253,17 @@ class MapPlaylistChannelsToEpg implements ShouldQueue
                 })->dispatch();
         } catch (Exception $e) {
             // Log the exception
-            logger()->error("Error processing \"{$epg->name}\" mapping: {$e->getMessage()}");
+            logger()->error("Error processing \"{$map->name}\": {$e->getMessage()}");
 
             // Send notification
             Notification::make()
                 ->danger()
-                ->title("Error processing \"{$epg->name}\" mapping")
+                ->title("Error processing \"{$map->name}\"")
                 ->body('Please view your notifications for details.')
                 ->broadcast($epg->user);
             Notification::make()
                 ->danger()
-                ->title("Error processing \"{$epg->name}\" mapping")
+                ->title("Error processing \"{$map->name}\"")
                 ->body($e->getMessage())
                 ->sendToDatabase($epg->user);
 

@@ -16,6 +16,7 @@
 
 use App\Enums\DvrRecordingStatus;
 use App\Jobs\PostProcessDvrRecording;
+use App\Jobs\StartDvrRecording;
 use App\Models\Channel;
 use App\Models\DvrRecording;
 use App\Models\DvrSetting;
@@ -99,6 +100,54 @@ it('uses the raw channel URL to avoid double-proxying through the editor', funct
 
     expect($recording->fresh()->stream_url)
         ->toBe('http://direct.example.com/stream.ts');
+});
+
+it('resolves the URL through the proxy for a pooled-provider channel so a profile is selected', function () {
+    $user = User::factory()->create();
+    $playlist = Playlist::factory()->for($user)->create(['profiles_enabled' => true]);
+    $setting = DvrSetting::factory()->enabled()->for($user)->for($playlist)->create();
+    $channel = Channel::factory()->for($user)->for($playlist)
+        ->create(['url' => 'http://direct.example.com/stream.ts']);
+    $recording = DvrRecording::factory()->for($setting, 'dvrSetting')->for($user)->create([
+        'status' => DvrRecordingStatus::Scheduled,
+        'channel_id' => $channel->id,
+        'stream_url' => null,
+    ]);
+
+    $mock = Mockery::mock(M3uProxyService::class);
+    $mock->shouldReceive('getChannelUrl')->once()->andReturn('http://proxy.local/stream/pooled-stream-id.ts');
+    $mock->shouldReceive('startDvrBroadcast')->andReturn($recording->uuid);
+    $mock->shouldReceive('getActiveStreamIdForChannel')->andReturnNull();
+    $mock->shouldReceive('getStreamProxyUrl')->andReturn('');
+    app()->instance(M3uProxyService::class, $mock);
+
+    app(DvrRecorderService::class)->start($recording);
+
+    expect($recording->fresh()->stream_url)->toBe('http://proxy.local/stream/pooled-stream-id.ts');
+});
+
+it('falls back to the raw channel URL when proxy resolution fails for a pooled-provider channel', function () {
+    $user = User::factory()->create();
+    $playlist = Playlist::factory()->for($user)->create(['profiles_enabled' => true]);
+    $setting = DvrSetting::factory()->enabled()->for($user)->for($playlist)->create();
+    $channel = Channel::factory()->for($user)->for($playlist)
+        ->create(['url' => 'http://direct.example.com/stream.ts']);
+    $recording = DvrRecording::factory()->for($setting, 'dvrSetting')->for($user)->create([
+        'status' => DvrRecordingStatus::Scheduled,
+        'channel_id' => $channel->id,
+        'stream_url' => null,
+    ]);
+
+    $mock = Mockery::mock(M3uProxyService::class);
+    $mock->shouldReceive('getChannelUrl')->once()->andThrow(new RuntimeException('all profiles at capacity'));
+    $mock->shouldReceive('startDvrBroadcast')->andReturn($recording->uuid);
+    $mock->shouldReceive('getActiveStreamIdForChannel')->andReturnNull();
+    $mock->shouldReceive('getStreamProxyUrl')->andReturn('');
+    app()->instance(M3uProxyService::class, $mock);
+
+    app(DvrRecorderService::class)->start($recording);
+
+    expect($recording->fresh()->stream_url)->toBe('http://direct.example.com/stream.ts');
 });
 
 // ── start() ───────────────────────────────────────────────────────────────────
@@ -260,4 +309,48 @@ it('DvrSetting use_proxy can be set to true', function () {
     $setting = DvrSetting::factory()->create(['use_proxy' => true]);
 
     expect($setting->fresh()->use_proxy)->toBeTrue();
+});
+
+// ── resume() ──────────────────────────────────────────────────────────────────
+
+it('resume() restarts the proxy capture without counting a new attempt', function () {
+    $recording = makeScheduledRecording();
+    $startedAt = now()->subMinutes(10)->startOfSecond();
+    $recording->update([
+        'status' => DvrRecordingStatus::Recording,
+        'proxy_network_id' => $recording->uuid,
+        'actual_start' => $startedAt,
+        'attempt_count' => 1,
+    ]);
+    $proxy = mockProxy($recording->uuid);
+
+    app(DvrRecorderService::class)->resume($recording->fresh());
+
+    $proxy->shouldHaveReceived('startDvrBroadcast')->once();
+    $fresh = $recording->fresh();
+    expect($fresh->status)->toBe(DvrRecordingStatus::Recording);
+    expect($fresh->attempt_count)->toBe(1);
+    expect($fresh->actual_start->equalTo($startedAt))->toBeTrue();
+});
+
+it('resume() does nothing for a recording that is no longer in progress', function () {
+    $recording = makeScheduledRecording();
+    $proxy = mockProxy();
+
+    app(DvrRecorderService::class)->resume($recording);
+
+    $proxy->shouldNotHaveReceived('startDvrBroadcast');
+});
+
+it('a failed resume leaves the recording in progress for the next tick to retry', function () {
+    $recording = makeScheduledRecording();
+    $recording->update(['status' => DvrRecordingStatus::Recording, 'proxy_network_id' => $recording->uuid]);
+    $proxy = Mockery::mock(M3uProxyService::class);
+    $proxy->shouldReceive('getActiveStreamIdForChannel')->andReturnNull();
+    $proxy->shouldReceive('startDvrBroadcast')->andThrow(new Exception('proxy down'));
+    app()->instance(M3uProxyService::class, $proxy);
+
+    (new StartDvrRecording($recording->id, resume: true))->handle(app(DvrRecorderService::class));
+
+    expect($recording->fresh()->status)->toBe(DvrRecordingStatus::Recording);
 });

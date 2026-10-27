@@ -1,0 +1,1071 @@
+<?php
+
+use App\Interfaces\MediaServer;
+use App\Models\EmbyLibraryMapping;
+use App\Models\MediaServerIntegration;
+use App\Models\User;
+use App\Services\EmbyManagedSetupService;
+use App\Services\MediaServerService;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Http\Client\Request;
+use Illuminate\Support\Facades\Http;
+
+uses(RefreshDatabase::class);
+
+it('defines managed library creation on the media server contract', function () {
+    expect(method_exists(MediaServer::class, 'createLibrary'))->toBeTrue();
+});
+
+beforeEach(function () {
+    $user = User::factory()->create();
+    $this->integration = MediaServerIntegration::factory()->for($user)->createQuietly([
+        'type' => 'emby',
+        'host' => 'emby.test',
+        'port' => 8096,
+        'ssl' => true,
+        'api_key' => 'emby-secret',
+        'emby_publisher_writable_paths' => ['/srv/emby'],
+    ]);
+});
+
+it('bootstraps managed publishing over trusted Docker HTTP with the saved administrator credential', function () {
+    $this->integration->update([
+        'host' => 'emby',
+        'ssl' => false,
+    ]);
+    Http::preventStrayRequests();
+    Http::fake([
+        'http://emby:8096/M3uEditor/Managed/Setup/V1' => Http::response([
+            'CapabilityVersion' => 1,
+            'IntegrationId' => $this->integration->id,
+            'ConfirmedRoot' => '/config/plugins/m3u-editor/managed-publishing',
+            'Ready' => true,
+            'Result' => 'Ready',
+        ]),
+    ]);
+
+    $result = app(EmbyManagedSetupService::class)->setup($this->integration);
+
+    expect($result['success'])->toBeTrue()
+        ->and($this->integration->refresh())
+        ->emby_managed_setup_binding_id->toBe($this->integration->id)
+        ->emby_managed_setup_root->toBe('/config/plugins/m3u-editor/managed-publishing')
+        ->emby_managed_setup_capability_version->toBe(1)
+        ->emby_managed_setup_contract_version->toBe(1)
+        ->and($this->integration->emby_publisher_writable_paths)
+        ->toBe(['/srv/emby']);
+    Http::assertSent(fn (Request $request): bool => $request->method() === 'PUT'
+        && $request->url() === 'http://emby:8096/M3uEditor/Managed/Setup/V1'
+        && $request->hasHeader('X-Emby-Token', 'emby-secret')
+        && $request->data() === ['IntegrationId' => $this->integration->id]);
+});
+
+it('allows managed setup only over approved transport origins', function (string $host, bool $ssl, bool $allowed) {
+    $this->integration->update([
+        'host' => $host,
+        'ssl' => $ssl,
+    ]);
+    Http::preventStrayRequests();
+    Http::fake(fn () => Http::response([
+        'CapabilityVersion' => 1,
+        'IntegrationId' => $this->integration->id,
+        'ConfirmedRoot' => '/config/plugins/m3u-editor/managed-publishing',
+        'Ready' => true,
+        'Result' => 'Ready',
+    ]));
+
+    $result = app(EmbyManagedSetupService::class)->setup($this->integration);
+
+    expect($result['success'])->toBe($allowed);
+    if ($allowed) {
+        Http::assertSentCount(1);
+    } else {
+        Http::assertNothingSent();
+    }
+})->with([
+    'Docker service name over HTTP' => ['emby', false, true],
+    'IPv4 loopback over HTTP' => ['127.0.0.1', false, true],
+    'RFC1918 10/8 over HTTP' => ['10.2.3.4', false, true],
+    'RFC1918 172.16/12 over HTTP' => ['172.31.255.1', false, true],
+    'RFC1918 192.168/16 over HTTP' => ['192.168.50.2', false, true],
+    'IPv4 link-local over HTTP' => ['169.254.10.20', false, true],
+    'IPv6 loopback over HTTP' => ['::1', false, true],
+    'IPv6 ULA over HTTP' => ['fd12:3456:789a::1', false, true],
+    'IPv6 link-local over HTTP' => ['fe80::1', false, true],
+    'public IPv4 over HTTP' => ['8.8.8.8', false, false],
+    'integer-encoded public IPv4 over HTTP' => ['134744072', false, false],
+    'hex-encoded public IPv4 over HTTP' => ['0x08080808', false, false],
+    'public hostname over HTTP' => ['emby.example.com', false, false],
+    'public hostname over HTTPS' => ['emby.example.com', true, true],
+    'userinfo-like host over HTTPS' => ['admin@emby.example.com', true, false],
+    'query-like host over HTTPS' => ['emby.example.com?target=private', true, false],
+]);
+
+it('adds the confirmed managed root while preserving existing publisher roots and mappings', function () {
+    $mapping = EmbyLibraryMapping::factory()
+        ->for($this->integration->user)
+        ->for($this->integration, 'integration')
+        ->create([
+            'output_path' => '/srv/emby/existing-library',
+            'target_library_id' => 'existing-library',
+        ]);
+    Http::preventStrayRequests();
+    Http::fake([
+        'https://emby.test:8096/M3uEditor/Managed/Setup/V1' => Http::response([
+            'CapabilityVersion' => 1,
+            'IntegrationId' => $this->integration->id,
+            'ConfirmedRoot' => '/config/plugins/m3u-editor/managed-publishing',
+            'Ready' => true,
+            'Result' => 'Ready',
+        ]),
+    ]);
+
+    $result = app(EmbyManagedSetupService::class)->setup($this->integration);
+    expect($result['success'])->toBeTrue()
+        ->and($this->integration->emby_publisher_writable_paths)->toBe(['/srv/emby'])
+        ->and($this->integration->getEmbyPublisherWritablePaths())->toBe([
+            '/config/plugins/m3u-editor/managed-publishing',
+            '/srv/emby',
+        ])
+        ->and($mapping->refresh())
+        ->output_path->toBe('/srv/emby/existing-library')
+        ->target_library_id->toBe('existing-library');
+    Http::assertSentCount(1);
+});
+
+it('fails closed without state changes for rejected or partial managed setup responses', function (mixed $body, int $status, string $message) {
+    Http::preventStrayRequests();
+    Http::fake([
+        'https://emby.test:8096/M3uEditor/Managed/Setup/V1' => Http::response($body, $status),
+    ]);
+
+    $result = app(EmbyManagedSetupService::class)->setup($this->integration);
+
+    expect($result)->toBe([
+        'success' => false,
+        'message' => $message,
+    ])->and($this->integration->refresh())
+        ->emby_managed_setup_binding_id->toBeNull()
+        ->emby_managed_setup_root->toBeNull()
+        ->emby_publisher_writable_paths->toBe(['/srv/emby']);
+    Http::assertSentCount(1);
+})->with([
+    'unauthorized setup' => [[], 401, 'Emby rejected the managed setup request. Check the administrator credential and permissions, then retry.'],
+    'missing companion endpoint' => [[], 404, 'The Emby managed setup endpoint was not found. Check the companion installation, then retry.'],
+    'redirect response' => [[], 302, 'Emby rejected the managed setup request. Check the administrator credential and permissions, then retry.'],
+    'scalar JSON response' => ['"not ready"', 200, 'Emby returned an invalid managed setup response. Check the companion configuration, then retry.'],
+    'list JSON response' => [['not ready'], 200, 'Emby returned an invalid managed setup response. Check the companion configuration, then retry.'],
+    'response without a readiness state' => [[
+        'CapabilityVersion' => 1,
+        'IntegrationId' => 1,
+        'ConfirmedRoot' => '/config/plugins/m3u-editor/managed-publishing',
+    ], 200, 'Emby returned an invalid managed setup response. Check the companion configuration, then retry.'],
+    'response with an invalid readiness state' => [[
+        'CapabilityVersion' => 1,
+        'IntegrationId' => 1,
+        'ConfirmedRoot' => '/config/plugins/m3u-editor/managed-publishing',
+        'Ready' => 'false',
+    ], 200, 'Emby returned an invalid managed setup response. Check the companion configuration, then retry.'],
+    'malformed JSON response' => ['{', 200, 'Emby returned an invalid managed setup response. Check the companion configuration, then retry.'],
+    'not ready' => [[
+        'CapabilityVersion' => 1,
+        'IntegrationId' => 0,
+        'ConfirmedRoot' => '/config/plugins/m3u-editor/managed-publishing',
+        'Ready' => false,
+        'Result' => 'backend secret or local path',
+    ], 200, 'Emby is not ready for managed setup. Check the companion configuration, then retry.'],
+    'not ready without an integration binding' => [[
+        'CapabilityVersion' => 1,
+        'ConfirmedRoot' => '/config/plugins/m3u-editor/managed-publishing',
+        'Ready' => false,
+        'Result' => 'backend secret or local path',
+    ], 200, 'Emby is not ready for managed setup. Check the companion configuration, then retry.'],
+    'old capability version' => [[
+        'CapabilityVersion' => 0,
+        'IntegrationId' => 1,
+        'ConfirmedRoot' => '/config/plugins/m3u-editor/managed-publishing',
+        'Ready' => true,
+        'Result' => 'Ready',
+    ], 200, 'The Emby companion does not support managed setup version 1. Update the companion, then retry.'],
+    'fractional capability version' => [[
+        'CapabilityVersion' => 1.9,
+        'IntegrationId' => 1,
+        'ConfirmedRoot' => '/config/plugins/m3u-editor/managed-publishing',
+        'Ready' => true,
+        'Result' => 'Ready',
+    ], 200, 'The Emby companion does not support managed setup version 1. Update the companion, then retry.'],
+    'string capability version' => [[
+        'CapabilityVersion' => '1.5',
+        'IntegrationId' => 1,
+        'ConfirmedRoot' => '/config/plugins/m3u-editor/managed-publishing',
+        'Ready' => true,
+        'Result' => 'Ready',
+    ], 200, 'The Emby companion does not support managed setup version 1. Update the companion, then retry.'],
+    'wrong integration binding' => [[
+        'CapabilityVersion' => 1,
+        'IntegrationId' => 0,
+        'ConfirmedRoot' => '/config/plugins/m3u-editor/managed-publishing',
+        'Ready' => true,
+        'Result' => 'Ready',
+    ], 200, 'Emby reported a managed setup binding conflict. Reconnect the integration, then retry.'],
+]);
+
+it('fails closed without state changes for a ready V1 response carrying an unsafe confirmed root', function () {
+    Http::preventStrayRequests();
+    Http::fake([
+        'https://emby.test:8096/M3uEditor/Managed/Setup/V1' => Http::response([
+            'CapabilityVersion' => 1,
+            'IntegrationId' => $this->integration->id,
+            'ConfirmedRoot' => '../private',
+            'Ready' => true,
+            'Result' => 'Ready',
+        ]),
+    ]);
+
+    expect(app(EmbyManagedSetupService::class)->setup($this->integration))->toBe([
+        'success' => false,
+        'message' => 'Emby returned an invalid managed setup response. Check the companion configuration, then retry.',
+    ])->and($this->integration->refresh())
+        ->emby_managed_setup_binding_id->toBeNull()
+        ->emby_managed_setup_root->toBeNull()
+        ->emby_publisher_writable_paths->toBe(['/srv/emby']);
+    Http::assertSentCount(1);
+});
+
+it('reports a binding conflict only for a ready V1 response without exposing the response result', function () {
+    Http::preventStrayRequests();
+    Http::fake([
+        'https://emby.test:8096/M3uEditor/Managed/Setup/V1' => Http::response([
+            'CapabilityVersion' => 1,
+            'IntegrationId' => $this->integration->id + 1,
+            'ConfirmedRoot' => '/config/plugins/m3u-editor/managed-publishing',
+            'Ready' => true,
+            'Result' => 'backend secret or local path',
+        ]),
+    ]);
+
+    expect(app(EmbyManagedSetupService::class)->setup($this->integration))->toBe([
+        'success' => false,
+        'message' => 'Emby reported a managed setup binding conflict. Reconnect the integration, then retry.',
+    ]);
+});
+
+it('reports an actual missing managed setup endpoint without suggesting that V1 is unavailable', function () {
+    Http::preventStrayRequests();
+    Http::fake([
+        'https://emby.test:8096/M3uEditor/Managed/Setup/V1' => Http::response([], 404),
+    ]);
+
+    expect(app(EmbyManagedSetupService::class)->setup($this->integration))->toBe([
+        'success' => false,
+        'message' => 'The Emby managed setup endpoint was not found. Check the companion installation, then retry.',
+    ]);
+});
+
+it('reports a blocked transport without sending the administrator credential', function () {
+    $this->integration->update([
+        'host' => 'emby.example.com',
+        'ssl' => false,
+    ]);
+    Http::preventStrayRequests();
+
+    expect(app(EmbyManagedSetupService::class)->setup($this->integration))->toBe([
+        'success' => false,
+        'message' => 'Emby managed setup was blocked by the integration security policy.',
+    ]);
+
+    Http::assertNothingSent();
+});
+
+it('preserves fifty legacy writable roots across repeated managed setup', function () {
+    $legacyRoots = array_map(fn (int $index): string => "/srv/legacy/{$index}", range(1, 50));
+    $this->integration->update(['emby_publisher_writable_paths' => $legacyRoots]);
+    $response = [
+        'CapabilityVersion' => 1,
+        'IntegrationId' => $this->integration->id,
+        'ConfirmedRoot' => '/srv/managed',
+        'Ready' => true,
+    ];
+    Http::preventStrayRequests();
+    Http::fakeSequence('https://emby.test:8096/M3uEditor/Managed/Setup/V1')
+        ->push($response)
+        ->push($response)
+        ->push($response);
+
+    expect(app(EmbyManagedSetupService::class)->setup($this->integration)['success'])->toBeTrue()
+        ->and(app(EmbyManagedSetupService::class)->setup($this->integration->refresh())['success'])->toBeTrue()
+        ->and(app(EmbyManagedSetupService::class)->setup($this->integration->refresh())['success'])->toBeTrue()
+        ->and($this->integration->refresh()->emby_publisher_writable_paths)->toBe($legacyRoots)
+        ->and($this->integration->getEmbyPublisherWritablePaths())
+        ->toBe(['/srv/managed', ...$legacyRoots]);
+    Http::assertSentCount(3);
+});
+
+it('returns a sanitized connection error when the managed companion is unavailable', function () {
+    Http::preventStrayRequests();
+    Http::fake([
+        'https://emby.test:8096/M3uEditor/Managed/Setup/V1' => Http::failedConnection(),
+    ]);
+
+    expect(app(EmbyManagedSetupService::class)->setup($this->integration))->toBe([
+        'success' => false,
+        'message' => 'Emby managed setup could not connect. Check that Emby is reachable, then retry.',
+    ])->and($this->integration->refresh()->emby_managed_setup_root)->toBeNull();
+});
+
+it('requires every managed setup response to remain on the exact requested origin', function () {
+    $method = new ReflectionMethod(EmbyManagedSetupService::class, 'originsMatch');
+    $method->setAccessible(true);
+    $service = app(EmbyManagedSetupService::class);
+
+    expect($method->invoke($service, 'https://emby.test:8096', 'https://emby.test:8096/M3uEditor/Managed/Setup/V1'))->toBeTrue()
+        ->and($method->invoke($service, 'https://emby.test:8096', 'http://emby.test:8096/M3uEditor/Managed/Setup/V1'))->toBeFalse()
+        ->and($method->invoke($service, 'https://emby.test:8096', 'https://other.test:8096/M3uEditor/Managed/Setup/V1'))->toBeFalse()
+        ->and($method->invoke($service, 'https://emby.test:8096', 'https://emby.test:8920/M3uEditor/Managed/Setup/V1'))->toBeFalse();
+});
+
+it('uses a stable operation identity and accepts only a direct companion-prepared child path', function (string $root, string $preparedPath) {
+    $this->integration->updateQuietly([
+        'emby_managed_setup_binding_id' => $this->integration->id,
+        'emby_managed_setup_root' => $root,
+        'emby_managed_setup_capability_version' => 1,
+        'emby_managed_setup_contract_version' => 1,
+    ]);
+    Http::preventStrayRequests();
+    $operationIds = [];
+    Http::fake([
+        'https://emby.test:8096/M3uEditor/Managed/Libraries/V1/Prepare' => function (Request $request) use (&$operationIds, $preparedPath) {
+            $operationIds[] = $request->data()['OperationId'];
+
+            return Http::response([
+                'CapabilityVersion' => 1,
+                'IntegrationId' => $request->data()['IntegrationId'],
+                'OperationId' => $request->data()['OperationId'],
+                'PreparedPath' => $preparedPath,
+                'State' => 'prepared',
+                'Success' => true,
+            ]);
+        },
+    ]);
+
+    $service = app(EmbyManagedSetupService::class);
+    $first = $service->prepareLibrary($this->integration, 'Managed Movies', 'movies');
+    $second = app(EmbyManagedSetupService::class)
+        ->prepareLibrary($this->integration->fresh(), 'Managed Movies', 'movies');
+
+    expect($first['success'])->toBeTrue()
+        ->and($first['path'])->toBe($preparedPath)
+        ->and($second['success'])->toBeTrue()
+        ->and($operationIds)->toHaveCount(2)
+        ->and($operationIds[0])->toBe($operationIds[1])
+        ->and($operationIds[0])->toMatch('/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/');
+})->with([
+    'Unix path' => ['/srv/emby/managed', '/srv/emby/managed/movies-0123456789abcdef01234567'],
+    'Windows path' => ['C:\\Emby\\Managed', 'C:\\Emby\\Managed\\movies-0123456789abcdef01234567'],
+]);
+
+it('fails closed on malformed or malicious prepare responses without exposing secrets', function (array|string $response) {
+    $this->integration->updateQuietly([
+        'emby_managed_setup_binding_id' => $this->integration->id,
+        'emby_managed_setup_root' => '/srv/emby/managed',
+        'emby_managed_setup_capability_version' => 1,
+        'emby_managed_setup_contract_version' => 1,
+    ]);
+    Http::preventStrayRequests();
+    $service = app(EmbyManagedSetupService::class);
+    if (is_array($response)) {
+        $response['IntegrationId'] = $this->integration->id;
+        $response['OperationId'] = $service->libraryOperationId($this->integration, 'Managed Movies', 'movies');
+    }
+    Http::fake([
+        'https://emby.test:8096/M3uEditor/Managed/Libraries/V1/Prepare' => Http::response($response),
+    ]);
+
+    $result = $service->prepareLibrary($this->integration, 'Managed Movies', 'movies');
+
+    expect($result['success'])->toBeFalse()
+        ->and($result['message'])->toBe('Emby returned an invalid managed setup response. Check the companion configuration, then retry.')
+        ->and($result['message'])->not->toContain('emby-secret', '/outside/secret');
+})->with([
+    'scalar JSON' => ['"emby-secret"'],
+    'outside root' => [[
+        'CapabilityVersion' => 1,
+        'IntegrationId' => 1,
+        'OperationId' => 'ignored',
+        'PreparedPath' => '/outside/secret',
+        'State' => 'prepared',
+        'Success' => true,
+    ]],
+    'root instead of direct child' => [[
+        'CapabilityVersion' => 1,
+        'IntegrationId' => 1,
+        'OperationId' => 'ignored',
+        'PreparedPath' => '/srv/emby/managed',
+        'State' => 'prepared',
+        'Success' => true,
+    ]],
+]);
+
+it('rejects an unsupported managed companion before making a library lifecycle request', function () {
+    Http::preventStrayRequests();
+    Http::fake();
+
+    $result = app(EmbyManagedSetupService::class)
+        ->prepareLibrary($this->integration, 'Managed Movies', 'movies');
+
+    expect($result['success'])->toBeFalse()
+        ->and($result['message'])->toBe('The Emby companion does not support managed setup version 1. Update the companion, then retry.');
+    Http::assertNothingSent();
+});
+
+it('creates an Emby library through the official virtual folders endpoint', function () {
+    Http::preventStrayRequests();
+    Http::fakeSequence('https://emby.test:8096/Library/VirtualFolders')
+        ->push([], 200)
+        ->push([], 204)
+        ->push([[
+            'ItemId' => 'library-1',
+            'Name' => 'Managed Movies',
+            'CollectionType' => 'movies',
+            'Locations' => ['/srv/emby/managed/movies'],
+        ]], 200);
+
+    $result = MediaServerService::make($this->integration)->createLibrary(
+        name: 'Managed Movies',
+        collectionType: 'movies',
+        paths: ['/srv/emby/managed/movies'],
+        refreshLibrary: false,
+    );
+
+    expect($result['success'])->toBeTrue()
+        ->and($result['created'])->toBeTrue()
+        ->and($result['library']['id'])->toBe('library-1');
+
+    Http::assertSent(fn (Request $request): bool => $request->method() === 'POST'
+        && $request->url() === 'https://emby.test:8096/Library/VirtualFolders'
+        && $request->hasHeader('X-Emby-Token', 'emby-secret')
+        && $request->data() === [
+            'Name' => 'Managed Movies',
+            'CollectionType' => 'movies',
+            'Paths' => ['/srv/emby/managed/movies'],
+            'RefreshLibrary' => false,
+        ]);
+    Http::assertNotSent(fn (Request $request): bool => $request->method() === 'DELETE');
+});
+
+it('creates an Emby library with the server-default metadata and image downloaders', function () {
+    Http::preventStrayRequests();
+    Http::fake([
+        'https://emby.test:8096/Libraries/AvailableOptions*' => Http::response([
+            'MetadataReaders' => [['Name' => 'Nfo', 'DefaultEnabled' => true]],
+            'TypeOptions' => [[
+                'Type' => 'Movie',
+                'MetadataFetchers' => [
+                    ['Name' => 'TheMovieDb', 'DefaultEnabled' => true],
+                    ['Name' => 'The Open Movie Database', 'DefaultEnabled' => false],
+                ],
+                'ImageFetchers' => [
+                    ['Name' => 'TheMovieDb', 'DefaultEnabled' => true],
+                    ['Name' => 'FanArt', 'DefaultEnabled' => true],
+                    ['Name' => 'The Open Movie Database', 'DefaultEnabled' => false],
+                ],
+            ]],
+            'DefaultLibraryOptions' => ['EnableRealtimeMonitor' => true, 'PathInfos' => [], 'DisabledLocalMetadataReaders' => []],
+        ]),
+        'https://emby.test:8096/Library/VirtualFolders' => Http::sequence()
+            ->push([], 200)
+            ->push([], 204)
+            ->push([[
+                'ItemId' => 'library-1',
+                'Name' => 'Managed Movies',
+                'CollectionType' => 'movies',
+                'Locations' => ['/srv/emby/managed/movies'],
+            ]], 200),
+    ]);
+
+    $result = MediaServerService::make($this->integration)->createLibrary(
+        name: 'Managed Movies',
+        collectionType: 'movies',
+        paths: ['/srv/emby/managed/movies'],
+        refreshLibrary: false,
+    );
+
+    expect($result['success'])->toBeTrue()->and($result['created'])->toBeTrue();
+
+    Http::assertSent(fn (Request $request): bool => $request->method() === 'GET'
+        && str_starts_with($request->url(), 'https://emby.test:8096/Libraries/AvailableOptions')
+        && $request['LibraryContentType'] === 'movies'
+        && $request['IsNewLibrary'] === 'true');
+    Http::assertSent(fn (Request $request): bool => $request->method() === 'POST'
+        && $request->url() === 'https://emby.test:8096/Library/VirtualFolders'
+        && $request->data() === [
+            'Name' => 'Managed Movies',
+            'CollectionType' => 'movies',
+            'Paths' => ['/srv/emby/managed/movies'],
+            'RefreshLibrary' => false,
+            'LibraryOptions' => [
+                'EnableRealtimeMonitor' => true,
+                'PathInfos' => [['Path' => '/srv/emby/managed/movies']],
+                'DisabledLocalMetadataReaders' => [],
+                'TypeOptions' => [[
+                    'Type' => 'Movie',
+                    'MetadataFetchers' => ['TheMovieDb'],
+                    'MetadataFetcherOrder' => [],
+                    'ImageFetchers' => ['TheMovieDb', 'FanArt'],
+                    'ImageFetcherOrder' => [],
+                    'ImageOptions' => [],
+                ]],
+            ],
+        ]);
+});
+
+it('still creates an Emby library without options when downloader discovery fails', function (int $status, mixed $body) {
+    Http::preventStrayRequests();
+    Http::fake([
+        'https://emby.test:8096/Libraries/AvailableOptions*' => Http::response($body, $status),
+        'https://emby.test:8096/Library/VirtualFolders' => Http::sequence()
+            ->push([], 200)
+            ->push([], 204)
+            ->push([[
+                'ItemId' => 'library-1',
+                'Name' => 'Managed Movies',
+                'CollectionType' => 'movies',
+                'Locations' => ['/srv/emby/managed/movies'],
+            ]], 200),
+    ]);
+
+    $result = MediaServerService::make($this->integration)->createLibrary(
+        name: 'Managed Movies',
+        collectionType: 'movies',
+        paths: ['/srv/emby/managed/movies'],
+        refreshLibrary: false,
+    );
+
+    expect($result['success'])->toBeTrue()->and($result['created'])->toBeTrue();
+    Http::assertSent(fn (Request $request): bool => $request->method() === 'POST'
+        && $request->url() === 'https://emby.test:8096/Library/VirtualFolders'
+        && ! array_key_exists('LibraryOptions', $request->data()));
+})->with([
+    'server error' => [500, []],
+    'no type options' => [200, ['MetadataReaders' => []]],
+    'no enabled type' => [200, ['TypeOptions' => ['not-an-object']]],
+]);
+
+it('reconciles inventory after a create connection timeout and reports an ambiguous outcome', function () {
+    Http::preventStrayRequests();
+    $inventoryRequests = 0;
+    $createRequests = 0;
+    Http::fake([
+        'https://emby.test:8096/Library/VirtualFolders' => function (Request $request) use (&$inventoryRequests, &$createRequests) {
+            if ($request->method() === 'POST') {
+                $createRequests++;
+
+                throw new ConnectionException('secret timeout details');
+            }
+
+            $inventoryRequests++;
+
+            return Http::response([], 200);
+        },
+    ]);
+
+    $result = MediaServerService::make($this->integration)->createLibrary(
+        name: 'Managed Movies',
+        collectionType: 'movies',
+        paths: ['/srv/emby/managed/movies'],
+        refreshLibrary: false,
+    );
+
+    expect($result['success'])->toBeFalse()
+        ->and($result['created'])->toBeTrue()
+        ->and($result['message'])->not->toContain('secret timeout details')
+        ->and($inventoryRequests)->toBe(2)
+        ->and($createRequests)->toBe(1);
+});
+
+it('includes Mixed Content libraries when fetching Emby libraries', function () {
+    Http::preventStrayRequests();
+    Http::fake([
+        'https://emby.test:8096/Library/VirtualFolders' => Http::response([
+            [
+                'ItemId' => 'library-movies',
+                'Name' => 'Movies',
+                'CollectionType' => 'movies',
+                'Locations' => ['/srv/emby/movies'],
+            ],
+            [
+                'ItemId' => 'library-mixed',
+                'Name' => 'Everything',
+                // Emby reports no CollectionType for a "Mixed Content" library.
+                'Locations' => ['/srv/emby/mixed'],
+            ],
+        ], 200),
+    ]);
+
+    $libraries = MediaServerService::make($this->integration)->fetchLibraries();
+
+    expect($libraries)->toHaveCount(2)
+        ->and($libraries->firstWhere('id', 'library-mixed')['type'])->toBe('mixed')
+        ->and($libraries->firstWhere('id', 'library-movies')['type'])->toBe('movies');
+});
+
+it('rejects a managed library path already owned by a different Emby library', function () {
+    Http::preventStrayRequests();
+    Http::fake([
+        'https://emby.test:8096/Library/VirtualFolders' => Http::response([[
+            'ItemId' => 'other-library',
+            'Name' => 'Different Name',
+            'CollectionType' => 'movies',
+            'Locations' => ['/srv/emby/managed/movies'],
+        ]]),
+    ]);
+
+    $result = MediaServerService::make($this->integration)->createLibrary(
+        name: 'Managed Movies',
+        collectionType: 'movies',
+        paths: ['/srv/emby/managed/movies'],
+        refreshLibrary: false,
+    );
+
+    expect($result['success'])->toBeFalse();
+    Http::assertSentCount(1);
+    Http::assertNotSent(fn (Request $request): bool => $request->method() === 'POST');
+});
+
+it('does not create a library when the managed inventory request fails', function (int $status) {
+    Http::preventStrayRequests();
+    Http::fake([
+        'https://emby.test:8096/Library/VirtualFolders' => Http::response([], $status),
+    ]);
+
+    $result = MediaServerService::make($this->integration)->createLibrary(
+        name: 'Managed Movies',
+        collectionType: 'movies',
+        paths: ['/srv/emby/managed/movies'],
+        refreshLibrary: false,
+    );
+
+    expect($result['success'])->toBeFalse();
+    Http::assertSentCount(1);
+    Http::assertNotSent(fn (Request $request): bool => $request->method() === 'POST');
+})->with([
+    'redirect' => 302,
+    'unauthorized' => 401,
+    'forbidden' => 403,
+    'server failure' => 500,
+]);
+
+it('rejects overlapping managed library paths', function (string $root, string $existingPath, string $requestedPath) {
+    $this->integration->update(['emby_publisher_writable_paths' => [$root]]);
+    Http::preventStrayRequests();
+    Http::fake([
+        'https://emby.test:8096/Library/VirtualFolders' => Http::response([[
+            'ItemId' => 'other-library',
+            'Name' => 'Different Name',
+            'CollectionType' => 'movies',
+            'Locations' => [$existingPath],
+        ]]),
+    ]);
+
+    $result = MediaServerService::make($this->integration->refresh())->createLibrary(
+        name: 'Managed Movies',
+        collectionType: 'movies',
+        paths: [$requestedPath],
+        refreshLibrary: false,
+    );
+
+    expect($result['success'])->toBeFalse();
+    Http::assertSentCount(1);
+    Http::assertNotSent(fn (Request $request): bool => $request->method() === 'POST');
+})->with([
+    'Unix requested child' => ['/srv/emby', '/srv/emby/movies', '/srv/emby/movies/child'],
+    'Unix requested parent' => ['/srv/emby', '/srv/emby/movies/child', '/srv/emby/movies'],
+    'Windows requested child' => ['C:\\Emby', 'C:\\Emby\\Movies', 'C:\\Emby\\Movies\\Child'],
+    'Windows requested parent' => ['C:\\Emby', 'C:\\Emby\\Movies\\Child', 'C:\\Emby\\Movies'],
+]);
+
+it('rejects unsupported Emby library collection types before making a request', function () {
+    Http::preventStrayRequests();
+    Http::fake();
+
+    $result = MediaServerService::make($this->integration)->createLibrary(
+        name: 'Managed Music',
+        collectionType: 'music',
+        paths: ['/srv/emby/managed/music'],
+    );
+
+    expect($result)->toMatchArray([
+        'success' => false,
+        'created' => false,
+    ]);
+    Http::assertNothingSent();
+});
+
+it('rejects non-absolute Emby library paths before making a request', function () {
+    Http::preventStrayRequests();
+    Http::fake();
+
+    $result = MediaServerService::make($this->integration)->createLibrary(
+        name: 'Managed Movies',
+        collectionType: 'movies',
+        paths: ['relative/movies'],
+    );
+
+    expect($result['success'])->toBeFalse();
+    Http::assertNothingSent();
+});
+
+it('does not create libraries for Jellyfin integrations', function () {
+    Http::preventStrayRequests();
+    Http::fake();
+    $this->integration->update(['type' => 'jellyfin']);
+
+    $result = MediaServerService::make($this->integration)->createLibrary(
+        name: 'Managed Movies',
+        collectionType: 'movies',
+        paths: ['/srv/jellyfin/managed/movies'],
+    );
+
+    expect($result['success'])->toBeFalse();
+    Http::assertNothingSent();
+});
+
+it('reconciles an existing Emby library by stable ID without creating a duplicate', function () {
+    Http::preventStrayRequests();
+    Http::fake([
+        'https://emby.test:8096/Library/VirtualFolders' => Http::response([[
+            'ItemId' => 'library-1',
+            'Name' => 'Renamed Managed Movies',
+            'CollectionType' => 'movies',
+            'Locations' => ['/srv/emby/moved/movies'],
+        ]], 200),
+    ]);
+
+    $result = MediaServerService::make($this->integration)->createLibrary(
+        name: 'Managed Movies',
+        collectionType: 'movies',
+        paths: ['/srv/emby/managed/movies'],
+        libraryId: 'library-1',
+    );
+
+    expect($result['success'])->toBeTrue()
+        ->and($result['created'])->toBeFalse()
+        ->and($result['library']['id'])->toBe('library-1')
+        ->and($result['drift'])->toBeTrue();
+    Http::assertSentCount(1);
+    Http::assertNotSent(fn (Request $request): bool => $request->method() === 'POST'
+        || $request->method() === 'DELETE');
+});
+
+it('does not drift an existing library when its selected path remains among several paths', function () {
+    Http::preventStrayRequests();
+    Http::fake([
+        'https://emby.test:8096/Library/VirtualFolders' => Http::response([[
+            'ItemId' => 'library-1',
+            'Name' => 'Managed Movies',
+            'CollectionType' => 'movies',
+            'Locations' => ['/srv/emby/managed/movies', '/srv/emby/archive/movies'],
+        ]], 200),
+    ]);
+
+    $result = MediaServerService::make($this->integration)->createLibrary(
+        name: 'Managed Movies',
+        collectionType: 'movies',
+        paths: ['/srv/emby/managed/movies'],
+        libraryId: 'library-1',
+    );
+
+    expect($result['success'])->toBeTrue()
+        ->and($result['created'])->toBeFalse()
+        ->and($result['drift'])->toBeFalse();
+    Http::assertSentCount(1);
+});
+
+it('does not drift when a managed mapping path is below an existing library location', function () {
+    Http::preventStrayRequests();
+    Http::fake([
+        'https://emby.test:8096/Library/VirtualFolders' => Http::response([[
+            'ItemId' => 'library-1',
+            'Name' => 'Managed Movies',
+            'CollectionType' => 'movies',
+            'Locations' => ['/srv/emby/managed/movies'],
+        ]], 200),
+    ]);
+
+    $result = MediaServerService::make($this->integration)->createLibrary(
+        name: 'Managed Movies',
+        collectionType: 'movies',
+        paths: ['/srv/emby/managed/movies/action-a1b2c3'],
+        libraryId: 'library-1',
+    );
+
+    expect($result['success'])->toBeTrue()
+        ->and($result['created'])->toBeFalse()
+        ->and($result['drift'])->toBeFalse();
+    Http::assertSentCount(1);
+});
+
+it('keeps drift when the existing library location is below the requested mapping path', function () {
+    Http::preventStrayRequests();
+    Http::fake([
+        'https://emby.test:8096/Library/VirtualFolders' => Http::response([[
+            'ItemId' => 'library-1',
+            'Name' => 'Managed Movies',
+            'CollectionType' => 'movies',
+            'Locations' => ['/srv/emby/managed/movies/action-a1b2c3'],
+        ]], 200),
+    ]);
+
+    $result = MediaServerService::make($this->integration)->createLibrary(
+        name: 'Managed Movies',
+        collectionType: 'movies',
+        paths: ['/srv/emby/managed/movies'],
+        libraryId: 'library-1',
+    );
+
+    expect($result['success'])->toBeTrue()
+        ->and($result['created'])->toBeFalse()
+        ->and($result['drift'])->toBeTrue();
+    Http::assertSentCount(1);
+});
+
+it('matches an existing Windows library path without case or separator drift', function () {
+    $this->integration->update(['emby_publisher_writable_paths' => ['C:\\Emby']]);
+    Http::preventStrayRequests();
+    Http::fake([
+        'https://emby.test:8096/Library/VirtualFolders' => Http::response([[
+            'ItemId' => 'library-1',
+            'Name' => 'Managed Movies',
+            'CollectionType' => 'movies',
+            'Locations' => ['C:/EMBY/Managed/Movies'],
+        ]], 200),
+    ]);
+
+    $result = MediaServerService::make($this->integration->refresh())->createLibrary(
+        name: 'Managed Movies',
+        collectionType: 'movies',
+        paths: ['c:\\emby\\managed\\movies'],
+        libraryId: 'library-1',
+    );
+
+    expect($result['success'])->toBeTrue()
+        ->and($result['drift'])->toBeFalse();
+    Http::assertSentCount(1);
+});
+
+it('keeps drift when the selected path is missing from an existing library', function () {
+    Http::preventStrayRequests();
+    Http::fake([
+        'https://emby.test:8096/Library/VirtualFolders' => Http::response([[
+            'ItemId' => 'library-1',
+            'Name' => 'Managed Movies',
+            'CollectionType' => 'movies',
+            'Locations' => ['/srv/emby/archive/movies'],
+        ]], 200),
+    ]);
+
+    $result = MediaServerService::make($this->integration)->createLibrary(
+        name: 'Managed Movies',
+        collectionType: 'movies',
+        paths: ['/srv/emby/managed/movies'],
+        libraryId: 'library-1',
+    );
+
+    expect($result['success'])->toBeTrue()
+        ->and($result['drift'])->toBeTrue();
+    Http::assertSentCount(1);
+});
+
+it('keeps drift when the stable target ID is missing despite an exact library', function () {
+    Http::preventStrayRequests();
+    Http::fake([
+        'https://emby.test:8096/Library/VirtualFolders' => Http::response([[
+            'ItemId' => 'library-2',
+            'Name' => 'Managed TV',
+            'CollectionType' => 'tvshows',
+            'Locations' => ['/srv/emby/managed/tv'],
+        ]], 200),
+    ]);
+
+    $result = MediaServerService::make($this->integration)->createLibrary(
+        name: 'Managed TV',
+        collectionType: 'tvshows',
+        paths: ['/srv/emby/managed/tv'],
+        libraryId: 'missing-library',
+    );
+
+    expect($result['success'])->toBeTrue()
+        ->and($result['created'])->toBeFalse()
+        ->and($result['library'])->toBeNull()
+        ->and($result['drift'])->toBeTrue();
+    Http::assertSentCount(1);
+    Http::assertNotSent(fn (Request $request): bool => $request->method() === 'POST'
+        || $request->method() === 'DELETE');
+});
+
+it('keeps drift when an existing mapping path is unsafe or no longer companion-writable', function (string $path) {
+    Http::preventStrayRequests();
+    Http::fake();
+
+    $result = MediaServerService::make($this->integration)->createLibrary(
+        name: 'Managed Movies',
+        collectionType: 'movies',
+        paths: [$path],
+        libraryId: 'library-1',
+    );
+
+    expect($result['success'])->toBeTrue()
+        ->and($result['created'])->toBeFalse()
+        ->and($result['library'])->toBeNull()
+        ->and($result['drift'])->toBeTrue();
+    Http::assertNothingSent();
+})->with([
+    'unsafe traversal' => ['/srv/emby/managed/../private'],
+    'outside registered root' => ['/mnt/private/movies'],
+]);
+
+it('fails closed when an Emby library name exists at a different path', function () {
+    Http::preventStrayRequests();
+    Http::fake([
+        'https://emby.test:8096/Library/VirtualFolders' => Http::response([[
+            'ItemId' => 'library-3',
+            'Name' => 'Managed Movies',
+            'CollectionType' => 'movies',
+            'Locations' => ['/srv/emby/unmanaged/movies'],
+        ]], 200),
+    ]);
+
+    $result = MediaServerService::make($this->integration)->createLibrary(
+        name: 'Managed Movies',
+        collectionType: 'movies',
+        paths: ['/srv/emby/managed/movies'],
+    );
+
+    expect($result['success'])->toBeFalse()
+        ->and($result['created'])->toBeFalse()
+        ->and($result['drift'])->toBeTrue();
+    Http::assertSentCount(1);
+    Http::assertNotSent(fn (Request $request): bool => $request->method() === 'POST'
+        || $request->method() === 'DELETE');
+});
+
+it('normalizes Emby errors without exposing response details', function () {
+    Http::preventStrayRequests();
+    Http::fakeSequence('https://emby.test:8096/Library/VirtualFolders')
+        ->push([], 200)
+        ->push('upstream secret: emby-secret', 500)
+        ->push('upstream secret: emby-secret', 500);
+
+    $result = MediaServerService::make($this->integration)->createLibrary(
+        name: 'Managed Movies',
+        collectionType: 'movies',
+        paths: ['/srv/emby/managed/movies'],
+    );
+
+    expect($result['success'])->toBeFalse()
+        ->and($result['message'])->not->toContain('emby-secret')
+        ->and($result['message'])->not->toContain('upstream secret');
+    Http::assertNotSent(fn (Request $request): bool => $request->method() === 'DELETE');
+});
+
+it('fails closed for movie imports while a created managed library is unresolved', function () {
+    EmbyLibraryMapping::factory()
+        ->for($this->integration->user)
+        ->for($this->integration, 'integration')
+        ->create([
+            'collection_type' => 'movies',
+            'target_library_id' => null,
+            'target_library_name' => 'Managed Movies',
+            'output_path' => '/srv/emby/managed/movies',
+            'is_managed' => true,
+            'enabled' => true,
+        ]);
+    Http::preventStrayRequests();
+    Http::fake([
+        'https://emby.test:8096/Library/VirtualFolders' => Http::sequence()
+            ->push([], 200)
+            ->push([], 204)
+            ->push([], 200),
+        'https://emby.test:8096/Items*' => Http::response(['Items' => []], 200),
+    ]);
+
+    $service = MediaServerService::make($this->integration);
+    $result = $service->createLibrary(
+        name: 'Managed Movies',
+        collectionType: 'movies',
+        paths: ['/srv/emby/managed/movies'],
+        refreshLibrary: false,
+    );
+
+    expect($result['success'])->toBeTrue()
+        ->and($result['created'])->toBeTrue()
+        ->and($result['library'])->toBeNull()
+        ->and($service->fetchMovies())->toBeEmpty();
+    Http::assertNotSent(fn (Request $request): bool => str_starts_with($request->url(), 'https://emby.test:8096/Items?')
+        && ($request->data()['ParentId'] ?? null) === null);
+});
+
+it('fails closed for series imports while a managed library is unresolved', function () {
+    EmbyLibraryMapping::factory()
+        ->for($this->integration->user)
+        ->for($this->integration, 'integration')
+        ->create([
+            'collection_type' => 'tvshows',
+            'target_library_id' => null,
+            'target_library_name' => 'Managed TV',
+            'output_path' => '/srv/emby/managed/tv',
+            'is_managed' => true,
+            'enabled' => true,
+        ]);
+    Http::preventStrayRequests();
+    Http::fake([
+        'https://emby.test:8096/Items*' => Http::response(['Items' => []], 200),
+    ]);
+
+    expect(MediaServerService::make($this->integration)->fetchSeries())->toBeEmpty();
+    Http::assertNothingSent();
+});
+
+it('excludes managed Emby libraries from default movie imports', function () {
+    $this->integration->update([
+        'available_libraries' => [
+            ['id' => 'source-library', 'name' => 'Source Movies', 'type' => 'movies'],
+            ['id' => 'managed-library', 'name' => 'Managed Movies', 'type' => 'movies'],
+        ],
+        'selected_library_ids' => [],
+    ]);
+    EmbyLibraryMapping::factory()
+        ->for($this->integration->user)
+        ->for($this->integration, 'integration')
+        ->create([
+            'target_library_id' => 'managed-library',
+            'target_library_name' => 'Managed Movies',
+            'is_managed' => true,
+        ]);
+    Http::preventStrayRequests();
+    Http::fake([
+        'https://emby.test:8096/Items*' => Http::response(['Items' => []], 200),
+    ]);
+
+    MediaServerService::make($this->integration->refresh())->fetchMovies();
+
+    Http::assertSentCount(1);
+    Http::assertSent(fn (Request $request): bool => $request->method() === 'GET'
+        && ($request->data()['ParentId'] ?? null) === 'source-library');
+    Http::assertNotSent(fn (Request $request): bool => ($request->data()['ParentId'] ?? null) === 'managed-library'
+        || ($request->method() === 'GET' && ($request->data()['ParentId'] ?? null) === null));
+});
+
+it('preserves unfiltered imports for media types without selected libraries', function () {
+    $this->integration->update([
+        'available_libraries' => [
+            ['id' => 'movie-library', 'name' => 'Movies', 'type' => 'movies'],
+            ['id' => 'series-library', 'name' => 'Series', 'type' => 'tvshows'],
+        ],
+        'selected_library_ids' => ['series-library'],
+    ]);
+
+    expect($this->integration->getImportLibraryIdsForType('movies'))->toBeNull()
+        ->and($this->integration->getImportLibraryIdsForType('tvshows'))->toBe(['series-library']);
+});

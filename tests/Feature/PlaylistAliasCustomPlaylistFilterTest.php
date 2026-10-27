@@ -16,9 +16,11 @@ use App\Filament\Resources\PlaylistAliases\Pages\CreatePlaylistAlias;
 use App\Filament\Resources\PlaylistAliases\Pages\EditPlaylistAlias;
 use App\Filament\Tables\CustomPlaylistGroupsTable;
 use App\Http\Controllers\PlaylistGenerateController;
+use App\Models\Bouquet;
 use App\Models\Category;
 use App\Models\Channel;
 use App\Models\CustomPlaylist;
+use App\Models\Episode;
 use App\Models\Playlist;
 use App\Models\PlaylistAlias;
 use App\Models\Series;
@@ -454,6 +456,21 @@ describe('getChannelQuery custom playlist live group ordering', function () {
             ->and($content)->not->toContain('group-title="Provider Sports"');
     });
 
+    it('labels M3U series episodes with the custom category tag rather than the provider category (issue #1671)', function () {
+        $providerCategory = Category::factory()->for($this->user)->for($this->playlist)->create(['name' => 'Provider Drama']);
+        $series = Series::factory()->for($this->user)->for($this->playlist)->for($providerCategory)->create(['enabled' => true]);
+        $series->episodes()->save(Episode::factory()->for($this->user)->for($this->playlist)->make(['enabled' => true]));
+        $this->customPlaylist->series()->attach($series->id);
+        tagSeries($this->customPlaylist, 'My Collection', [$series]);
+
+        $this->customPlaylist->update(['include_series_in_m3u' => true]);
+
+        $content = $this->get("/{$this->customPlaylist->uuid}/playlist.m3u")->assertOk()->streamedContent();
+
+        expect($content)->toContain('group-title="My Collection"')
+            ->and($content)->not->toContain('group-title="Provider Drama"');
+    });
+
     it('emits M3U group-titles in the alias custom order', function () {
         $news = addCustomChannel($this->user, $this->playlist, $this->customPlaylist, ['title' => 'CNN']);
         $sports = addCustomChannel($this->user, $this->playlist, $this->customPlaylist, ['title' => 'ESPN']);
@@ -732,4 +749,34 @@ it('keeps an existing custom playlist filter when the edit form is saved untouch
         ->assertHasNoFormErrors();
 
     expect($alias->refresh()->getAllowedLiveGroupNames())->toBe(['Sports']);
+});
+
+it('does not materialize bouquet names into group_filter when the form is saved (R1 guard)', function () {
+    $this->actingAs($this->user);
+
+    $sports = addCustomChannel($this->user, $this->playlist, $this->customPlaylist);
+    tagChannels($this->customPlaylist, 'Manual Group', [$sports]);
+
+    $alias = makeCustomAlias($this->user, $this->customPlaylist, ['selected_groups' => ['Manual Group']], [
+        'xtream_config' => [[
+            'url' => 'http://example.com:8080',
+            'username' => 'alias-user',
+            'password' => 'alias-pass',
+        ]],
+    ]);
+
+    $bouquet = Bouquet::factory()->create([
+        'user_id' => $this->user->id,
+        'playlist_id' => null,
+        'custom_playlist_id' => $this->customPlaylist->id,
+        'group_selections' => ['selected_groups' => ['Bouquet Group']],
+    ]);
+    $alias->bouquets()->sync([$bouquet->id]);
+
+    Livewire::test(EditPlaylistAlias::class, ['record' => $alias->getRouteKey()])
+        ->assertSuccessful()
+        ->call('save')
+        ->assertHasNoFormErrors();
+
+    expect($alias->refresh()->group_filter['selected_groups'])->toBe(['Manual Group']);
 });

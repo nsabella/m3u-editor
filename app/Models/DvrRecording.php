@@ -8,6 +8,7 @@ use App\Enums\DvrRuleType;
 use App\Events\DvrRecordingStatusEvent;
 use App\Notifications\Notification as AppNotification;
 use App\Services\ShowMetadataService;
+use App\Support\EpisodeNumberParser;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
@@ -17,10 +18,23 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
+use Symfony\Component\HttpFoundation\StreamedResponse;
 
 class DvrRecording extends Model
 {
     use HasFactory;
+
+    /**
+     * Bare film genres that EPG providers use as the whole category for movies.
+     * A subtitle alongside one of these is not evidence of an episode. Matched
+     * against the entire category, so "Crime drama" or "Kids animation" don't count.
+     *
+     * @var list<string>
+     */
+    private const FILM_GENRE_CATEGORIES = [
+        'drama', 'action', 'thriller', 'comedy', 'horror', 'romance', 'western',
+        'sci-fi', 'science fiction', 'fantasy', 'adventure', 'crime', 'mystery', 'suspense',
+    ];
 
     /**
      * @return array<string, string>
@@ -334,11 +348,28 @@ class DvrRecording extends Model
             return;
         }
 
+        $playlistAuth = $this->playlistAuth;
+
+        // A guest whose credential has since been disabled, has expired, or
+        // had DVR access turned off shouldn't keep receiving notifications
+        // about recordings tied to their account.
+        if ($playlistAuth && ! $playlistAuth->isEligibleForDvrNotifications()) {
+            return;
+        }
+
         AppNotification::make()
             ->title($title)
             ->body($this->title)
             ->status($status)
-            ->tvBroadcast($playlist, 'dvr');
+            // Owner-created recordings (null playlistAuth) notify only the
+            // admin/owner channel; guest recordings notify only the guest who
+            // created them — never every other guest sharing the playlist.
+            ->tvBroadcast(
+                $playlist,
+                'dvr',
+                adminOnly: $playlistAuth === null,
+                playlistAuth: $playlistAuth,
+            );
     }
 
     public function user(): BelongsTo
@@ -407,11 +438,119 @@ class DvrRecording extends Model
     }
 
     /**
+     * Decide whether this recording is TV content (series/episode) rather than a movie.
+     *
+     * Priority order (first match wins):
+     *
+     *   1. TMDB metadata type (definitive when present)
+     *   2. season/episode columns
+     *   3. epg_programme_data.episode_num, when it parses as a real season/episode
+     *   4. Gracenote/Schedules Direct programme ID in episode_num (dd_progid):
+     *      "MV..." → movie, "EP..."/"SH..."/"SP..." → TV
+     *   5. EPG category containing movie/film → movie
+     *   6. Recorded by a Series rule
+     *   7. EPG category with TV-ish keywords → TV
+     *   8. Non-movie category with a subtitle → TV. Bare film genres ("Drama", "Action")
+     *      are skipped here, since movies often carry a subtitle (tagline, edition, original title).
+     *
+     * series_key is deliberately not a signal: every recording gets one, including movies.
+     * Neither is a TVMaze match: its singlesearch is fuzzy and returns a show for most movie titles.
+     */
+    public function isTvContent(): bool
+    {
+        $tmdbType = $this->metadata['tmdb']['type'] ?? null;
+
+        if ($tmdbType !== null) {
+            return $tmdbType === 'tv';
+        }
+
+        if ($this->season !== null || $this->episode !== null) {
+            return true;
+        }
+
+        // Covers recordings made before season/episode were parsed at schedule time.
+        $episodeNum = $this->epg_programme_data['episode_num'] ?? null;
+        [$season, $episode] = EpisodeNumberParser::fromRaw($episodeNum);
+
+        if ($season !== null || $episode !== null) {
+            return true;
+        }
+
+        if ($episodeNum !== null && preg_match('/^(MV|EP|SH|SP)\d{6}/i', trim($episodeNum), $programmeId)) {
+            return strtoupper($programmeId[1]) !== 'MV';
+        }
+
+        $category = mb_strtolower(trim((string) ($this->epg_programme_data['category'] ?? '')));
+
+        if (Str::contains($category, ['movie', 'film'])) {
+            return false;
+        }
+
+        if ($this->recordingRule?->type === DvrRuleType::Series) {
+            return true;
+        }
+
+        if ($category === '') {
+            return false;
+        }
+
+        if (Str::contains($category, ['series', 'episode', 'tv', 'show', 'news', 'documentary', 'talk'])) {
+            return true;
+        }
+
+        if (in_array($category, self::FILM_GENRE_CATEGORIES, true)) {
+            return false;
+        }
+
+        return trim((string) $this->subtitle) !== '';
+    }
+
+    /**
      * Whether this recording has a completed file on disk.
      */
     public function hasFilePath(): bool
     {
         return $this->status === DvrRecordingStatus::Completed && ! empty($this->file_path);
+    }
+
+    /**
+     * Resolve the storage disk this recording's file lives on.
+     */
+    public function resolveStorageDisk(): string
+    {
+        return $this->dvrSetting?->storage_disk ?: config('dvr.storage_disk');
+    }
+
+    /**
+     * Resolve the MIME type from the recording file's extension.
+     */
+    public function resolveMimeType(): string
+    {
+        return match (strtolower(pathinfo($this->file_path, PATHINFO_EXTENSION))) {
+            'mp4' => 'video/mp4',
+            'mkv' => 'video/x-matroska',
+            default => 'video/mp2t',
+        };
+    }
+
+    /**
+     * Build a download response for this recording's file, or null if the
+     * file is missing from disk. Delegates the actual streaming to the
+     * storage disk's driver rather than hand-rolling fopen/fread, so
+     * missing/unreadable files are handled by Flysystem instead of risking
+     * a TypeError from feof()/fread() on a failed fopen().
+     */
+    public function downloadResponse(): ?StreamedResponse
+    {
+        $disk = $this->resolveStorageDisk();
+
+        if (! Storage::disk($disk)->exists($this->file_path)) {
+            return null;
+        }
+
+        return Storage::disk($disk)->download($this->file_path, basename($this->file_path), [
+            'Content-Type' => $this->resolveMimeType(),
+        ]);
     }
 
     /**
@@ -434,21 +573,20 @@ class DvrRecording extends Model
 
     /**
      * Build the attribute array used to open this recording in the floating player.
-     * Mirrors Episode::getFloatingPlayerAttributes() for consistent dispatch shape.
+     * Mirrors Episode::getFloatingPlayerAttributes() for consistent dispatch shape:
+     * the given credentials (e.g. a guest's) when set, otherwise the owner's.
      */
-    public function getFloatingPlayerAttributes(): array
+    public function getFloatingPlayerAttributes(?string $username = null, ?string $password = null): array
     {
         $playlist = $this->dvrSetting?->owner();
-        $username = $this->user->name;
         $format = $this->status === DvrRecordingStatus::Completed
             ? ($this->dvrSetting?->dvr_output_format ?? 'mp4')
             : 'm3u8';
 
-        $routeParams = [
-            'username' => $username,
-            'password' => $playlist->uuid,
-            'uuid' => $this->uuid,
-        ];
+        $routeParams = $username && $password
+            ? ['username' => $username, 'password' => $password]
+            : ['username' => $this->user->name, 'password' => $playlist?->getInternalAuthPassword()];
+        $routeParams['uuid'] = $this->uuid;
 
         return [
             'id' => 'dvr-recording-'.$this->id,

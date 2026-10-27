@@ -131,10 +131,7 @@ class DvrRecordingResource extends Resource
                                     ImageEntry::make('channel_icon')
                                         ->label(__('Channel Icon'))
                                         ->hidden(fn (DvrRecording $record): bool => ! $record->channel_icon)
-                                        ->height(80)
-                                        ->width(80)
-                                        ->square()
-                                        ->extraImgAttributes(['class' => 'rounded-md']),
+                                        ->extraImgAttributes(['class' => 'h-20 w-auto max-w-full object-contain rounded-md']),
                                 ]),
                         ]),
 
@@ -304,17 +301,6 @@ class DvrRecordingResource extends Resource
             ->recordActions([
                 ActionGroup::make([
                     ViewAction::make(),
-                    Action::make('watch')
-                        ->label(__('Watch'))
-                        ->icon('heroicon-o-play-circle')
-                        ->color('success')
-                        ->visible(fn (DvrRecording $record): bool => in_array($record->status, [
-                            DvrRecordingStatus::Recording,
-                            DvrRecordingStatus::Completed,
-                        ]) && $record->dvrSetting?->owner())
-                        ->action(function (DvrRecording $record, $livewire): void {
-                            $livewire->dispatch('openFloatingStream', $record->getFloatingPlayerAttributes());
-                        }),
                     Action::make('retry')
                         ->label(__('Retry Post-Processing'))
                         ->icon('heroicon-o-arrow-path')
@@ -362,9 +348,31 @@ class DvrRecordingResource extends Resource
                                 ->title(__('Comskip reprocessing queued'))
                                 ->send();
                         }),
+                    Action::make('download')
+                        ->label(__('Download'))
+                        ->icon('heroicon-o-arrow-down-tray')
+                        ->color('gray')
+                        ->visible(fn (DvrRecording $record): bool => $record->hasFilePath())
+                        ->url(fn (DvrRecording $record): string => route('dvr-recordings.download', $record))
+                        ->openUrlInNewTab(),
                     DeleteAction::make()
                         ->modalDescription(__('Are you sure you want to delete this recording? The file on disk and any linked VOD entry will also be removed.')),
                 ])->button()->hiddenLabel()->size('sm'),
+                Action::make('play')
+                    ->label(__('Watch'))
+                    ->tooltip(__('Watch'))
+                    ->action(function (DvrRecording $record, $livewire): void {
+                        $livewire->dispatch('openFloatingStream', $record->getFloatingPlayerAttributes());
+                    })
+                    ->icon('heroicon-s-play-circle')
+                    ->color('success')
+                    ->visible(fn (DvrRecording $record): bool => in_array($record->status, [
+                        DvrRecordingStatus::Recording,
+                        DvrRecordingStatus::Completed,
+                    ]) && $record->dvrSetting?->owner())
+                    ->button()
+                    ->hiddenLabel()
+                    ->size('sm'),
             ], position: RecordActionsPosition::BeforeCells)
             ->toolbarActions([
                 BulkActionGroup::make([

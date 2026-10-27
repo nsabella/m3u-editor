@@ -7,6 +7,7 @@ use App\Jobs\GroupFindAndReplace;
 use App\Jobs\GroupFindAndReplaceReset;
 use App\Models\Playlist;
 use App\Services\FindReplaceService;
+use App\Services\MergedGroupService;
 use Filament\Actions\Action;
 use Filament\Actions\ActionGroup;
 use Filament\Actions\CreateAction;
@@ -42,7 +43,10 @@ class ListGroups extends ListRecords
                         ->success()
                         ->title(__('Group created'))
                         ->body(__('You can now assign channels to this group from the Channels section.')),
-                )->slideOver(),
+                )
+                ->successRedirectUrl(fn (Model $record): string => GroupResource::getUrl('edit', ['record' => $record]))
+                ->slideOver(),
+            MergedGroupService::createMergedGroupAction('live'),
             ActionGroup::make([
                 Action::make('find-replace')
                     ->label(__('Find & Replace'))

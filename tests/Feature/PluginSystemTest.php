@@ -1,6 +1,8 @@
 <?php
 
+use App\Filament\Resources\Plugins\Pages\EditPlugin;
 use App\Filament\Resources\Plugins\Pages\ViewPluginRun;
+use App\Filament\Resources\QueueMonitor\QueueMonitorResource;
 use App\Jobs\ExecutePluginInvocation;
 use App\Models\Plugin;
 use App\Models\PluginInstallReview;
@@ -8,6 +10,8 @@ use App\Models\PluginRun;
 use App\Models\User;
 use App\Plugins\PluginManager;
 use App\Plugins\PluginValidator;
+use Filament\Actions\Action;
+use Filament\Notifications\Notification;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Queue;
@@ -830,6 +834,82 @@ it('downgrades trust when a trusted fixture plugin file changes', function () {
     }
 });
 
+it('warns about a possibly stale queue worker when re-trusting a previously active plugin (issue #1667)', function () {
+    $pluginId = 'restale-fixture-'.Str::lower(Str::random(6));
+    $pluginManager = app(PluginManager::class);
+
+    try {
+        $installed = installFixturePluginForTests($pluginId, trust: true, enabled: true);
+        $plugin = $installed['plugin'];
+        $manifestPath = rtrim((string) $plugin?->path, DIRECTORY_SEPARATOR).DIRECTORY_SEPARATOR.'plugin.json';
+        $originalManifest = File::get($manifestPath);
+        $decoded = json_decode($originalManifest, true, flags: JSON_THROW_ON_ERROR);
+        $decoded['description'] = 'Tampered during test '.Str::random(6);
+        File::put($manifestPath, json_encode($decoded, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES).PHP_EOL);
+
+        $plugin = $pluginManager->verifyIntegrity($plugin->fresh());
+        expect($plugin->integrity_status)->toBe('changed')
+            ->and($plugin->enabled)->toBeFalse();
+
+        // Re-trusting a hash the plugin manager has never seen approved needs a fresh
+        // review for the tampered files first - this is the real "Submit for Review" ->
+        // scan -> approve path, matching how an admin would actually clear the way to
+        // re-trust after changing a plugin's files on disk.
+        $review = $pluginManager->stageDirectoryReview((string) $plugin->path);
+        $review = $pluginManager->scanInstallReview($review);
+        $pluginManager->approveInstallReview($review, trust: false);
+
+        $admin = User::factory()->create(['is_admin' => true]);
+        $this->actingAs($admin);
+
+        Livewire::test(EditPlugin::class, ['record' => $plugin->getKey()])
+            ->callAction('trust')
+            ->assertNotified(
+                Notification::make()
+                    ->success()
+                    ->title(__('Plugin trusted and activated'))
+                    ->body(__('Updated files have been trusted and the plugin is now active. A queue worker that already ran this plugin may keep executing the previous version until it recycles - use Reset Queue on the Queue Monitor page if you need the update to take effect immediately.'))
+                    ->persistent()
+                    ->actions([
+                        Action::make('view_queue_monitor')
+                            ->label(__('Reset Queue'))
+                            ->url(QueueMonitorResource::getUrl('index')),
+                    ])
+            );
+
+        $plugin->refresh();
+        expect($plugin->enabled)->toBeTrue();
+    } finally {
+        if (isset($originalManifest)) {
+            File::put($manifestPath, $originalManifest);
+        }
+        cleanupReviewFixturePlugin($pluginId);
+    }
+});
+
+it('does not warn about a stale worker when trusting a plugin for the first time', function () {
+    $pluginId = 'first-trust-fixture-'.Str::lower(Str::random(6));
+
+    try {
+        $installed = installFixturePluginForTests($pluginId, trust: false, enabled: false);
+        $plugin = $installed['plugin'];
+
+        $admin = User::factory()->create(['is_admin' => true]);
+        $this->actingAs($admin);
+
+        Livewire::test(EditPlugin::class, ['record' => $plugin->getKey()])
+            ->callAction('trust')
+            ->assertNotified(
+                Notification::make()
+                    ->success()
+                    ->title(__('Plugin trusted'))
+                    ->body(__('The plugin is now trusted. You can enable it when you are ready.'))
+            );
+    } finally {
+        cleanupReviewFixturePlugin($pluginId);
+    }
+});
+
 it('supports plugin lifecycle and trust commands for a fixture plugin', function () {
     $pluginId = 'cli-fixture-'.Str::lower(Str::random(6));
     $paths = createReviewFixturePlugin($pluginId);
@@ -913,6 +993,72 @@ it('updates an installed fixture plugin from a reviewed archive and keeps it ena
         cleanupReviewFixturePlugin($pluginId);
     }
 });
+
+it('reports installed plugin updates according to their enabled state', function (bool $enabled) {
+    Http::preventStrayRequests();
+    config()->set('plugins.auto_trust_official', true);
+    $pluginId = 'update-notification-'.Str::lower(Str::random(6));
+    $repository = 'm3ue/'.$pluginId.'-plugin';
+
+    try {
+        $installed = installFixturePluginForTests($pluginId, enabled: $enabled, manifestOverrides: ['repository' => $repository]);
+        $plugin = $installed['plugin'];
+        $paths = createReviewFixturePlugin($pluginId, manifestOverrides: [
+            'repository' => $repository,
+            'version' => '1.0.1',
+        ]);
+        createZipArchiveForTests($paths['source'], $paths['archive']);
+        $releaseUrl = "https://github.com/{$repository}/releases/download/v1.0.1/{$pluginId}.zip";
+        $checksum = hash_file('sha256', $paths['archive']);
+        $plugin->update([
+            'latest_version' => '1.0.1',
+            'latest_release_url' => $releaseUrl,
+            'latest_release_sha256' => $checksum,
+        ]);
+        Http::fake([
+            $releaseUrl => Http::response(File::get($paths['archive']), 200, ['Content-Type' => 'application/zip']),
+        ]);
+        $this->actingAs(User::factory()->admin()->create());
+
+        $page = Livewire::test(EditPlugin::class, ['record' => $plugin->getKey()])
+            ->assertActionVisible('stage_update')
+            ->callAction('stage_update')
+            ->assertHasNoActionErrors();
+
+        $updatedPlugin = $plugin->fresh();
+        expect($updatedPlugin->version)->toBe('1.0.1')
+            ->and($updatedPlugin->enabled)->toBe($enabled)
+            ->and($updatedPlugin->trust_state)->toBe('trusted')
+            ->and($updatedPlugin->integrity_status)->toBe('verified');
+        $review = PluginInstallReview::query()->where('source_path', $releaseUrl)->sole();
+        expect($review->status)->toBe('installed')
+            ->and($review->archive_sha256)->toBe($checksum)
+            ->and($review->expected_archive_sha256)->toBe($checksum);
+
+        $notification = Notification::make()
+            ->success()
+            ->title(__(':plugin updated', ['plugin' => $plugin->name]))
+            ->body($enabled
+                ? 'Version 1.0.1 is now active. A queue worker that already ran this plugin may keep executing the previous version until it recycles - use Reset Queue on the Queue Monitor page if you need the update to take effect immediately.'
+                : 'Version 1.0.1 is installed. The plugin remains disabled.');
+
+        if ($enabled) {
+            $notification->persistent()->actions([
+                Action::make('view_queue_monitor')
+                    ->label(__('Reset Queue'))
+                    ->url(QueueMonitorResource::getUrl('index')),
+            ]);
+        }
+
+        $page->assertNotified($notification);
+        Http::assertSentCount(1);
+    } finally {
+        cleanupReviewFixturePlugin($pluginId);
+    }
+})->with([
+    'disabled' => false,
+    'enabled' => true,
+]);
 
 it('supports the reviewed install command flow for GitHub release archives', function () {
     $pluginId = 'github-cli-'.Str::lower(Str::random(6));
@@ -1038,7 +1184,7 @@ it('marks stale runs, supports cancellation requests, and queues resume for stal
             'progress' => 42,
             'progress_message' => 'Still working through checkpoint 3.',
             'last_heartbeat_at' => now()->subMinutes(20),
-            'started_at' => now()->subMinutes(25),
+            'started_at' => now()->subMinutes(370),
             'run_state' => [
                 'resume' => [
                     'last_step' => 'checkpoint-3',
@@ -1085,6 +1231,158 @@ it('marks stale runs, supports cancellation requests, and queues resume for stal
                 && $job->options['existing_run_id'] === $staleRun->id
                 && $job->options['user_id'] === $user->id;
         });
+    } finally {
+        cleanupReviewFixturePlugin($pluginId);
+    }
+});
+
+it('uses heartbeat expiry authoritatively and minimum runtime for legacy stale runs', function () {
+    $pluginId = 'stale-runtime-fixture-'.Str::lower(Str::random(6));
+    $pluginManager = app(PluginManager::class);
+    $installed = installFixturePluginForTests($pluginId, trust: true, enabled: true);
+    $plugin = $installed['plugin'];
+
+    try {
+        $expiredHeartbeatRun = PluginRun::query()->create([
+            'extension_plugin_id' => $plugin->id,
+            'status' => 'running',
+            'invocation_type' => 'action',
+            'action' => 'scan',
+            'trigger' => 'manual',
+            'dry_run' => true,
+            'payload' => [],
+            'last_heartbeat_at' => now()->subMinutes(20),
+            'started_at' => now()->subMinutes(10),
+        ]);
+        $freshHeartbeatRun = PluginRun::query()->create([
+            'extension_plugin_id' => $plugin->id,
+            'status' => 'running',
+            'invocation_type' => 'action',
+            'action' => 'scan',
+            'trigger' => 'manual',
+            'dry_run' => true,
+            'payload' => [],
+            'last_heartbeat_at' => now(),
+            'started_at' => now()->subMinutes(370),
+        ]);
+        $youngLegacyRun = PluginRun::query()->create([
+            'extension_plugin_id' => $plugin->id,
+            'status' => 'running',
+            'invocation_type' => 'action',
+            'action' => 'scan',
+            'trigger' => 'manual',
+            'dry_run' => true,
+            'payload' => [],
+            'last_heartbeat_at' => null,
+            'started_at' => now()->subMinutes(360),
+        ]);
+        $staleLegacyRun = PluginRun::query()->create([
+            'extension_plugin_id' => $plugin->id,
+            'status' => 'running',
+            'invocation_type' => 'action',
+            'action' => 'scan',
+            'trigger' => 'manual',
+            'dry_run' => true,
+            'payload' => [],
+            'last_heartbeat_at' => null,
+            'started_at' => now()->subMinutes(370),
+        ]);
+
+        expect(config('plugins.stale_run.heartbeat_minutes'))->toBe(15)
+            ->and(config('plugins.stale_run.minimum_runtime_minutes'))->toBe(365)
+            ->and($pluginManager->recoverStaleRuns())->toBe(2)
+            ->and($expiredHeartbeatRun->fresh()->status)->toBe('stale')
+            ->and($freshHeartbeatRun->fresh()->status)->toBe('running')
+            ->and($youngLegacyRun->fresh()->status)->toBe('running')
+            ->and($staleLegacyRun->fresh()->status)->toBe('stale');
+
+        $this->artisan('plugins:recover-stale-runs', [
+            '--minutes' => 15,
+            '--minimum-runtime' => 359,
+        ])
+            ->assertSuccessful()
+            ->expectsOutput('Recovered 1 stale plugin run(s).');
+
+        expect($youngLegacyRun->fresh()->status)->toBe('stale');
+    } finally {
+        cleanupReviewFixturePlugin($pluginId);
+    }
+});
+
+it('rejects explicit stale recovery overrides that are not a positive whole number', function () {
+    $this->artisan('plugins:recover-stale-runs', [
+        '--minutes' => 0,
+        '--minimum-runtime' => 365,
+    ])
+        ->assertFailed()
+        ->expectsOutputToContain('Heartbeat expiry minutes must be a whole number of at least 1.');
+
+    $this->artisan('plugins:recover-stale-runs', [
+        '--minutes' => '2.5',
+        '--minimum-runtime' => 365,
+    ])
+        ->assertFailed()
+        ->expectsOutputToContain('Heartbeat expiry minutes must be a whole number of at least 1.');
+
+    $this->artisan('plugins:recover-stale-runs', [
+        '--minutes' => 15,
+        '--minimum-runtime' => 0,
+    ])
+        ->assertFailed()
+        ->expectsOutputToContain('Minimum runtime minutes must be a whole number of at least 1.');
+
+    expect(fn () => app(PluginManager::class)->recoverStaleRuns(0))
+        ->toThrow(InvalidArgumentException::class, 'Heartbeat expiry minutes must be a whole number of at least 1.');
+});
+
+it('falls back to the default when a stale_run config value is blank or non-numeric', function () {
+    // A templated .env line left empty casts to 0; a typo leaves a non-numeric string.
+    // Neither may throw - recoverStaleRuns() runs every minute and on every plugin page mount.
+    config()->set('plugins.stale_run.heartbeat_minutes', 0);
+    config()->set('plugins.stale_run.minimum_runtime_minutes', 'not-a-number');
+
+    expect(app(PluginManager::class)->recoverStaleRuns())->toBe(0);
+
+    $this->artisan('plugins:recover-stale-runs')
+        ->assertSuccessful()
+        ->expectsOutputToContain('Recovered 0 stale plugin run(s).');
+});
+
+it('recovers resumed runs that were queued but never claimed by a worker', function () {
+    $pluginId = 'stale-pending-fixture-'.Str::lower(Str::random(6));
+    $installed = installFixturePluginForTests($pluginId, trust: true, enabled: true);
+    $plugin = $installed['plugin'];
+
+    try {
+        $orphanedPendingRun = PluginRun::query()->create([
+            'extension_plugin_id' => $plugin->id,
+            'status' => 'pending',
+            'invocation_type' => 'action',
+            'action' => 'scan',
+            'trigger' => 'manual',
+            'dry_run' => true,
+            'payload' => [],
+            'progress_message' => 'Run queued and waiting for the worker to resume.',
+            'started_at' => now()->subMinutes(400),
+        ]);
+        $orphanedPendingRun->forceFill(['updated_at' => now()->subMinutes(370)])->saveQuietly();
+
+        $freshPendingRun = PluginRun::query()->create([
+            'extension_plugin_id' => $plugin->id,
+            'status' => 'pending',
+            'invocation_type' => 'action',
+            'action' => 'scan',
+            'trigger' => 'manual',
+            'dry_run' => true,
+            'payload' => [],
+            'progress_message' => 'Run queued and waiting for the worker to resume.',
+            'started_at' => now()->subMinutes(400),
+        ]);
+
+        expect(app(PluginManager::class)->recoverStaleRuns())->toBe(1)
+            ->and($orphanedPendingRun->fresh()->status)->toBe('stale')
+            ->and($orphanedPendingRun->fresh()->summary)->toBe('Run was queued to resume but no worker picked it up. Marked stale so it can be resumed again.')
+            ->and($freshPendingRun->fresh()->status)->toBe('pending');
     } finally {
         cleanupReviewFixturePlugin($pluginId);
     }

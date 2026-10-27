@@ -3,11 +3,13 @@
 use App\Enums\ChannelLogoType;
 use App\Jobs\MergeChannels;
 use App\Jobs\UnmergeChannels;
+use App\Models\Bouquet;
 use App\Models\Category;
 use App\Models\Channel;
 use App\Models\Episode;
 use App\Models\Group;
 use App\Models\Playlist;
+use App\Models\PlaylistAlias;
 use App\Models\PlaylistAuth;
 use App\Models\Season;
 use App\Models\Series;
@@ -254,10 +256,9 @@ it('returns live streams successfully', function () {
     $channel1Data = collect($jsonResponse)->firstWhere('stream_id', $enabledChannel1->id);
     $this->assertNotNull($channel1Data, 'Channel 1 should be in response');
     $this->assertStringContainsString('icon1.png', $channel1Data['stream_icon']);
-    // direct_source field is present in the response structure
+    // direct_source is intentionally always empty so upstream URLs/credentials are never exposed (#1386)
     $this->assertArrayHasKey('direct_source', $channel1Data);
-    // Note: direct_source is currently not implemented and returns empty string
-    $this->assertIsString($channel1Data['direct_source']);
+    $this->assertSame('', $channel1Data['direct_source']);
 });
 
 it('includes stream stats when probed for get live streams', function () {
@@ -369,6 +370,47 @@ it('returns an empty list for get vod streams when there is no vod', function ()
     $response->assertStatus(200)->assertExactJson([]);
 });
 
+it('falls back to VOD metadata when the channel year is missing', function () {
+    $group = Group::factory()->for($this->user)->create();
+    Channel::factory()->for($this->playlist)->for($group)->create([
+        'enabled' => true,
+        'is_vod' => true,
+        'title' => 'Metadata Year Movie',
+        'year' => null,
+        'info' => ['release_date' => '2024-05-17'],
+    ]);
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_vod_streams'));
+
+    $response->assertOk()
+        ->assertJsonPath('0.year', 2024);
+});
+
+it('reports the provider added date for vod streams, falling back to created_at', function () {
+    $group = Group::factory()->for($this->user)->create();
+    Channel::factory()->for($this->playlist)->for($group)->create([
+        'enabled' => true,
+        'is_vod' => true,
+        'title' => 'Provider Dated',
+        'source_added_at' => '2021-03-04 05:06:07',
+        'created_at' => '2026-10-14 00:00:00',
+    ]);
+    Channel::factory()->for($this->playlist)->for($group)->create([
+        'enabled' => true,
+        'is_vod' => true,
+        'title' => 'Undated',
+        'source_added_at' => null,
+        'created_at' => '2026-10-14 00:00:00',
+    ]);
+
+    $streams = collect($this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_vod_streams'))
+        ->assertOk()
+        ->json())->keyBy('name');
+
+    expect($streams['Provider Dated']['added'])->toBe((string) Carbon\Carbon::parse('2021-03-04 05:06:07')->timestamp)
+        ->and($streams['Undated']['added'])->toBe((string) Carbon\Carbon::parse('2026-10-14 00:00:00')->timestamp);
+});
+
 // Tests for get_vod_info - returns VOD channel (movie) info, not Series
 it('returns vod info successfully', function () {
     $group = Group::factory()->for($this->user)->create();
@@ -400,6 +442,522 @@ it('returns vod info successfully', function () {
         ])
         ->assertJsonPath('movie_data.stream_id', $vodChannel->id)
         ->assertJsonPath('movie_data.name', 'Test Movie');
+});
+
+it('uses the custom title over the provider title on get vod info', function () {
+    // Issue #1648: get_vod_info built its name/title straight from provider
+    // data, ignoring title_custom - unlike get_vod_streams, which already
+    // preferred it. A Find & Replace / manual rename never showed up here.
+    $group = Group::factory()->for($this->user)->create();
+    $vodChannel = Channel::factory()->for($this->playlist)->for($group)->create([
+        'enabled' => true,
+        'is_vod' => true,
+        'name' => 'Provider Movie',
+        'title' => 'Provider Movie',
+        'title_custom' => 'Renamed Movie',
+        'last_metadata_fetch' => now(),
+        'info' => [],
+    ]);
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_vod_info', ['vod_id' => $vodChannel->id]));
+
+    $response->assertOk()
+        ->assertJsonPath('info.name', 'Renamed Movie')
+        ->assertJsonPath('movie_data.name', 'Renamed Movie')
+        ->assertJsonPath('movie_data.title', 'Renamed Movie')
+        // o_name intentionally stays the original, untouched provider name.
+        ->assertJsonPath('info.o_name', 'Provider Movie');
+});
+
+it('falls back to VOD metadata when the channel year is missing for get vod info', function () {
+    $group = Group::factory()->for($this->user)->create();
+    $vodChannel = Channel::factory()->for($this->playlist)->for($group)->create([
+        'enabled' => true,
+        'is_vod' => true,
+        'title' => 'Metadata Year Movie',
+        'year' => null,
+        'rating' => 8.5,
+        'last_metadata_fetch' => now(), // Skip metadata fetch in test
+        'info' => ['release_date' => '2024-05-17'],
+    ]);
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_vod_info', ['vod_id' => $vodChannel->id]));
+
+    $response->assertOk()
+        ->assertJsonPath('movie_data.year', 2024);
+});
+
+it('prefers TMDB rating from info over provider rating on get vod info when both present', function () {
+    // Regression guard for the precedence flip in XtreamApiController::get_vod_info:
+    // info['rating'] is exclusively TMDB-origin, so when both are set it must win
+    // over the raw provider column. Issue #1435.
+    $group = Group::factory()->for($this->user)->create();
+    $vodChannel = Channel::factory()->for($this->playlist)->for($group)->create([
+        'enabled' => true,
+        'is_vod' => true,
+        'title' => 'TMDB Wins Movie',
+        'rating' => 10.0, // Implausible provider rating
+        'last_metadata_fetch' => now(), // Skip metadata fetch in test
+        'info' => [
+            'rating' => 6.5, // Real TMDB rating
+        ],
+    ]);
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_vod_info', ['vod_id' => $vodChannel->id]));
+
+    $response->assertOk()
+        ->assertJsonPath('info.rating', 6.5)
+        ->assertJsonPath('rating', 6.5);
+});
+
+it('falls back to provider rating on get vod info when info rating is absent', function () {
+    // Regression guard for the fallback path - when only the provider rating is set,
+    // the response must surface that value (not '' or null). `channels.rating` is a
+    // string DB column, so the response carries it as a string - compare loosely.
+    $group = Group::factory()->for($this->user)->create();
+    $vodChannel = Channel::factory()->for($this->playlist)->for($group)->create([
+        'enabled' => true,
+        'is_vod' => true,
+        'title' => 'Provider Only Movie',
+        'rating' => 7.0,
+        'last_metadata_fetch' => now(),
+        'info' => [],
+    ]);
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_vod_info', ['vod_id' => $vodChannel->id]));
+
+    $response->assertOk()
+        ->assertJsonPath('info.rating', fn ($v) => (float) $v === 7.0)
+        ->assertJsonPath('rating', fn ($v) => (float) $v === 7.0);
+});
+
+it('prefers TMDB rating from info over provider rating on get vod streams when both present', function () {
+    // Same precedence flip in the streaming list endpoint.
+    $group = Group::factory()->for($this->user)->create();
+    Channel::factory()->for($this->playlist)->for($group)->create([
+        'enabled' => true,
+        'is_vod' => true,
+        'title' => 'TMDB Wins Streams Movie',
+        'rating' => 10.0, // Provider
+        'info' => ['rating' => 6.5], // TMDB
+    ]);
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_vod_streams'));
+
+    $response->assertOk()
+        ->assertJsonCount(1)
+        ->assertJsonFragment(['name' => 'TMDB Wins Streams Movie', 'rating' => 6.5]);
+});
+
+it('falls back to provider rating on get vod streams when info rating is absent', function () {
+    $group = Group::factory()->for($this->user)->create();
+    Channel::factory()->for($this->playlist)->for($group)->create([
+        'enabled' => true,
+        'is_vod' => true,
+        'title' => 'Provider Only Streams Movie',
+        'rating' => 7.0,
+        'info' => [],
+    ]);
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_vod_streams'));
+
+    $response->assertOk()
+        ->assertJsonCount(1)
+        ->assertJsonFragment(['name' => 'Provider Only Streams Movie', 'rating' => '7']);
+});
+
+// Vote count threshold tests — TMDB ratings backed by too few votes are suppressed (issue #1436)
+
+it('suppresses VOD rating on get vod info when tmdb vote_count is below threshold', function () {
+    $group = Group::factory()->for($this->user)->create();
+    $vodChannel = Channel::factory()->for($this->playlist)->for($group)->create([
+        'enabled' => true,
+        'is_vod' => true,
+        'title' => 'Low Votes Movie',
+        'rating' => 8.0,
+        'last_metadata_fetch' => now(),
+        'info' => [
+            'rating' => 6.5,
+            'vote_count' => 3,
+        ],
+    ]);
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_vod_info', ['vod_id' => $vodChannel->id]));
+
+    $response->assertOk()
+        ->assertJsonPath('info.rating', '')
+        ->assertJsonPath('rating', '');
+});
+
+it('surfaces VOD rating on get vod info when tmdb vote_count is at or above threshold', function () {
+    $group = Group::factory()->for($this->user)->create();
+    $vodChannel = Channel::factory()->for($this->playlist)->for($group)->create([
+        'enabled' => true,
+        'is_vod' => true,
+        'title' => 'Enough Votes Movie',
+        'rating' => 8.0,
+        'last_metadata_fetch' => now(),
+        'info' => [
+            'rating' => 6.5,
+            'vote_count' => 25,
+        ],
+    ]);
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_vod_info', ['vod_id' => $vodChannel->id]));
+
+    $response->assertOk()
+        ->assertJsonPath('info.rating', 6.5)
+        ->assertJsonPath('rating', 6.5);
+});
+
+it('surfaces VOD rating on get vod info when vote_count is absent (unknown is not low)', function () {
+    $group = Group::factory()->for($this->user)->create();
+    $vodChannel = Channel::factory()->for($this->playlist)->for($group)->create([
+        'enabled' => true,
+        'is_vod' => true,
+        'title' => 'Unknown Vote Count Movie',
+        'rating' => 8.0,
+        'last_metadata_fetch' => now(),
+        'info' => [
+            'rating' => 6.5,
+            // no vote_count key — simulates a pre-#1436 fetch
+        ],
+    ]);
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_vod_info', ['vod_id' => $vodChannel->id]));
+
+    $response->assertOk()
+        ->assertJsonPath('info.rating', 6.5)
+        ->assertJsonPath('rating', 6.5);
+});
+
+it('suppresses VOD rating on get vod streams when tmdb vote_count is below threshold', function () {
+    $group = Group::factory()->for($this->user)->create();
+    Channel::factory()->for($this->playlist)->for($group)->create([
+        'enabled' => true,
+        'is_vod' => true,
+        'title' => 'Low Votes Streams Movie',
+        'rating' => 8.0,
+        'info' => [
+            'rating' => 6.5,
+            'vote_count' => 3,
+        ],
+    ]);
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_vod_streams'));
+
+    $response->assertOk()
+        ->assertJsonCount(1)
+        ->assertJsonFragment(['name' => 'Low Votes Streams Movie', 'rating' => '']);
+});
+
+it('surfaces VOD rating on get vod streams when tmdb vote_count is at or above threshold', function () {
+    $group = Group::factory()->for($this->user)->create();
+    Channel::factory()->for($this->playlist)->for($group)->create([
+        'enabled' => true,
+        'is_vod' => true,
+        'title' => 'Enough Votes Streams Movie',
+        'rating' => 8.0,
+        'info' => [
+            'rating' => 6.5,
+            'vote_count' => 25,
+        ],
+    ]);
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_vod_streams'));
+
+    $response->assertOk()
+        ->assertJsonCount(1)
+        ->assertJsonFragment(['name' => 'Enough Votes Streams Movie', 'rating' => 6.5]);
+});
+
+it('surfaces VOD rating on get vod streams when vote_count is absent', function () {
+    $group = Group::factory()->for($this->user)->create();
+    Channel::factory()->for($this->playlist)->for($group)->create([
+        'enabled' => true,
+        'is_vod' => true,
+        'title' => 'Unknown Vote Count Streams Movie',
+        'rating' => 8.0,
+        'info' => [
+            'rating' => 6.5,
+            // no vote_count key
+        ],
+    ]);
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_vod_streams'));
+
+    $response->assertOk()
+        ->assertJsonCount(1)
+        ->assertJsonFragment(['name' => 'Unknown Vote Count Streams Movie', 'rating' => 6.5]);
+});
+
+it('suppresses series rating on get series info when tmdb vote_count is below threshold', function () {
+    $category = Category::factory()->for($this->user)->for($this->playlist)->create();
+    $series = Series::factory()->for($this->playlist)->create([
+        'user_id' => $this->user->id,
+        'category_id' => $category->id,
+        'enabled' => true,
+        'name' => 'Low Votes Series',
+        'rating' => 8.0,
+        'metadata' => ['tmdb' => '', 'vote_count' => 3],
+    ]);
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_series_info', ['series_id' => $series->id]));
+
+    $response->assertOk()
+        ->assertJsonPath('info.rating', '');
+});
+
+it('suppresses series rating on get series when tmdb vote_count is below threshold', function () {
+    $category = Category::factory()->for($this->user)->for($this->playlist)->create();
+    Series::factory()->for($this->playlist)->create([
+        'user_id' => $this->user->id,
+        'category_id' => $category->id,
+        'enabled' => true,
+        'name' => 'Low Votes Series List',
+        'rating' => 8.0,
+        'metadata' => ['tmdb' => '', 'vote_count' => 3],
+    ]);
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_series'));
+
+    $response->assertOk()
+        ->assertJsonCount(1)
+        ->assertJsonFragment(['name' => 'Low Votes Series List', 'rating' => '']);
+});
+
+it('surfaces series rating on get series info when tmdb vote_count is at or above threshold', function () {
+    $category = Category::factory()->for($this->user)->for($this->playlist)->create();
+    $series = Series::factory()->for($this->playlist)->create([
+        'user_id' => $this->user->id,
+        'category_id' => $category->id,
+        'enabled' => true,
+        'name' => 'Solid Votes Series',
+        'rating' => 8.0,
+        'metadata' => ['tmdb' => '', 'vote_count' => 25],
+    ]);
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_series_info', ['series_id' => $series->id]));
+
+    $response->assertOk()
+        ->assertJsonPath('info.rating', fn ($v) => (float) $v === 8.0);
+});
+
+it('surfaces series rating on get series info when vote_count is absent (unknown is not low)', function () {
+    $category = Category::factory()->for($this->user)->for($this->playlist)->create();
+    $series = Series::factory()->for($this->playlist)->create([
+        'user_id' => $this->user->id,
+        'category_id' => $category->id,
+        'enabled' => true,
+        'name' => 'Unknown Vote Count Series',
+        'rating' => 7.5,
+        'metadata' => ['tmdb' => ''],
+    ]);
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_series_info', ['series_id' => $series->id]));
+
+    $response->assertOk()
+        ->assertJsonPath('info.rating', fn ($v) => (float) $v === 7.5);
+});
+
+it('surfaces series rating on get series when tmdb vote_count is at or above threshold', function () {
+    $category = Category::factory()->for($this->user)->for($this->playlist)->create();
+    Series::factory()->for($this->playlist)->create([
+        'user_id' => $this->user->id,
+        'category_id' => $category->id,
+        'enabled' => true,
+        'name' => 'Solid Votes Series List',
+        'rating' => 8.0,
+        'metadata' => ['tmdb' => '', 'vote_count' => 25],
+    ]);
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_series'));
+
+    $response->assertOk()
+        ->assertJsonCount(1)
+        ->assertJsonFragment(['name' => 'Solid Votes Series List', 'rating' => '8']);
+});
+
+it('surfaces series rating on get series when vote_count is absent (unknown is not low)', function () {
+    $category = Category::factory()->for($this->user)->for($this->playlist)->create();
+    Series::factory()->for($this->playlist)->create([
+        'user_id' => $this->user->id,
+        'category_id' => $category->id,
+        'enabled' => true,
+        'name' => 'Unknown Vote Count Series List',
+        'rating' => 7.5,
+        'metadata' => ['tmdb' => ''],
+    ]);
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_series'));
+
+    $response->assertOk()
+        ->assertJsonCount(1)
+        ->assertJsonFragment(['name' => 'Unknown Vote Count Series List', 'rating' => '7.5']);
+});
+
+it('suppresses series rating_5based on get series info when tmdb vote_count is below threshold', function () {
+    $category = Category::factory()->for($this->user)->for($this->playlist)->create();
+    $series = Series::factory()->for($this->playlist)->create([
+        'user_id' => $this->user->id,
+        'category_id' => $category->id,
+        'enabled' => true,
+        'name' => 'Low Votes Series 5Based',
+        'rating' => 8.0,
+        'metadata' => ['tmdb' => '', 'vote_count' => 3],
+    ]);
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_series_info', ['series_id' => $series->id]));
+
+    $response->assertOk()
+        ->assertJsonPath('info.rating', '')
+        ->assertJsonPath('info.rating_5based', 0);
+});
+
+it('surfaces series rating_5based on get series info when tmdb vote_count is at or above threshold', function () {
+    $category = Category::factory()->for($this->user)->for($this->playlist)->create();
+    $series = Series::factory()->for($this->playlist)->create([
+        'user_id' => $this->user->id,
+        'category_id' => $category->id,
+        'enabled' => true,
+        'name' => 'Solid Votes Series 5Based',
+        'rating' => 8.0,
+        'metadata' => ['tmdb' => '', 'vote_count' => 25],
+    ]);
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_series_info', ['series_id' => $series->id]));
+
+    $response->assertOk()
+        ->assertJsonPath('info.rating_5based', fn ($v) => (float) $v === 4.0);
+});
+
+it('suppresses series rating_5based on get series list when tmdb vote_count is below threshold', function () {
+    $category = Category::factory()->for($this->user)->for($this->playlist)->create();
+    Series::factory()->for($this->playlist)->create([
+        'user_id' => $this->user->id,
+        'category_id' => $category->id,
+        'enabled' => true,
+        'name' => 'Low Votes Series List 5Based',
+        'rating' => 8.0,
+        'metadata' => ['tmdb' => '', 'vote_count' => 3],
+    ]);
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_series'));
+
+    $response->assertOk()
+        ->assertJsonCount(1)
+        ->assertJsonFragment(['name' => 'Low Votes Series List 5Based', 'rating' => '', 'rating_5based' => 0]);
+});
+
+it('suppresses episode rating on get series info when tmdb vote_count is below threshold', function () {
+    $category = Category::factory()->for($this->user)->for($this->playlist)->create();
+    $series = Series::factory()->for($this->playlist)->create([
+        'user_id' => $this->user->id,
+        'category_id' => $category->id,
+        'enabled' => true,
+        'name' => 'Series With Low Vote Episode',
+        'metadata' => ['tmdb' => ''],
+    ]);
+
+    $season = Season::factory()->create([
+        'user_id' => $this->user->id,
+        'playlist_id' => $this->playlist->id,
+        'category_id' => $category->id,
+        'series_id' => $series->id,
+        'season_number' => 1,
+        'episode_count' => 1,
+    ]);
+
+    Episode::factory()->create([
+        'user_id' => $this->user->id,
+        'playlist_id' => $this->playlist->id,
+        'series_id' => $series->id,
+        'season_id' => $season->id,
+        'season' => 1,
+        'episode_num' => 1,
+        'enabled' => true,
+        'info' => [
+            'rating' => 10.0,
+            'vote_count' => 1,
+        ],
+    ]);
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_series_info', ['series_id' => $series->id]));
+
+    $response->assertOk();
+    $episodes = $response->json('episodes.1');
+    expect($episodes)->toHaveCount(1);
+    expect($episodes[0]['info']['rating'])->toBe('');
+});
+
+it('returns the season trailer on get series info', function () {
+    $category = Category::factory()->for($this->user)->for($this->playlist)->create();
+    $series = Series::factory()->for($this->playlist)->create([
+        'user_id' => $this->user->id,
+        'category_id' => $category->id,
+        'enabled' => true,
+        'name' => 'Series With Season Trailers',
+        'metadata' => ['tmdb' => ''],
+    ]);
+
+    foreach ([1 => ['youtube_trailer' => 'https://www.youtube.com/watch?v=abc123'], 2 => []] as $seasonNumber => $metadata) {
+        Season::factory()->create([
+            'user_id' => $this->user->id,
+            'playlist_id' => $this->playlist->id,
+            'category_id' => $category->id,
+            'series_id' => $series->id,
+            'season_number' => $seasonNumber,
+            'metadata' => $metadata,
+        ]);
+    }
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_series_info', ['series_id' => $series->id]));
+
+    $response->assertOk();
+    $trailers = collect($response->json('seasons'))->pluck('youtube_trailer', 'season_number');
+    expect($trailers[1])->toBe('https://www.youtube.com/watch?v=abc123')
+        ->and($trailers[2])->toBe('');
+});
+
+it('surfaces episode rating on get series info when tmdb vote_count is at or above threshold', function () {
+    $category = Category::factory()->for($this->user)->for($this->playlist)->create();
+    $series = Series::factory()->for($this->playlist)->create([
+        'user_id' => $this->user->id,
+        'category_id' => $category->id,
+        'enabled' => true,
+        'name' => 'Series With Solid Vote Episode',
+        'metadata' => ['tmdb' => ''],
+    ]);
+
+    $season = Season::factory()->create([
+        'user_id' => $this->user->id,
+        'playlist_id' => $this->playlist->id,
+        'category_id' => $category->id,
+        'series_id' => $series->id,
+        'season_number' => 1,
+        'episode_count' => 1,
+    ]);
+
+    Episode::factory()->create([
+        'user_id' => $this->user->id,
+        'playlist_id' => $this->playlist->id,
+        'series_id' => $series->id,
+        'season_id' => $season->id,
+        'season' => 1,
+        'episode_num' => 1,
+        'enabled' => true,
+        'info' => [
+            'rating' => 9.0,
+            'vote_count' => 25,
+        ],
+    ]);
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_series_info', ['series_id' => $series->id]));
+
+    $response->assertOk();
+    $episodes = $response->json('episodes.1');
+    expect($episodes)->toHaveCount(1);
+    expect((float) $episodes[0]['info']['rating'])->toBe(9.0);
 });
 
 it('returns not found for get vod info when vod is missing', function () {
@@ -716,6 +1274,76 @@ it('handles null backdrop paths for get series when logo proxy is enabled', func
     $response->assertJsonCount(1);
 });
 
+it('does not double-proxy an already app-hosted series cover when logo proxy is enabled', function () {
+    $this->playlist->update(['enable_logo_proxy' => true]);
+
+    $category = Category::factory()->for($this->user)->create();
+    $localCover = url('/media-server-image-proxy/abc123/cover.jpg');
+    $localBackdrop = url('/media-server-image-proxy/abc123/backdrop.jpg');
+
+    $series = Series::factory()->create([
+        'user_id' => $this->user->id,
+        'playlist_id' => $this->playlist->id,
+        'category_id' => $category->id,
+        'enabled' => true,
+        'cover' => $localCover,
+        'backdrop_path' => json_encode([$localBackdrop]),
+        'metadata' => json_encode(['tmdb' => '', 'last_modified' => null]),
+    ]);
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_series_info', ['series_id' => $series->id]));
+
+    $response->assertOk()
+        ->assertJsonPath('info.cover', $localCover)
+        ->assertJsonPath('info.backdrop_path.0', $localBackdrop);
+});
+
+it('does not double-proxy an already app-hosted vod cover when logo proxy is enabled', function () {
+    $this->playlist->update(['enable_logo_proxy' => true]);
+
+    $group = Group::factory()->for($this->user)->create();
+    $localCover = url('/media-server-image-proxy/abc123/cover.jpg');
+    $vodChannel = Channel::factory()->for($this->playlist)->for($group)->create([
+        'enabled' => true,
+        'is_vod' => true,
+        'name' => 'Test Movie',
+        'title' => 'Test Movie',
+        'logo' => $localCover,
+        'last_metadata_fetch' => now(),
+        'info' => [
+            'name' => 'Test Movie',
+            'cover_big' => $localCover,
+            'movie_image' => $localCover,
+            'rating' => 8.5,
+        ],
+    ]);
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_vod_info', ['vod_id' => $vodChannel->id]));
+
+    $response->assertOk()
+        ->assertJsonPath('info.cover_big', $localCover)
+        ->assertJsonPath('info.movie_image', $localCover);
+});
+
+it('requests the poster size for proxied vod stream icons when logo proxy is enabled', function () {
+    $this->playlist->update(['enable_logo_proxy' => true]);
+
+    $group = Group::factory()->for($this->user)->create();
+    Channel::factory()->for($this->playlist)->for($group)->create([
+        'enabled' => true,
+        'is_vod' => true,
+        'title' => 'Proxied VOD',
+        'logo' => 'https://image.tmdb.org/t/p/original/poster.jpg',
+    ]);
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_vod_streams'));
+
+    $response->assertOk();
+    $streamIcon = $response->json('0.stream_icon');
+    expect($streamIcon)->toStartWith(url('/'))
+        ->and($streamIcon)->toEndWith('?p=poster');
+});
+
 it('orders series categories by sort order for a regular playlist', function () {
     $third = Category::factory()->for($this->user)->for($this->playlist)->create([
         'name' => 'Third',
@@ -751,7 +1379,8 @@ it('orders series categories by sort order for a regular playlist', function () 
 it('enables tv archive for live streams when shift is set', function () {
     $group = Group::factory()->for($this->user)->create();
 
-    // Channel with shift > 0 but no catchup value (custom channel scenario)
+    // Channel with shift > 0 but no catchup value (custom channel scenario).
+    // shift is stored in hours; tv_archive_duration is reported in days (#1389).
     $channelWithShift = Channel::factory()->for($this->playlist)->for($group)->create([
         'enabled' => true,
         'title_custom' => 'Channel With Shift',
@@ -759,11 +1388,23 @@ it('enables tv archive for live streams when shift is set', function () {
         'catchup' => null,
     ]);
 
-    // Channel with catchup set (provider-imported scenario)
+    // Channel with catchup and a known duration (provider-imported scenario).
     $channelWithCatchup = Channel::factory()->for($this->playlist)->for($group)->create([
         'enabled' => true,
         'title_custom' => 'Channel With Catchup',
-        'shift' => 24,
+        'shift' => 48,
+        'catchup' => 'default',
+    ]);
+
+    // Channel with catchup enabled but no known duration - retention is
+    // unknown, not zero, so tv_archive_duration falls back to a sensible
+    // default rather than asserting zero retention (#1389). It stays a
+    // plain int (never null) for compatibility with third-party Xtream
+    // clients like TiviMate that deserialize this as a non-nullable int.
+    $channelWithUnknownDuration = Channel::factory()->for($this->playlist)->for($group)->create([
+        'enabled' => true,
+        'title_custom' => 'Channel With Unknown Duration',
+        'shift' => 0,
         'catchup' => 'default',
     ]);
 
@@ -782,15 +1423,38 @@ it('enables tv archive for live streams when shift is set', function () {
 
     $shiftData = collect($jsonResponse)->firstWhere('stream_id', $channelWithShift->id);
     $this->assertEquals(1, $shiftData['tv_archive'], 'tv_archive should be 1 when shift > 0');
-    $this->assertEquals(12, $shiftData['tv_archive_duration']);
+    $this->assertEquals(1, $shiftData['tv_archive_duration'], '12 hours rounds up to 1 day');
 
     $catchupData = collect($jsonResponse)->firstWhere('stream_id', $channelWithCatchup->id);
     $this->assertEquals(1, $catchupData['tv_archive'], 'tv_archive should be 1 when catchup is set');
-    $this->assertEquals(24, $catchupData['tv_archive_duration']);
+    $this->assertEquals(2, $catchupData['tv_archive_duration'], '48 hours converts to 2 days');
+
+    $unknownDurationData = collect($jsonResponse)->firstWhere('stream_id', $channelWithUnknownDuration->id);
+    $this->assertEquals(1, $unknownDurationData['tv_archive'], 'tv_archive should be 1 when catchup is set even without a known duration');
+    $this->assertEquals(config('dev.default_epg_catchup_days'), $unknownDurationData['tv_archive_duration'], 'unknown retention falls back to the configured default, not 0');
 
     $noArchiveData = collect($jsonResponse)->firstWhere('stream_id', $channelWithoutArchive->id);
     $this->assertEquals(0, $noArchiveData['tv_archive'], 'tv_archive should be 0 when no shift and no catchup');
     $this->assertEquals(0, $noArchiveData['tv_archive_duration']);
+});
+
+it('respects dev.default_epg_catchup_days=0 to advertise no retention instead of the default fallback', function () {
+    config(['dev.default_epg_catchup_days' => 0]);
+
+    $group = Group::factory()->for($this->user)->create();
+    $channel = Channel::factory()->for($this->playlist)->for($group)->create([
+        'enabled' => true,
+        'title_custom' => 'Channel With Unknown Duration',
+        'shift' => 0,
+        'catchup' => 'default',
+    ]);
+
+    $response = $this->getJson(getXtreamApiUrl($this->username, $this->password, 'get_live_streams'));
+    $response->assertStatus(200);
+
+    $data = collect($response->json())->firstWhere('stream_id', $channel->id);
+    $this->assertEquals(1, $data['tv_archive']);
+    $this->assertEquals(0, $data['tv_archive_duration']);
 });
 
 it('returns valid json with episode count for dvr series info', function () {
@@ -839,4 +1503,109 @@ it('returns valid json with episode count for dvr series info', function () {
     $seasons = $response->json('seasons');
     $this->assertCount(1, $seasons);
     $this->assertSame(2, $seasons[0]['episode_count']);
+});
+
+// ── Bouquet propagation into Xtream category listings (Task 10, issue #1391) ──
+//
+// The four PlaylistAlias accessors (getAllowedLiveGroupNames() etc.) union attached
+// bouquets' selections and channels()/series() enforce the result, so the Xtream
+// category endpoints - which read those same accessors to build aliasFilter arrays -
+// inherit bouquet filtering automatically. These tests pin that propagation.
+
+describe('Xtream API categories for a bouquet-narrowed standard playlist alias', function () {
+    beforeEach(function () {
+        $this->sports = Group::factory()->for($this->user)->for($this->playlist)->create([
+            'type' => 'live', 'name' => 'Sports', 'name_internal' => 'Sports',
+        ]);
+        $this->news = Group::factory()->for($this->user)->for($this->playlist)->create([
+            'type' => 'live', 'name' => 'News', 'name_internal' => 'News',
+        ]);
+        Channel::factory()->for($this->playlist)->for($this->user)->for($this->sports)->create([
+            'group_internal' => 'Sports', 'is_vod' => false, 'enabled' => true,
+        ]);
+        Channel::factory()->for($this->playlist)->for($this->user)->for($this->news)->create([
+            'group_internal' => 'News', 'is_vod' => false, 'enabled' => true,
+        ]);
+    });
+
+    it('narrows get_live_categories to a bouquet-attached alias\'s union without re-keying category ids', function () {
+        // An alias with no filter at all returns every group's own id - the baseline
+        // to prove the bouquet-narrowed response reuses the same ids (no re-keying).
+        PlaylistAlias::create([
+            'name' => 'Unfiltered Alias', 'uuid' => fake()->uuid(),
+            'user_id' => $this->user->id, 'playlist_id' => $this->playlist->id,
+            'xtream_config' => null, 'username' => 'unfiltered_user', 'password' => 'unfiltered_pass',
+        ]);
+        $unfilteredCategories = $this->getJson(getXtreamApiUrl('unfiltered_user', 'unfiltered_pass', 'get_live_categories'))
+            ->assertOk()->json();
+        $unfilteredIdByName = collect($unfilteredCategories)->pluck('category_id', 'category_name');
+
+        $alias = PlaylistAlias::create([
+            'name' => 'Bouquet Alias', 'uuid' => fake()->uuid(),
+            'user_id' => $this->user->id, 'playlist_id' => $this->playlist->id,
+            'xtream_config' => null, 'username' => 'bouquet_user', 'password' => 'bouquet_pass',
+        ]);
+        $bouquet = Bouquet::factory()->create([
+            'user_id' => $this->user->id, 'playlist_id' => $this->playlist->id,
+            'group_selections' => ['selected_groups' => ['Sports']],
+        ]);
+        $alias->bouquets()->attach($bouquet);
+
+        $categories = $this->getJson(getXtreamApiUrl('bouquet_user', 'bouquet_pass', 'get_live_categories'))
+            ->assertOk()->json();
+
+        expect(array_column($categories, 'category_name'))->toBe(['Sports'])
+            ->and($categories[0]['category_id'])->toBe($unfilteredIdByName['Sports']);
+    });
+
+    it('falls back to the "all" category when a bouquet narrows to no matching group, exactly as an over-narrow manual filter', function () {
+        PlaylistAlias::create([
+            'name' => 'Manual Alias', 'uuid' => fake()->uuid(),
+            'user_id' => $this->user->id, 'playlist_id' => $this->playlist->id,
+            'xtream_config' => null, 'username' => 'manual_user', 'password' => 'manual_pass',
+            'group_filter' => ['selected_groups' => ['Nonexistent Group']],
+        ]);
+        $manualCategories = $this->getJson(getXtreamApiUrl('manual_user', 'manual_pass', 'get_live_categories'))
+            ->assertOk()->json();
+
+        $bouquetAlias = PlaylistAlias::create([
+            'name' => 'Bouquet Alias', 'uuid' => fake()->uuid(),
+            'user_id' => $this->user->id, 'playlist_id' => $this->playlist->id,
+            'xtream_config' => null, 'username' => 'bouquet_all_user', 'password' => 'bouquet_all_pass',
+        ]);
+        $bouquet = Bouquet::factory()->create([
+            'user_id' => $this->user->id, 'playlist_id' => $this->playlist->id,
+            'group_selections' => ['selected_groups' => ['Nonexistent Group']],
+        ]);
+        $bouquetAlias->bouquets()->attach($bouquet);
+
+        $bouquetCategories = $this->getJson(getXtreamApiUrl('bouquet_all_user', 'bouquet_all_pass', 'get_live_categories'))
+            ->assertOk()->json();
+
+        expect($manualCategories)->toBe([['category_id' => 'all', 'category_name' => 'All', 'parent_id' => 0]])
+            ->and($bouquetCategories)->toBe($manualCategories);
+    });
+
+    it('rejects stream-time access to a channel outside the bouquet union and allows one inside it', function () {
+        $alias = PlaylistAlias::create([
+            'name' => 'Stream Time Alias', 'uuid' => fake()->uuid(),
+            'user_id' => $this->user->id, 'playlist_id' => $this->playlist->id,
+            'xtream_config' => null, 'username' => 'streamtime_user', 'password' => 'streamtime_pass',
+        ]);
+        $bouquet = Bouquet::factory()->create([
+            'user_id' => $this->user->id, 'playlist_id' => $this->playlist->id,
+            'group_selections' => ['selected_groups' => ['Sports']],
+        ]);
+        $alias->bouquets()->attach($bouquet);
+        $alias->refresh();
+
+        $sportsChannel = Channel::where('group_internal', 'Sports')->where('playlist_id', $this->playlist->id)->firstOrFail();
+        $newsChannel = Channel::where('group_internal', 'News')->where('playlist_id', $this->playlist->id)->firstOrFail();
+
+        // This is the exact membership query XtreamStreamController::getValidatedStreamFromPlaylist()
+        // runs to validate a live/vod stream request against the authenticated playlist:
+        // $playlist->channels()->where('channels.id', $streamId)->where('enabled', true)->first().
+        expect($alias->channels()->where('channels.id', $sportsChannel->id)->where('enabled', true)->exists())->toBeTrue()
+            ->and($alias->channels()->where('channels.id', $newsChannel->id)->where('enabled', true)->exists())->toBeFalse();
+    });
 });

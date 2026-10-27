@@ -15,6 +15,7 @@ use App\Models\User;
 use App\Services\SyncPipelineService;
 use App\Services\TmdbService;
 use App\Settings\GeneralSettings;
+use App\Support\TmdbEnrichment;
 use Illuminate\Cache\ArrayStore;
 use Illuminate\Cache\Repository;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -50,6 +51,52 @@ beforeEach(function () {
 
     // Mock TMDB settings without saving to avoid missing properties error
     mockTmdbSettings();
+});
+
+it('does not re-fetch an already enriched title for the new certification sentinels in the bulk job', function () {
+    $tmdbCalls = 0;
+    Http::fake(function () use (&$tmdbCalls) {
+        $tmdbCalls++;
+
+        return Http::response([], 500);
+    });
+
+    // Enriched before tmdb_certification / content_rating / networks existed.
+    $channel = Channel::factory()->create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'is_vod' => true,
+        'title' => 'The Matrix',
+        'tmdb_id' => 603,
+        'info' => [
+            'tmdb_id' => 603,
+            'plot' => 'TMDB plot.',
+            'cover_big' => 'https://image.tmdb.org/t/p/w500/matrix.jpg',
+            'genre' => 'Action, Science Fiction',
+            'related_tmdb' => [],
+        ],
+    ]);
+    $series = Series::factory()->create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'name' => 'Breaking Bad',
+        'plot' => 'TMDB plot.',
+        'cover' => 'https://image.tmdb.org/t/p/w500/bb.jpg',
+        'genre' => 'Drama, Crime',
+        'tmdb_id' => 1396,
+        'metadata' => ['tmdb_id' => 1396, 'related_tmdb' => []],
+    ]);
+
+    (new TestableFetchTmdbIds(
+        vodChannelIds: [$channel->id],
+        seriesIds: [$series->id],
+        overwriteExisting: false,
+        user: $this->user,
+    ))->handle(app(TmdbService::class));
+
+    expect($tmdbCalls)->toBe(0)
+        ->and($channel->refresh()->info)->not->toHaveKey('tmdb_certification')
+        ->and($series->refresh()->metadata)->not->toHaveKey('networks');
 });
 
 it('can fetch TMDB ID for a VOD channel', function () {
@@ -145,6 +192,154 @@ it('can fetch TMDB and TVDB IDs for a series', function () {
     expect($series->metadata['tmdb_id'])->toBe(4592)
         ->and($series->metadata['tvdb_id'])->toBe(78020)
         ->and($series->metadata['imdb_id'])->toBe('tt0090390');
+});
+
+it('refreshes series rating from TMDB when overwrite is true and metadata already populated', function () {
+    Http::fake([
+        'https://api.themoviedb.org/3/search/tv*' => Http::response([
+            'results' => [
+                [
+                    'id' => 4592,
+                    'name' => 'ALF',
+                    'first_air_date' => '1986-09-22',
+                    'popularity' => 45.2,
+                ],
+            ],
+        ], 200),
+        'https://api.themoviedb.org/3/tv/4592*' => Http::response([
+            'id' => 4592,
+            'name' => 'ALF',
+            'overview' => 'An alien lifestyle.',
+            'poster_path' => '/alf.jpg',
+            'vote_average' => 7.1,
+        ], 200),
+    ]);
+
+    // Fixture deliberately has hasMetadata=true (plot + cover both set) and a stale
+    // rating of 10.0 - only overwriteExisting can refresh the rating in this state.
+    $series = Series::factory()->create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'name' => 'ALF',
+        'release_date' => '1986-09-22',
+        'tmdb_id' => 4592,
+        'plot' => 'Existing plot from prior fetch.',
+        'cover' => 'https://image.tmdb.org/t/p/w500/alf.jpg',
+        'genre' => null, // Avoid the skip-branch genre re-enrichment side path
+        'rating' => 10.0, // Implausible provider/stale TMDB rating
+        'metadata' => ['tmdb_id' => 4592],
+    ]);
+
+    $job = new TestableFetchTmdbIds(
+        vodChannelIds: null,
+        seriesIds: [$series->id],
+        overwriteExisting: true,
+        user: $this->user,
+    );
+
+    $job->handle(app(TmdbService::class));
+
+    $series->refresh();
+
+    expect((float) $series->rating)->toBe(7.1);
+});
+
+it('preserves existing series rating when overwrite is false even if metadata is populated', function () {
+    Http::fake([
+        'https://api.themoviedb.org/3/search/tv*' => Http::response([
+            'results' => [
+                [
+                    'id' => 4592,
+                    'name' => 'ALF',
+                    'first_air_date' => '1986-09-22',
+                    'popularity' => 45.2,
+                ],
+            ],
+        ], 200),
+        'https://api.themoviedb.org/3/tv/4592*' => Http::response([
+            'id' => 4592,
+            'name' => 'ALF',
+            'overview' => 'An alien lifestyle.',
+            'vote_average' => 7.1,
+        ], 200),
+    ]);
+
+    $series = Series::factory()->create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'name' => 'ALF',
+        'release_date' => '1986-09-22',
+        'tmdb_id' => 4592,
+        'plot' => 'Existing plot from prior fetch.',
+        'cover' => 'https://image.tmdb.org/t/p/w500/alf.jpg',
+        'genre' => null,
+        'rating' => 10.0,
+        'metadata' => ['tmdb_id' => 4592],
+    ]);
+
+    $job = new TestableFetchTmdbIds(
+        vodChannelIds: null,
+        seriesIds: [$series->id],
+        overwriteExisting: false,
+        user: $this->user,
+    );
+
+    $job->handle(app(TmdbService::class));
+
+    $series->refresh();
+
+    // Regression guard: skip branch runs because hasMetadata=true and !overwrite,
+    // so the stale rating must be preserved.
+    expect((float) $series->rating)->toBe(10.0);
+});
+
+it('persists Series vote_count alongside rating', function () {
+    Http::fake([
+        'https://api.themoviedb.org/3/search/tv*' => Http::response([
+            'results' => [
+                [
+                    'id' => 4592,
+                    'name' => 'ALF',
+                    'first_air_date' => '1986-09-22',
+                    'popularity' => 45.2,
+                ],
+            ],
+        ], 200),
+        'https://api.themoviedb.org/3/tv/4592*' => Http::response([
+            'id' => 4592,
+            'name' => 'ALF',
+            'overview' => 'An alien lifestyle.',
+            'poster_path' => '/alf.jpg',
+            'vote_average' => 7.5,
+            'vote_count' => 200,
+        ], 200),
+    ]);
+
+    $series = Series::factory()->create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'name' => 'ALF',
+        'release_date' => '1986-09-22',
+        'tmdb_id' => 4592,
+        'plot' => 'An alien lifestyle.',
+        'cover' => 'https://image.tmdb.org/t/p/w500/alf.jpg',
+        'genre' => null,
+        'metadata' => ['tmdb_id' => 4592],
+    ]);
+
+    $job = new TestableFetchTmdbIds(
+        vodChannelIds: null,
+        seriesIds: [$series->id],
+        overwriteExisting: true,
+        user: $this->user,
+    );
+
+    $job->handle(app(TmdbService::class));
+
+    $series->refresh();
+
+    expect($series->metadata['vote_count'])->toBe(200);
+    expect((float) $series->rating)->toBe(7.5);
 });
 
 it('skips items that already have IDs and metadata when overwrite is false', function () {
@@ -305,6 +500,258 @@ it('overwrites existing IDs when overwrite is true', function () {
 
     // Should be updated with correct ID
     expect($channel->info['tmdb_id'])->toBe(603);
+});
+
+it('keeps the existing correct tmdb_id when overwrite search finds no confident match (issue #1647)', function () {
+    Http::fake([
+        // Overwrite's re-search finds nothing confident for this title.
+        'https://api.themoviedb.org/3/search/movie*' => Http::response(['results' => []], 200),
+        'https://api.themoviedb.org/3/movie/424/external_ids*' => Http::response([
+            'imdb_id' => 'tt0108052',
+        ], 200),
+        'https://api.themoviedb.org/3/movie/424*' => Http::response([
+            'id' => 424,
+            'title' => "Schindler's List",
+            'overview' => 'In German-occupied Poland...',
+            'release_date' => '1993-12-15',
+        ], 200),
+    ]);
+
+    $channel = Channel::factory()->create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'is_vod' => true,
+        'title' => "Schindler's List",
+        'tmdb_id' => 424, // Already correct
+        'year' => null, // Missing metadata the user wants refreshed
+    ]);
+
+    $job = new TestableFetchTmdbIds(
+        vodChannelIds: [$channel->id],
+        seriesIds: null,
+        overwriteExisting: true,
+        user: $this->user,
+    );
+
+    $job->handle(app(TmdbService::class));
+
+    $channel->refresh();
+
+    // The known-good ID must survive a failed overwrite re-search, and metadata should
+    // still get populated from it - not discarded in favor of reporting "not found".
+    expect($channel->tmdb_id)->toBe(424)
+        ->and($channel->info['tmdb_search_failed'] ?? false)->toBeFalse()
+        ->and($channel->info['plot'])->toBe('In German-occupied Poland...');
+});
+
+it('refreshes VOD rating from TMDB when overwrite is true and metadata already populated', function () {
+    Http::fake([
+        'https://api.themoviedb.org/3/search/movie*' => Http::response([
+            'results' => [
+                [
+                    'id' => 603,
+                    'title' => 'The Matrix',
+                    'release_date' => '1999-03-30',
+                    'popularity' => 85.5,
+                ],
+            ],
+        ], 200),
+        'https://api.themoviedb.org/3/movie/603*' => Http::response([
+            'id' => 603,
+            'title' => 'The Matrix',
+            'overview' => 'A computer hacker learns about the true nature of reality.',
+            'poster_path' => '/matrix.jpg',
+            'vote_average' => 6.5,
+            'genres' => [
+                ['name' => 'Action'],
+                ['name' => 'Sci-Fi'],
+            ],
+        ], 200),
+    ]);
+
+    // Fixture deliberately has hasMetadata=true (plot + cover_big both set) and a stale
+    // rating of 10.0 - this is the path where the top-level skip-bypass via
+    // overwriteExisting is the only thing letting the rating get refreshed.
+    $channel = Channel::factory()->create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'is_vod' => true,
+        'title' => 'The Matrix',
+        'year' => 1999,
+        'group' => null, // Avoid the skip-branch genre re-enrichment side path
+        'info' => [
+            'tmdb_id' => 603,
+            'plot' => 'Existing plot from prior fetch.',
+            'cover_big' => 'https://image.tmdb.org/t/p/w500/matrix.jpg',
+            'rating' => 10.0, // Implausible provider/stale TMDB rating
+        ],
+    ]);
+
+    $job = new TestableFetchTmdbIds(
+        vodChannelIds: [$channel->id],
+        seriesIds: null,
+        overwriteExisting: true,
+        user: $this->user,
+    );
+
+    $job->handle(app(TmdbService::class));
+
+    $channel->refresh();
+
+    expect($channel->info['rating'])->toBe(6.5);
+});
+
+it('preserves existing VOD rating when overwrite is false even if metadata is populated', function () {
+    Http::fake([
+        'https://api.themoviedb.org/3/search/movie*' => Http::response([
+            'results' => [
+                [
+                    'id' => 603,
+                    'title' => 'The Matrix',
+                    'release_date' => '1999-03-30',
+                    'popularity' => 85.5,
+                ],
+            ],
+        ], 200),
+        'https://api.themoviedb.org/3/movie/603*' => Http::response([
+            'id' => 603,
+            'title' => 'The Matrix',
+            'overview' => 'A computer hacker learns about the true nature of reality.',
+            'vote_average' => 6.5,
+        ], 200),
+    ]);
+
+    $channel = Channel::factory()->create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'is_vod' => true,
+        'title' => 'The Matrix',
+        'year' => 1999,
+        'group' => null,
+        'info' => [
+            'tmdb_id' => 603,
+            'plot' => 'Existing plot from prior fetch.',
+            'cover_big' => 'https://image.tmdb.org/t/p/w500/matrix.jpg',
+            'rating' => 10.0,
+        ],
+    ]);
+
+    $job = new TestableFetchTmdbIds(
+        vodChannelIds: [$channel->id],
+        seriesIds: null,
+        overwriteExisting: false,
+        user: $this->user,
+    );
+
+    $job->handle(app(TmdbService::class));
+
+    $channel->refresh();
+
+    // Regression guard: skip branch runs because hasMetadata=true and !overwrite,
+    // so the stale rating must be preserved. (10.0 round-trips through JSON as int 10.)
+    expect($channel->info['rating'])->toEqual(10.0);
+});
+
+it('persists VOD vote_count alongside rating', function () {
+    Http::fake([
+        'https://api.themoviedb.org/3/search/movie*' => Http::response([
+            'results' => [
+                [
+                    'id' => 603,
+                    'title' => 'The Matrix',
+                    'release_date' => '1999-03-30',
+                    'popularity' => 85.5,
+                ],
+            ],
+        ], 200),
+        'https://api.themoviedb.org/3/movie/603*' => Http::response([
+            'id' => 603,
+            'title' => 'The Matrix',
+            'overview' => 'A computer hacker learns about the true nature of reality.',
+            'poster_path' => '/matrix.jpg',
+            'vote_average' => 7.0,
+            'vote_count' => 150,
+        ], 200),
+    ]);
+
+    $channel = Channel::factory()->create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'is_vod' => true,
+        'title' => 'The Matrix',
+        'year' => 1999,
+        'group' => null,
+        'info' => [
+            'tmdb_id' => 603,
+            'plot' => 'A computer hacker learns about the true nature of reality.',
+            'cover_big' => 'https://image.tmdb.org/t/p/w500/matrix.jpg',
+        ],
+    ]);
+
+    $job = new TestableFetchTmdbIds(
+        vodChannelIds: [$channel->id],
+        seriesIds: null,
+        overwriteExisting: true,
+        user: $this->user,
+    );
+
+    $job->handle(app(TmdbService::class));
+
+    $channel->refresh();
+
+    expect($channel->info['vote_count'])->toBe(150);
+    expect($channel->info['rating'])->toEqual(7.0);
+});
+
+it('does not set vote_count when TMDB response omits it (0 is a valid vote count)', function () {
+    Http::fake([
+        'https://api.themoviedb.org/3/search/movie*' => Http::response([
+            'results' => [
+                [
+                    'id' => 603,
+                    'title' => 'The Matrix',
+                    'release_date' => '1999-03-30',
+                    'popularity' => 85.5,
+                ],
+            ],
+        ], 200),
+        'https://api.themoviedb.org/3/movie/603*' => Http::response([
+            'id' => 603,
+            'title' => 'The Matrix',
+            'overview' => 'A computer hacker learns about the true nature of reality.',
+            'poster_path' => '/matrix.jpg',
+            'vote_average' => 6.0,
+            // Deliberately no vote_count key
+        ], 200),
+    ]);
+
+    $channel = Channel::factory()->create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'is_vod' => true,
+        'title' => 'The Matrix',
+        'year' => 1999,
+        'group' => null,
+        'info' => [
+            'tmdb_id' => 603,
+            'plot' => 'A computer hacker learns about the true nature of reality.',
+            'cover_big' => 'https://image.tmdb.org/t/p/w500/matrix.jpg',
+        ],
+    ]);
+
+    $job = new TestableFetchTmdbIds(
+        vodChannelIds: [$channel->id],
+        seriesIds: null,
+        overwriteExisting: true,
+        user: $this->user,
+    );
+
+    $job->handle(app(TmdbService::class));
+
+    $channel->refresh();
+
+    // isset returns false for null but we want to verify the key is absent entirely
+    expect(array_key_exists('vote_count', $channel->info))->toBeFalse();
 });
 
 it('handles items with no match gracefully', function () {
@@ -496,6 +943,7 @@ it('enriches episodes when series has complete metadata but episodes lack tmdb_i
         ], 200),
         // getSeasonDetails call
         'https://api.themoviedb.org/3/tv/224372/season/1*' => Http::response([
+            'id' => 22437201,
             'season_number' => 1,
             'poster_path' => '/season1.jpg',
             'episodes' => [
@@ -616,6 +1064,7 @@ it('enriches episodes even when series is skipped due to complete metadata', fun
         ], 200),
         // getSeasonDetails call
         'https://api.themoviedb.org/3/tv/1396/season/1*' => Http::response([
+            'id' => 139601,
             'season_number' => 1,
             'poster_path' => '/bb_s1.jpg',
             'episodes' => [
@@ -1162,7 +1611,10 @@ it('creates categories for series when auto_create_groups is enabled', function 
 });
 
 it('excludes VOD channels that were attempted but had no match from query when overwrite is false', function () {
-    // This channel was already attempted but no TMDB match was found
+    // This channel was already attempted but no TMDB match was found. Marked via
+    // info['tmdb_search_failed'] rather than bare last_metadata_fetch, since that field
+    // is also stamped by ordinary provider metadata syncs (Channel::fetchMetadata()) and
+    // by media-server syncs (SyncMediaServer) for reasons unrelated to a TMDB attempt.
     Channel::factory()->create([
         'playlist_id' => $this->playlist->id,
         'user_id' => $this->user->id,
@@ -1172,6 +1624,7 @@ it('excludes VOD channels that were attempted but had no match from query when o
         'tmdb_id' => null,
         'imdb_id' => null,
         'last_metadata_fetch' => now(),
+        'info' => ['tmdb_search_failed' => true],
     ]);
 
     $tmdb = Mockery::mock(TmdbService::class);
@@ -1558,6 +2011,178 @@ it('with lookupScope both, processes series that are enabled OR new', function (
     $job->handle($tmdb);
 });
 
+it('fetches IDs only for enabled VOD channels in the given groups', function () {
+    $tmdb = Mockery::mock(TmdbService::class);
+    $tmdb->shouldReceive('isConfigured')->andReturn(true);
+
+    $groupA = Group::factory()->for($this->user)->for($this->playlist)->create(['type' => 'vod', 'name' => 'Movies A']);
+    $groupB = Group::factory()->for($this->user)->for($this->playlist)->create(['type' => 'vod', 'name' => 'Movies B']);
+
+    // Enabled channel in group A — should be processed
+    $enabledInA = Channel::factory()->create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'is_vod' => true,
+        'enabled' => true,
+        'group_id' => $groupA->id,
+        'title' => 'Enabled In A',
+        'tmdb_id' => null,
+        'last_metadata_fetch' => null,
+    ]);
+
+    // Disabled channel in group A — should NOT be processed (applyScopeFilter default = enabled)
+    Channel::factory()->create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'is_vod' => true,
+        'enabled' => false,
+        'group_id' => $groupA->id,
+        'title' => 'Disabled In A',
+        'tmdb_id' => null,
+        'last_metadata_fetch' => null,
+    ]);
+
+    // Enabled channel in group B — should NOT be processed (different group)
+    Channel::factory()->create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'is_vod' => true,
+        'enabled' => true,
+        'group_id' => $groupB->id,
+        'title' => 'Enabled In B',
+        'tmdb_id' => null,
+        'last_metadata_fetch' => null,
+    ]);
+
+    $tmdb->shouldReceive('searchMovie')->once()->with('Enabled In A', Mockery::any())->andReturn(null);
+    $tmdb->shouldNotReceive('getMovieDetails');
+
+    $job = new TestableFetchTmdbIds(
+        vodGroupIds: [$groupA->id],
+        user: $this->user,
+    );
+    $job->handle($tmdb);
+});
+
+it('fetches IDs only for enabled series in the given categories', function () {
+    $tmdb = Mockery::mock(TmdbService::class);
+    $tmdb->shouldReceive('isConfigured')->andReturn(true);
+
+    $categoryA = Category::factory()->for($this->user)->for($this->playlist)->create(['name' => 'Shows A']);
+    $categoryB = Category::factory()->for($this->user)->for($this->playlist)->create(['name' => 'Shows B']);
+
+    // Enabled series in category A — should be processed
+    Series::factory()->create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'category_id' => $categoryA->id,
+        'enabled' => true,
+        'name' => 'Enabled Show In A',
+        'tmdb_id' => null,
+        'last_metadata_fetch' => null,
+    ]);
+
+    // Disabled series in category A — should NOT be processed
+    Series::factory()->create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'category_id' => $categoryA->id,
+        'enabled' => false,
+        'name' => 'Disabled Show In A',
+        'tmdb_id' => null,
+        'last_metadata_fetch' => null,
+    ]);
+
+    // Enabled series in category B — should NOT be processed
+    Series::factory()->create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'category_id' => $categoryB->id,
+        'enabled' => true,
+        'name' => 'Enabled Show In B',
+        'tmdb_id' => null,
+        'last_metadata_fetch' => null,
+    ]);
+
+    $tmdb->shouldReceive('searchTvSeries')->once()->with('Enabled Show In A', Mockery::any())->andReturn(null);
+    $tmdb->shouldNotReceive('getTvSeriesDetails');
+
+    $job = new TestableFetchTmdbIds(
+        seriesCategoryIds: [$categoryA->id],
+        user: $this->user,
+    );
+    $job->handle($tmdb);
+});
+
+it('expands a merged VOD group to its child groups', function () {
+    $tmdb = Mockery::mock(TmdbService::class);
+    $tmdb->shouldReceive('isConfigured')->andReturn(true);
+
+    $merged = Group::factory()->for($this->user)->for($this->playlist)->create([
+        'type' => 'vod',
+        'name' => 'Merged Movies',
+        'is_merged' => true,
+        'custom' => true,
+    ]);
+    $child = Group::factory()->for($this->user)->for($this->playlist)->create([
+        'type' => 'vod',
+        'name' => 'Child Movies',
+        'parent_id' => $merged->id,
+    ]);
+
+    // Enabled channel lives on the child group (merged parents never own channels directly)
+    Channel::factory()->create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'is_vod' => true,
+        'enabled' => true,
+        'group_id' => $child->id,
+        'title' => 'On Child Group',
+        'tmdb_id' => null,
+        'last_metadata_fetch' => null,
+    ]);
+
+    $tmdb->shouldReceive('searchMovie')->once()->with('On Child Group', Mockery::any())->andReturn(null);
+    $tmdb->shouldNotReceive('getMovieDetails');
+
+    $job = new TestableFetchTmdbIds(
+        vodGroupIds: [$merged->id],
+        user: $this->user,
+    );
+    $job->handle($tmdb);
+});
+
+it('splits large group lookups into batched chunk jobs', function () {
+    $group = Group::factory()->for($this->user)->for($this->playlist)->create(['type' => 'vod', 'name' => 'Big Group']);
+
+    Channel::factory()
+        ->count(5)
+        ->create([
+            'playlist_id' => $this->playlist->id,
+            'user_id' => $this->user->id,
+            'is_vod' => true,
+            'enabled' => true,
+            'group_id' => $group->id,
+            'info' => [],
+        ]);
+
+    Bus::fake();
+
+    $job = new TestableFetchTmdbIds(
+        vodGroupIds: [$group->id],
+        overwriteExisting: false,
+        user: $this->user,
+    );
+
+    $job->batchChunkSize = 2;
+
+    $job->handle(app(TmdbService::class));
+
+    Bus::assertBatched(function ($batch) {
+        return count($batch->jobs) === 3;
+    });
+});
+
 it('advances the sync pipeline when TMDB is not configured', function () {
     $tmdb = Mockery::mock(TmdbService::class);
     $tmdb->shouldReceive('isConfigured')->andReturn(false);
@@ -1835,6 +2460,402 @@ it('strips numbering from VOD title even without prefix patterns', function () {
 
     $job = new TestableFetchTmdbIds(vodChannelIds: [$channel->id], user: $this->user);
     $job->handle($tmdb);
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Repeat lookups: titles TMDB has already been asked about must not be fetched
+// again on every sync.
+// ──────────────────────────────────────────────────────────────────────────────
+
+it('does not re-fetch a VOD title that TMDB has no poster for once it has been looked up', function () {
+    $channel = Channel::factory()->create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'is_vod' => true,
+        'title' => 'Example Documentary (2010)',
+        'tmdb_id' => 900001,
+        'info' => [
+            'tmdb_id' => 900001,
+            'plot' => 'A documentary TMDB has an overview for but no poster.',
+            'genre' => 'Documentary, History',
+            'related_tmdb' => [],
+        ],
+    ]);
+
+    $tmdb = Mockery::mock(TmdbService::class);
+    $tmdb->shouldReceive('isConfigured')->andReturn(true);
+    $tmdb->shouldNotReceive('getMovieDetails');
+    $tmdb->shouldNotReceive('searchMovie');
+
+    (new TestableFetchTmdbIds(vodChannelIds: [$channel->id], overwriteExisting: false, user: $this->user))->handle($tmdb);
+});
+
+it('runs the VOD library-name genre check only once per title', function () {
+    $channel = Channel::factory()->create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'is_vod' => true,
+        'title' => 'A Drama',
+        'tmdb_id' => 4242,
+        'info' => [
+            'tmdb_id' => 4242,
+            'plot' => 'Plot.',
+            'cover_big' => 'https://image.tmdb.org/t/p/w500/drama.jpg',
+            'genre' => 'Drama',
+            'related_tmdb' => [],
+        ],
+    ]);
+
+    $tmdb = Mockery::mock(TmdbService::class);
+    $tmdb->shouldReceive('isConfigured')->andReturn(true);
+    // Genuinely single-genre: nothing to change, but it must not be asked again.
+    $tmdb->shouldReceive('getMovieDetails')->once()->with(4242)->andReturn(['genres' => 'Drama']);
+
+    foreach ([1, 2] as $run) {
+        (new TestableFetchTmdbIds(vodChannelIds: [$channel->id], overwriteExisting: false, user: $this->user))->handle($tmdb);
+    }
+
+    expect($channel->fresh()->info['tmdb_genre_checked'])->toBe('Drama')
+        ->and($channel->fresh()->info['genre'])->toBe('Drama');
+});
+
+it('checks the VOD genre again when a provider refresh sets it back to a library name', function () {
+    $channel = Channel::factory()->create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'is_vod' => true,
+        'title' => 'An Action Film',
+        'tmdb_id' => 4244,
+        'info' => [
+            'tmdb_id' => 4244,
+            'plot' => 'Plot.',
+            'cover_big' => 'https://image.tmdb.org/t/p/w500/action.jpg',
+            'genre' => 'Movies',
+            'related_tmdb' => [],
+        ],
+    ]);
+
+    $tmdb = Mockery::mock(TmdbService::class);
+    $tmdb->shouldReceive('isConfigured')->andReturn(true);
+    $tmdb->shouldReceive('getMovieDetails')->twice()->with(4244)->andReturn(['genres' => 'Action']);
+    $run = fn () => (new TestableFetchTmdbIds(vodChannelIds: [$channel->id], overwriteExisting: false, user: $this->user))->handle($tmdb);
+
+    $run();
+    $run();
+    expect($channel->fresh()->info['genre'])->toBe('Action');
+
+    // A provider refresh replaces info (the marker is carried over) and restores the placeholder.
+    $channel->update(['info' => array_merge($channel->fresh()->info, ['genre' => 'Movies'])]);
+    $run();
+
+    expect($channel->fresh()->info)->toMatchArray(['genre' => 'Action', 'tmdb_genre_checked' => 'Action']);
+});
+
+it('retries the VOD genre check when the TMDB lookup failed', function () {
+    $channel = Channel::factory()->create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'is_vod' => true,
+        'title' => 'A Drama',
+        'tmdb_id' => 4243,
+        'info' => [
+            'tmdb_id' => 4243,
+            'plot' => 'Plot.',
+            'cover_big' => 'https://image.tmdb.org/t/p/w500/drama.jpg',
+            'genre' => 'Drama',
+            'related_tmdb' => [],
+        ],
+    ]);
+
+    $tmdb = Mockery::mock(TmdbService::class);
+    $tmdb->shouldReceive('isConfigured')->andReturn(true);
+    $tmdb->shouldReceive('getMovieDetails')->twice()->with(4243)->andReturn(null);
+
+    foreach ([1, 2] as $run) {
+        (new TestableFetchTmdbIds(vodChannelIds: [$channel->id], overwriteExisting: false, user: $this->user))->handle($tmdb);
+    }
+
+    expect($channel->fresh()->info)->not->toHaveKey('tmdb_genre_checked');
+});
+
+it('does not re-fetch a series that TMDB has no poster for once it has been looked up', function () {
+    $series = Series::factory()->create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'name' => 'Example Series (1991)',
+        'tmdb_id' => 900101,
+        'plot' => 'Plot from TMDB.',
+        'cover' => null,
+        'genre' => 'Comedy, Drama',
+        'metadata' => ['tmdb_id' => 900101, 'related_tmdb' => []],
+    ]);
+
+    $tmdb = Mockery::mock(TmdbService::class);
+    $tmdb->shouldReceive('isConfigured')->andReturn(true);
+    $tmdb->shouldNotReceive('getTvSeriesDetails');
+    $tmdb->shouldNotReceive('searchTvSeries');
+
+    (new TestableFetchTmdbIds(seriesIds: [$series->id], overwriteExisting: false, user: $this->user))->handle($tmdb);
+});
+
+it('remembers a series TMDB search with no match and does not search again', function () {
+    $series = Series::factory()->create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'name' => 'Example Shorts (2011)',
+        'tmdb_id' => null,
+        'tvdb_id' => null,
+        'metadata' => [],
+    ]);
+
+    $tmdb = Mockery::mock(TmdbService::class);
+    $tmdb->shouldReceive('isConfigured')->andReturn(true);
+    $tmdb->shouldReceive('searchTvSeries')->once()->andReturn(null);
+
+    foreach ([1, 2] as $run) {
+        (new TestableFetchTmdbIds(seriesIds: [$series->id], overwriteExisting: false, user: $this->user))->handle($tmdb);
+    }
+
+    expect($series->fresh()->metadata['tmdb_search_failed'])->toBeTrue();
+
+    // Overwrite (the single-item "look up again" action) still searches.
+    $retry = Mockery::mock(TmdbService::class);
+    $retry->shouldReceive('isConfigured')->andReturn(true);
+    $retry->shouldReceive('searchTvSeries')->once()->andReturn(null);
+    (new TestableFetchTmdbIds(seriesIds: [$series->id], overwriteExisting: true, user: $this->user))->handle($retry);
+});
+
+it('looks up unmatched episodes again only when new episodes arrive or a week has passed', function () {
+    $series = Series::factory()->create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'name' => 'Example Cartoon',
+        'tmdb_id' => 900102,
+        'plot' => 'Plot.',
+        'cover' => 'https://image.tmdb.org/t/p/w500/cartoon.jpg',
+        'genre' => 'Animation, Action',
+        'metadata' => ['tmdb_id' => 900102, 'related_tmdb' => []],
+    ]);
+    $season = Season::factory()->create([
+        'series_id' => $series->id,
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'season_number' => 1,
+    ]);
+    $makeEpisode = fn (int $number) => Episode::factory()->create([
+        'series_id' => $series->id,
+        'season_id' => $season->id,
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'season' => 1,
+        'episode_num' => $number,
+        'tmdb_id' => null,
+        'info' => [],
+    ]);
+    $makeEpisode(1);
+
+    $calls = 0;
+    $tmdb = Mockery::mock(TmdbService::class);
+    $tmdb->shouldReceive('isConfigured')->andReturn(true);
+    $tmdb->shouldReceive('getAllSeasons')->andReturnUsing(function () use (&$calls) {
+        $calls++;
+
+        return [['season_number' => 1]];
+    });
+    // TMDB has nothing for this episode, so it stays without a tmdb_id.
+    $tmdb->shouldReceive('getSeasonDetailsResult')->andReturn(['status' => 'found', 'payload' => ['episodes' => [['episode_number' => 99, 'id' => 1]]]]);
+    $run = fn () => (new TestableFetchTmdbIds(seriesIds: [$series->id], overwriteExisting: false, user: $this->user))->handle($tmdb);
+
+    $run();
+    $run();
+    expect($calls)->toBe(1);
+
+    $this->travel(5)->seconds();
+    $makeEpisode(2);
+    $run();
+    expect($calls)->toBe(2);
+
+    $run();
+    expect($calls)->toBe(2);
+
+    $this->travel(8)->days();
+    $run();
+    expect($calls)->toBe(3);
+});
+
+it('looks up episodes again on the next run when a TMDB season lookup failed', function (?array $seasons, array $seasonDetails) {
+    $series = Series::factory()->create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'name' => 'Example Cartoon',
+        'tmdb_id' => 900104,
+        'plot' => 'Plot.',
+        'cover' => 'https://image.tmdb.org/t/p/w500/cartoon.jpg',
+        'genre' => 'Animation, Action',
+        'metadata' => ['tmdb_id' => 900104, 'related_tmdb' => []],
+    ]);
+    $season = Season::factory()->create([
+        'series_id' => $series->id,
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'season_number' => 1,
+    ]);
+    Episode::factory()->create([
+        'series_id' => $series->id,
+        'season_id' => $season->id,
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'season' => 1,
+        'episode_num' => 1,
+        'tmdb_id' => null,
+        'info' => [],
+    ]);
+
+    $tmdb = Mockery::mock(TmdbService::class);
+    $tmdb->shouldReceive('isConfigured')->andReturn(true);
+    // getAllSeasons(nullOnError: true) returns null on a failed request, and
+    // getSeasonDetailsResult() an error status.
+    $tmdb->shouldReceive('getAllSeasons')->twice()->andReturn($seasons);
+    $tmdb->shouldReceive('getSeasonDetailsResult')->andReturn($seasonDetails);
+
+    foreach ([1, 2] as $run) {
+        (new TestableFetchTmdbIds(seriesIds: [$series->id], overwriteExisting: false, user: $this->user))->handle($tmdb);
+    }
+
+    expect($series->fresh()->metadata)->not->toHaveKey('tmdb_episodes_checked_at');
+})->with([
+    'seasons request failed' => [null, ['status' => 'error']],
+    'season details request failed' => [[['season_number' => 1]], ['status' => 'error']],
+]);
+
+it('does not look up episodes again when TMDB verifiably has no season data', function (array $seasons, array $seasonDetails) {
+    $series = Series::factory()->create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'name' => 'Example Cartoon',
+        'tmdb_id' => 900105,
+        'plot' => 'Plot.',
+        'cover' => 'https://image.tmdb.org/t/p/w500/cartoon.jpg',
+        'genre' => 'Animation, Action',
+        'metadata' => ['tmdb_id' => 900105, 'related_tmdb' => []],
+    ]);
+    $season = Season::factory()->create([
+        'series_id' => $series->id,
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'season_number' => 1,
+    ]);
+    Episode::factory()->create([
+        'series_id' => $series->id,
+        'season_id' => $season->id,
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'season' => 1,
+        'episode_num' => 1,
+        'tmdb_id' => null,
+        'info' => [],
+    ]);
+
+    $tmdb = Mockery::mock(TmdbService::class);
+    $tmdb->shouldReceive('isConfigured')->andReturn(true);
+    $tmdb->shouldReceive('getAllSeasons')->once()->andReturn($seasons);
+    $tmdb->shouldReceive('getSeasonDetailsResult')->andReturn($seasonDetails);
+
+    foreach ([1, 2] as $run) {
+        (new TestableFetchTmdbIds(seriesIds: [$series->id], overwriteExisting: false, user: $this->user))->handle($tmdb);
+    }
+
+    expect($series->fresh()->metadata)->toHaveKey('tmdb_episodes_checked_at');
+})->with([
+    'no seasons on TMDB' => [[], ['status' => 'error']],
+    'season not found on TMDB' => [[['season_number' => 1]], ['status' => 'not_found']],
+]);
+
+it('treats only a TMDB "resource not found" as no seasons when asked for failures', function () {
+    Http::fake([
+        'https://api.themoviedb.org/3/tv/404404*' => Http::response(['status_code' => 34, 'status_message' => 'Not found.'], 404),
+        'https://api.themoviedb.org/3/tv/500500*' => Http::response([], 500),
+    ]);
+
+    $tmdb = app(TmdbService::class);
+
+    expect($tmdb->getAllSeasons(404404, nullOnError: true))->toBe([])
+        ->and($tmdb->getAllSeasons(500500, nullOnError: true))->toBeNull()
+        ->and($tmdb->getAllSeasons(500500))->toBe([]);
+});
+
+it('keeps the TMDB lookup markers through a provider metadata refresh', function () {
+    $existing = [
+        'related_tmdb' => [],
+        'tmdb_genre_checked' => true,
+        'tmdb_episodes_checked_at' => '2026-10-01T00:00:00+00:00',
+        'tmdb_search_failed' => true,
+    ];
+
+    $refreshed = TmdbEnrichment::preserveOnProviderRefresh($existing, ['plot' => 'From the provider.']);
+
+    expect($refreshed)
+        ->toMatchArray([
+            'plot' => 'From the provider.',
+            'tmdb_genre_checked' => true,
+            'tmdb_episodes_checked_at' => '2026-10-01T00:00:00+00:00',
+        ])
+        // A refresh is what earns a no-match title another search.
+        ->not->toHaveKey('tmdb_search_failed')
+        // The markers alone don't mean the row holds TMDB data.
+        ->and(TmdbEnrichment::isEnriched(['tmdb_genre_checked' => true, 'tmdb_episodes_checked_at' => '2026-10-01T00:00:00+00:00']))->toBeFalse();
+});
+
+it('runs the series library-name genre check only once per series', function () {
+    $series = Series::factory()->create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'name' => 'Example Detective Show',
+        'tmdb_id' => 900103,
+        'plot' => 'Plot.',
+        'cover' => 'https://image.tmdb.org/t/p/w500/detective.jpg',
+        'genre' => 'Drama',
+        'metadata' => ['tmdb_id' => 900103, 'related_tmdb' => []],
+    ]);
+
+    $tmdb = Mockery::mock(TmdbService::class);
+    $tmdb->shouldReceive('isConfigured')->andReturn(true);
+    $tmdb->shouldReceive('getTvSeriesDetails')->once()->with(900103)->andReturn(['genres' => 'Drama']);
+
+    foreach ([1, 2] as $run) {
+        (new TestableFetchTmdbIds(seriesIds: [$series->id], overwriteExisting: false, user: $this->user))->handle($tmdb);
+    }
+
+    expect($series->fresh()->metadata['tmdb_genre_checked'])->toBe('Drama')
+        ->and($series->fresh()->genre)->toBe('Drama');
+});
+
+it('checks the series genre again when a provider refresh sets it back to a library name', function () {
+    $series = Series::factory()->create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'name' => 'Example Action Show',
+        'tmdb_id' => 900105,
+        'plot' => 'Plot.',
+        'cover' => 'https://image.tmdb.org/t/p/w500/action.jpg',
+        'genre' => 'Shows',
+        'metadata' => ['tmdb_id' => 900105, 'related_tmdb' => []],
+    ]);
+
+    $tmdb = Mockery::mock(TmdbService::class);
+    $tmdb->shouldReceive('isConfigured')->andReturn(true);
+    $tmdb->shouldReceive('getTvSeriesDetails')->twice()->with(900105)->andReturn(['genres' => 'Action']);
+    $run = fn () => (new TestableFetchTmdbIds(seriesIds: [$series->id], overwriteExisting: false, user: $this->user))->handle($tmdb);
+
+    $run();
+    $run();
+    expect($series->fresh()->genre)->toBe('Action');
+
+    $series->fresh()->update(['genre' => 'Shows']);
+    $run();
+
+    expect($series->fresh()->genre)->toBe('Action')
+        ->and($series->fresh()->metadata['tmdb_genre_checked'])->toBe('Action');
 });
 
 class TestableFetchTmdbIds extends FetchTmdbIds

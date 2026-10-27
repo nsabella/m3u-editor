@@ -16,6 +16,7 @@ use App\Models\PlaylistAlias;
 use App\Models\PlaylistAuth;
 use App\Models\StreamProfile;
 use App\Pivots\PlaylistAuthPivot;
+use App\Rules\UrlSafeCredential;
 use App\Services\DateFormatService;
 use App\Traits\HasUserFiltering;
 use EslamRedaDiv\FilamentCopilot\Contracts\CopilotResource;
@@ -74,7 +75,7 @@ class PlaylistAuthResource extends Resource implements CopilotResource
 
     public static function getNavigationSort(): ?int
     {
-        return 6;
+        return 7;
     }
 
     public static function form(Schema $schema): Schema
@@ -94,6 +95,7 @@ class PlaylistAuthResource extends Resource implements CopilotResource
                     ->searchable()
                     ->sortable(),
                 TextColumn::make('username')
+                    ->extraAttributes(['class' => 'privacy-sensitive'])
                     ->searchable()
                     ->toggleable()
                     ->sortable(),
@@ -301,6 +303,20 @@ class PlaylistAuthResource extends Resource implements CopilotResource
             ->collapsible()
             ->collapsed(fn ($record) => ! ($record?->aiostreams_enabled));
 
+        $libraryPublishingSection = Section::make(__('Library Publishing Access'))
+            ->description(__('Allow this credential to read managed Emby publishing catalogs and report sync results.'))
+            ->compact()
+            ->hidden(fn () => ! (auth()->user()?->canUseIntegrations() ?? false))
+            ->schema([
+                Toggle::make('library_publishing_enabled')
+                    ->label(__('Enable Library Publishing'))
+                    ->default(false)
+                    ->columnSpan(2),
+            ])
+            ->columns(2)
+            ->collapsible()
+            ->collapsed(fn ($record) => ! ($record?->library_publishing_enabled));
+
         return [
             Grid::make()
                 ->schema([
@@ -318,12 +334,14 @@ class PlaylistAuthResource extends Resource implements CopilotResource
                         ->columns(3)
                         ->schema([
                             TextInput::make('username')
+                                ->extraInputAttributes(['class' => 'privacy-sensitive'])
                                 ->label(__('Username'))
                                 ->required()
                                 ->rules(function ($record) {
                                     return [
                                         Rule::unique('playlist_auths', 'username')->ignore($record?->id),
                                         Rule::unique('playlist_aliases', 'username'),
+                                        new UrlSafeCredential,
                                     ];
                                 })
                                 ->columnSpan(1),
@@ -331,6 +349,7 @@ class PlaylistAuthResource extends Resource implements CopilotResource
                                 ->label(__('Password'))
                                 ->password()
                                 ->required()
+                                ->rules([new UrlSafeCredential])
                                 ->revealable()
                                 ->suffixAction(GeneratePasswordAction::make())
                                 ->columnSpan(1),
@@ -402,9 +421,7 @@ class PlaylistAuthResource extends Resource implements CopilotResource
                                 }
                             }
 
-                            $takenPlaylists = $assignedIds[(new Playlist)->getMorphClass()] ?? [];
                             Playlist::where('user_id', $userId)
-                                ->when($takenPlaylists, fn ($q) => $q->whereNotIn('id', $takenPlaylists))
                                 ->get()
                                 ->each(function (Playlist $playlist) use (&$options) {
                                     $key = Playlist::class.'|'.$playlist->id;
@@ -475,6 +492,7 @@ class PlaylistAuthResource extends Resource implements CopilotResource
             $requestsSection,
             $dvrSection,
             $aiostreamsSection,
+            $libraryPublishingSection,
         ];
     }
 }

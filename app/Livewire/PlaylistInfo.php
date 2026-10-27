@@ -13,6 +13,7 @@ use App\Services\ProfileService;
 use Carbon\Carbon;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Str;
 use Livewire\Component;
 
 class PlaylistInfo extends Component
@@ -142,11 +143,27 @@ class PlaylistInfo extends Component
             'xtream_info' => [
                 'active_connections' => "$activeConnections/$maxConnections",
                 'max_streams_reached' => $activeConnections >= $maxConnections,
-                'expires' => $expires ? $expires->diffForHumans() : 'N/A',
+                'expires' => $expires ? $this->formatExpiresInDays($expires) : 'N/A',
                 'expires_description' => $expires ? $expires->toDateTimeString() : 'N/A',
                 'expires_in_24_hours_or_less' => $expiresIn24HoursOrLess,
             ],
         ];
+    }
+
+    /**
+     * Format an expiration Carbon instance as an exact number of days,
+     * rather than the rounded single-unit output of diffForHumans().
+     */
+    private function formatExpiresInDays(Carbon $expires): string
+    {
+        $days = (int) round(now()->diffInDays($expires, absolute: false));
+        $absoluteDays = abs($days);
+
+        return match (true) {
+            $days === 0 => 'Today',
+            $days < 0 => $absoluteDays.' '.Str::plural('day', $absoluteDays).' ago',
+            default => $absoluteDays.' '.Str::plural('day', $absoluteDays),
+        };
     }
 
     /**
@@ -223,7 +240,7 @@ class PlaylistInfo extends Component
             'xtream_info' => [
                 'active_connections' => "$activeConnections/$maxConnections",
                 'max_streams_reached' => $maxConnections > 0 && $activeConnections >= $maxConnections,
-                'expires' => $expires ? $expires->diffForHumans() : 'N/A',
+                'expires' => $expires ? $this->formatExpiresInDays($expires) : 'N/A',
                 'expires_description' => $expires ? $expires->toDateTimeString() : 'N/A',
                 'expires_in_24_hours_or_less' => $expiresIn24HoursOrLess,
                 'profiles_enabled' => true,

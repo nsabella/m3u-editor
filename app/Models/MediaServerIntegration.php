@@ -78,6 +78,13 @@ class MediaServerIntegration extends Model
         'aiostreams_catalogs' => 'array',
         'aiostreams_enable_all_catalogs' => 'boolean',
         'aiostreams_selected_catalog_ids' => 'array',
+        'aiostreams_meta_id_prefixes' => 'array',
+        'aiostreams_tmdb_enrich' => 'boolean',
+        'emby_publisher_writable_paths' => 'array',
+        'emby_publisher_capabilities_updated_at' => 'datetime',
+        'emby_managed_setup_binding_id' => 'integer',
+        'emby_managed_setup_capability_version' => 'integer',
+        'emby_managed_setup_contract_version' => 'integer',
     ];
 
     /**
@@ -97,6 +104,11 @@ class MediaServerIntegration extends Model
     public function user(): BelongsTo
     {
         return $this->belongsTo(User::class);
+    }
+
+    public function embyLibraryMappings(): HasMany
+    {
+        return $this->hasMany(EmbyLibraryMapping::class);
     }
 
     /**
@@ -186,8 +198,11 @@ class MediaServerIntegration extends Model
     public function getBaseUrlAttribute(): string
     {
         $protocol = $this->ssl ? 'https' : 'http';
+        $host = str_contains((string) $this->host, ':')
+            ? '['.trim((string) $this->host, '[]').']'
+            : $this->host;
 
-        return "{$protocol}://{$this->host}:{$this->port}";
+        return "{$protocol}://{$host}:{$this->port}";
     }
 
     /**
@@ -196,6 +211,189 @@ class MediaServerIntegration extends Model
     public function isEmby(): bool
     {
         return $this->type === 'emby';
+    }
+
+    /**
+     * Whether a string is safe to store/advertise as an Emby publisher
+     * writable path: an absolute path (Unix, Windows drive, or UNC), within
+     * length/byte bounds, and free of traversal or ambiguous separators.
+     *
+     * These paths live on the companion app's (Emby) host, never on
+     * m3u-editor's own filesystem, so there is no local root to resolve
+     * against via realpath() — this is a shape/sanity check, not a
+     * filesystem-boundary check. Shared by this model's own getter (paths
+     * already stored) and XtreamApiController::registerManagedLibraryPublisher()
+     * (paths a companion app is registering), so both enforce identical rules.
+     */
+    public static function isSafeWritablePath(string $path): bool
+    {
+        return static::parseRemoteAbsolutePath($path) !== null;
+    }
+
+    public static function isPathWithinWritableRoot(string $path, string $writableRoot): bool
+    {
+        $parsedPath = static::parseRemoteAbsolutePath($path);
+        $parsedRoot = static::parseRemoteAbsolutePath($writableRoot);
+
+        if ($parsedPath === null || $parsedRoot === null || $parsedPath['style'] !== $parsedRoot['style']) {
+            return false;
+        }
+
+        if (count($parsedRoot['segments']) > count($parsedPath['segments'])) {
+            return false;
+        }
+
+        return array_slice($parsedPath['segments'], 0, count($parsedRoot['segments'])) === $parsedRoot['segments'];
+    }
+
+    /**
+     * @param  list<string>  $writableRoots
+     */
+    public static function isPathWithinAnyWritableRoot(string $path, array $writableRoots): bool
+    {
+        foreach ($writableRoots as $writableRoot) {
+            if (static::isPathWithinWritableRoot($path, $writableRoot)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * @return array{style: 'unix'|'windows', segments: list<string>}|null
+     */
+    private static function parseRemoteAbsolutePath(string $path): ?array
+    {
+        if ($path === '' || strlen($path) > 1024 || trim($path) !== $path
+            || preg_match('/[\x00-\x1F\x7F]/', $path) === 1
+            || preg_match('/^[A-Za-z][A-Za-z0-9+.-]*:\/\//', $path) === 1) {
+            return null;
+        }
+
+        if (str_starts_with($path, '\\\\') || str_starts_with($path, '//')) {
+            if (preg_match('/^[\/\\\\]{3}/', $path) === 1) {
+                return null;
+            }
+
+            $body = substr($path, 2);
+            if ($body === '' || preg_match('/[\/\\\\]{2,}/', $body) === 1) {
+                return null;
+            }
+            $body = rtrim($body, '/\\');
+
+            $segments = preg_split('/[\/\\\\]/', $body);
+            if ($segments === false || count($segments) < 2 || static::hasTraversalSegment($segments)
+                || static::hasInvalidWindowsSegment($segments)) {
+                return null;
+            }
+
+            return [
+                'style' => 'windows',
+                'segments' => array_map(mb_strtolower(...), $segments),
+            ];
+        }
+
+        if (preg_match('/^[A-Za-z]:[\/\\\\]/', $path) === 1) {
+            $body = substr($path, 3);
+            if (preg_match('/[\/\\\\]{2,}/', $body) === 1) {
+                return null;
+            }
+            $body = rtrim($body, '/\\');
+
+            $segments = $body === '' ? [] : preg_split('/[\/\\\\]/', $body);
+            if ($segments === false || static::hasTraversalSegment($segments)
+                || static::hasInvalidWindowsSegment($segments)) {
+                return null;
+            }
+
+            return [
+                'style' => 'windows',
+                'segments' => [mb_strtolower(substr($path, 0, 2)), ...array_map(mb_strtolower(...), $segments)],
+            ];
+        }
+
+        if (! str_starts_with($path, '/') || str_contains($path, '\\')) {
+            return null;
+        }
+
+        $body = trim($path, '/');
+        if (preg_match('/\/{2,}/', $path) === 1) {
+            return null;
+        }
+
+        $segments = $body === '' ? [] : explode('/', $body);
+        if (static::hasTraversalSegment($segments)) {
+            return null;
+        }
+
+        return [
+            'style' => 'unix',
+            'segments' => $segments,
+        ];
+    }
+
+    /** @param list<string> $segments */
+    private static function hasTraversalSegment(array $segments): bool
+    {
+        return in_array('.', $segments, true) || in_array('..', $segments, true);
+    }
+
+    /** @param list<string> $segments */
+    private static function hasInvalidWindowsSegment(array $segments): bool
+    {
+        static $reservedNames = [
+            'con', 'prn', 'aux', 'nul',
+            'com1', 'com2', 'com3', 'com4', 'com5', 'com6', 'com7', 'com8', 'com9',
+            'lpt1', 'lpt2', 'lpt3', 'lpt4', 'lpt5', 'lpt6', 'lpt7', 'lpt8', 'lpt9',
+        ];
+
+        foreach ($segments as $segment) {
+            if ($segment === ''
+                || preg_match('/[<>:"|?*]/', $segment) === 1
+                || str_ends_with($segment, '.') || str_ends_with($segment, ' ')) {
+                return true;
+            }
+
+            $baseName = strtolower(explode('.', $segment, 2)[0]);
+            if (in_array($baseName, $reservedNames, true)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * @return list<string>
+     */
+    public function getEmbyPublisherWritablePaths(): array
+    {
+        $paths = [];
+
+        if (is_string($this->emby_managed_setup_root)) {
+            $managedRoot = trim($this->emby_managed_setup_root);
+
+            if (static::isSafeWritablePath($managedRoot)) {
+                $paths[$managedRoot] = $managedRoot;
+            }
+        }
+
+        foreach (array_slice($this->emby_publisher_writable_paths ?? [], 0, 50) as $path) {
+            if (! is_string($path)) {
+                continue;
+            }
+
+            $path = trim($path);
+
+            if (! static::isSafeWritablePath($path)) {
+                continue;
+            }
+
+            $paths[$path] = $path;
+        }
+
+        return array_values($paths);
     }
 
     /**
@@ -359,6 +557,50 @@ class MediaServerIntegration extends Model
             ->filter(fn ($lib) => $lib['type'] === $type && in_array($lib['id'], $selectedIds))
             ->pluck('id')
             ->toArray();
+    }
+
+    /**
+     * Return null when imports are intentionally unfiltered, or a safe list that excludes
+     * libraries generated by managed publishing.
+     *
+     * @return array<string>|null
+     */
+    public function getImportLibraryIdsForType(string $type): ?array
+    {
+        $managedMappings = $this->embyLibraryMappings()
+            ->where('collection_type', $type)
+            ->where('enabled', true)
+            ->where(fn (Builder $query): Builder => $query
+                ->whereNotNull('target_library_id')
+                ->orWhere('is_managed', true))
+            ->select(['id', 'target_library_id'])
+            ->cursor();
+
+        $managedLibraryIds = [];
+        $requiresFilteredImport = false;
+        foreach ($managedMappings as $mapping) {
+            $requiresFilteredImport = true;
+            if ($mapping->target_library_id !== null) {
+                $managedLibraryIds[] = $mapping->target_library_id;
+            }
+        }
+
+        $selectedLibraryIds = $this->getSelectedLibraryIdsForType($type);
+        if ($selectedLibraryIds !== []) {
+            return array_values(array_diff($selectedLibraryIds, $managedLibraryIds));
+        }
+
+        if (! $requiresFilteredImport) {
+            return null;
+        }
+
+        return collect($this->available_libraries ?? [])
+            ->filter(fn (array $library): bool => ($library['type'] ?? null) === $type
+                && ! in_array($library['id'] ?? null, $managedLibraryIds, true))
+            ->pluck('id')
+            ->filter()
+            ->values()
+            ->all();
     }
 
     /**

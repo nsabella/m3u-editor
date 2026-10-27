@@ -5,8 +5,10 @@ namespace App\Filament\GuestPanel\Resources\DvrRules;
 use App\Enums\DvrRuleType;
 use App\Enums\DvrSeriesMode;
 use App\Filament\GuestPanel\Pages\Concerns\HasGuestDvr;
+use App\Filament\Support\DvrPaddingFields;
 use App\Models\Channel;
 use App\Models\DvrRecordingRule;
+use App\Models\PlaylistAuth;
 use App\Settings\GeneralSettings;
 use App\Traits\HasDvrMatchedAirings;
 use Filament\Actions\Action;
@@ -69,16 +71,25 @@ class GuestDvrRuleResource extends Resource
 
     public static function canEdit(Model $record): bool
     {
-        $auth = static::getCurrentPlaylistAuth();
-
-        return $auth && $record->playlist_auth_id === $auth->id;
+        return static::guestCanAccessDvr() && static::guestOwnsRule($record, static::getCurrentPlaylistAuth());
     }
 
     public static function canDelete(Model $record): bool
     {
-        $auth = static::getCurrentPlaylistAuth();
+        return static::guestCanAccessDvr() && static::guestOwnsRule($record, static::getCurrentPlaylistAuth());
+    }
 
-        return $auth && $record->playlist_auth_id === $auth->id;
+    /**
+     * Whether the current session owns the given rule and may edit, delete,
+     * or toggle it.
+     *
+     * Guests only own rules they created themselves. The playlist owner has
+     * no PlaylistAuth record, so their rules carry a null playlist_auth_id —
+     * those created directly through the main admin panel.
+     */
+    public static function guestOwnsRule(Model $record, ?PlaylistAuth $auth): bool
+    {
+        return static::sessionOwnsRecord($auth, $record->playlist_auth_id);
     }
 
     public static function getUrl(
@@ -103,10 +114,14 @@ class GuestDvrRuleResource extends Resource
             return parent::getEloquentQuery()->whereRaw('1 = 0');
         }
 
-        return parent::getEloquentQuery()
-            ->with(['channel', 'playlistAuth'])
-            ->where('dvr_setting_id', $dvrSetting->id)
-            ->orderByDesc('created_at');
+        // Guests only see their own rules — never another guest's, nor the
+        // playlist owner's (null playlist_auth_id).
+        return static::restrictToSessionOwner(
+            parent::getEloquentQuery()
+                ->with(['channel', 'playlistAuth'])
+                ->where('dvr_setting_id', $dvrSetting->id)
+                ->orderByDesc('created_at')
+        );
     }
 
     /**
@@ -197,17 +212,19 @@ class GuestDvrRuleResource extends Resource
                 ->hintIcon('heroicon-m-question-mark-circle')
                 ->hintIconTooltip(__('When not set, the DVR Setting default is used. Comskip detects and marks commercials in recordings. The Emby.ComSkiper plugin for Emby is available at https://github.com/BillOatmanWork/Emby.ComSkipper')),
 
-            TextInput::make('start_early_seconds')
-                ->label(__('Start Early (seconds)'))
-                ->numeric()
-                ->minValue(0)
-                ->placeholder(__('Leave blank to use playlist default')),
+            DvrPaddingFields::make(
+                field: 'start_early_seconds',
+                label: __('Start Padding'),
+                isStart: true,
+                placeholder: __('Leave blank to use playlist default'),
+            ),
 
-            TextInput::make('end_late_seconds')
-                ->label(__('End Late (seconds)'))
-                ->numeric()
-                ->minValue(0)
-                ->placeholder(__('Leave blank to use playlist default')),
+            DvrPaddingFields::make(
+                field: 'end_late_seconds',
+                label: __('End Padding'),
+                isStart: false,
+                placeholder: __('Leave blank to use playlist default'),
+            ),
 
             TextInput::make('keep_last')
                 ->label(__('Keep Last N Recordings'))
@@ -249,7 +266,7 @@ class GuestDvrRuleResource extends Resource
 
                 ToggleColumn::make('enabled')
                     ->label(__('Enabled'))
-                    ->disabled(fn (DvrRecordingRule $record): bool => ! ($currentAuth && $record->playlist_auth_id === $currentAuth->id))
+                    ->disabled(fn (DvrRecordingRule $record): bool => ! static::guestOwnsRule($record, $currentAuth))
                     ->toggleable()
                     ->sortable(),
 
@@ -294,7 +311,7 @@ class GuestDvrRuleResource extends Resource
             ->recordActions([
                 EditAction::make()
                     ->before(function (DvrRecordingRule $record, Action $action) use ($currentAuth): void {
-                        if (! $currentAuth || $record->playlist_auth_id !== $currentAuth->id) {
+                        if (! static::guestCanAccessDvr() || ! static::guestOwnsRule($record, $currentAuth)) {
                             Notification::make()
                                 ->danger()
                                 ->title(__('Unauthorized'))
@@ -329,7 +346,7 @@ class GuestDvrRuleResource extends Resource
 
                 DeleteAction::make()
                     ->before(function (DvrRecordingRule $record, Action $action) use ($currentAuth): void {
-                        if (! $currentAuth || $record->playlist_auth_id !== $currentAuth->id) {
+                        if (! static::guestCanAccessDvr() || ! static::guestOwnsRule($record, $currentAuth)) {
                             Notification::make()
                                 ->danger()
                                 ->title(__('Unauthorized'))
@@ -353,7 +370,7 @@ class GuestDvrRuleResource extends Resource
                         $dvrSetting = static::getDvrSetting();
                         $auth = static::getCurrentPlaylistAuth();
 
-                        if (! $dvrSetting || ! $auth) {
+                        if (! static::guestCanAccessDvr() || (! $auth && ! static::isOwnerAuth())) {
                             Notification::make()
                                 ->danger()
                                 ->title(__('Unauthorized'))

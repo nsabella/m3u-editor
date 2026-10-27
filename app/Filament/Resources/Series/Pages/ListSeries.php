@@ -2,8 +2,8 @@
 
 namespace App\Filament\Resources\Series\Pages;
 
-use App\Facades\SortFacade;
 use App\Filament\Actions\RegexTesterAction;
+use App\Filament\Actions\SortSeriesByDateAction;
 use App\Filament\Resources\Series\SeriesResource;
 use App\Jobs\FetchTmdbIds;
 use App\Jobs\ProcessM3uImportSeriesEpisodes;
@@ -97,7 +97,7 @@ class ListSeries extends ListRecords
                             ->send();
                     }),
                 Action::make('process')
-                    ->label(__('Fetch Series Metadata'))
+                    ->label(__('Fetch Provider Metadata'))
                     ->schema([
                         Toggle::make('overwrite_existing')
                             ->label(__('Overwrite Existing Metadata'))
@@ -138,17 +138,17 @@ class ListSeries extends ListRecords
                     ->modalDescription(__('Process now? This will fetch all episodes and seasons for the enabled series.'))
                     ->modalSubmitActionLabel(__('Yes, process now')),
                 Action::make('fetch_tmdb_ids')
-                    ->label(__('Fetch TMDB/TVDB IDs'))
+                    ->label(__('Fetch TMDB Metadata'))
                     ->icon('heroicon-o-magnifying-glass')
                     ->schema([
                         Toggle::make('overwrite_existing')
-                            ->label(__('Overwrite Existing IDs'))
-                            ->helperText(__('Overwrite existing TMDB/TVDB/IMDB IDs? If disabled, it will only fetch IDs for series that don\'t have them.'))
+                            ->label(__('Overwrite Existing Metadata'))
+                            ->helperText(__('Overwrite existing TMDB metadata? If disabled, only series missing metadata are fetched.'))
                             ->default(false),
                         Toggle::make('all_playlists')
                             ->label(__('All Playlists'))
                             ->live()
-                            ->helperText(__('Fetch IDs for all enabled Playlist Series? If disabled, it will only be fetched for Series of the selected Playlist.'))
+                            ->helperText(__('Fetch metadata for all enabled Playlist Series? If disabled, it will only be fetched for Series of the selected Playlist.'))
                             ->default(true),
                         Select::make('playlist')
                             ->label(__('Playlist'))
@@ -209,14 +209,14 @@ class ListSeries extends ListRecords
                         Notification::make()
                             ->success()
                             ->title("Fetching TMDB/TVDB IDs for {$seriesCount} series")
-                            ->body(__('The TMDB ID lookup has been started. You will be notified when it is complete.'))
+                            ->body(__('The TMDB metadata fetch has been started. You will be notified when it is complete.'))
                             ->duration(10000)
                             ->send();
                     })
                     ->requiresConfirmation()
                     ->modalIcon('heroicon-o-magnifying-glass')
-                    ->modalDescription(__('Search TMDB for matching TV series and populate TMDB/TVDB/IMDB IDs? This enables Trash Guides compatibility for Sonarr.'))
-                    ->modalSubmitActionLabel(__('Yes, fetch IDs now')),
+                    ->modalDescription(__('Search TMDB for matching TV series and fetch full metadata (plot, artwork, cast, genres, seasons and episodes) plus TMDB, TVDB and IMDB IDs? This also enables Trash Guides compatibility for Sonarr.'))
+                    ->modalSubmitActionLabel(__('Yes, fetch metadata now')),
                 Action::make('sync')
                     ->label(__('Sync Series .strm files'))
                     ->schema([
@@ -254,44 +254,7 @@ class ListSeries extends ListRecords
                     ->modalDescription(__('Sync .strm files now? This will generate .strm files for enabled series.'))
                     ->modalSubmitActionLabel(__('Yes, sync now')),
 
-                Action::make('sort_release_date')
-                    ->label(__('Sort by Release Date'))
-                    ->icon('heroicon-o-calendar-days')
-                    ->schema([
-                        Select::make('playlist')
-                            ->label(__('Playlist'))
-                            ->required()
-                            ->helperText(__('Select the Playlist you would like to sort Series by release date for.'))
-                            ->options(Playlist::where(['user_id' => auth()->id()])->get(['name', 'id'])->pluck('name', 'id'))
-                            ->searchable(),
-                        Select::make('sort')
-                            ->label(__('Sort Order'))
-                            ->options([
-                                'DESC' => 'Newest first (2026 to 1950)',
-                                'ASC' => 'Newest first (1950 to 2026)',
-                            ])
-                            ->default('DESC')
-                            ->required(),
-                    ])
-                    ->action(function (array $data): void {
-                        $playlist = Playlist::find($data['playlist'] ?? null);
-                        if (! $playlist) {
-                            return;
-                        }
-                        SortFacade::bulkSortPlaylistSeriesByReleaseDate($playlist, $data['sort'] ?? 'DESC');
-                    })
-                    ->after(function () {
-                        Notification::make()
-                            ->success()
-                            ->title(__('Series Sorted by Release Date'))
-                            ->body(__('Series have been sorted by release date across the playlist.'))
-                            ->send();
-                    })
-                    ->requiresConfirmation()
-                    ->icon('heroicon-o-calendar-days')
-                    ->modalIcon('heroicon-o-calendar-days')
-                    ->modalDescription(__('Sort all Series in the selected playlist by release date? This will update the sort order within each category.'))
-                    ->modalSubmitActionLabel(__('Yes, sort now')),
+                SortSeriesByDateAction::forPlaylist(),
 
                 Action::make('find-replace')
                     ->label(__('Find & Replace'))

@@ -18,6 +18,7 @@ use App\Services\Arr\SonarrService;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Throwable;
 
@@ -287,15 +288,10 @@ class ContentRequestService
             ];
         }
 
-        $result = $service->add($payload);
-        if (! ($result['ok'] ?? false)) {
-            return [
-                'ok' => false,
-                'code' => 'submission_failed',
-                'error' => 'The request provider could not accept this title.',
-            ];
-        }
-
+        // Claim the request atomically (via the partial unique index on active
+        // statuses) before calling the provider. Concurrent duplicate submissions
+        // then race on this DB insert instead of both reaching $service->add(),
+        // which would otherwise double-add the same title on the provider side.
         $mediaRequest = $this->createMediaRequest(
             $playlistAuth,
             $integration,
@@ -308,6 +304,17 @@ class ContentRequestService
         );
         if (! $mediaRequest) {
             return ['ok' => false, 'code' => 'already_requested', 'error' => 'This title has already been requested.'];
+        }
+
+        $result = $service->add($payload);
+        if (! ($result['ok'] ?? false)) {
+            $mediaRequest->delete();
+
+            return [
+                'ok' => false,
+                'code' => 'submission_failed',
+                'error' => 'The request provider could not accept this title.',
+            ];
         }
 
         return [
@@ -329,7 +336,11 @@ class ContentRequestService
         ?Carbon $reviewedAt = null,
     ): ?MediaRequest {
         try {
-            return MediaRequest::create([
+            // Wrapped in its own transaction so a unique-constraint failure only
+            // rolls back to a savepoint, not the whole ambient transaction - on
+            // Postgres, an uncaught-at-the-connection-level failed statement
+            // otherwise poisons every later query until an explicit rollback.
+            return DB::transaction(fn () => MediaRequest::create([
                 'playlist_auth_id' => $playlistAuth->id,
                 'arr_integration_id' => $integration->id,
                 'title' => $title,
@@ -339,7 +350,7 @@ class ContentRequestService
                 'status' => $status,
                 'requested_at' => now(),
                 'reviewed_at' => $reviewedAt,
-            ]);
+            ]));
         } catch (QueryException $e) {
             $message = $e->getMessage();
             if (str_contains($message, 'UNIQUE constraint failed')
@@ -453,10 +464,17 @@ class ContentRequestService
         }
 
         if (in_array($status, ['completed', 'imported'], true)) {
-            $status = 'completed';
-            if ($canPersistCompleted) {
+            if ($canPersistCompleted && $this->requestedSeasonsAreAvailable($mediaRequest, $integration)) {
+                $status = 'completed';
                 $this->completeRequest($mediaRequest);
                 $formatted = $this->formatRequest($mediaRequest);
+            } else {
+                // A Download/imported event with this external ID exists, but for a
+                // season-specific series request it doesn't (yet) cover every
+                // monitored season - e.g. an import from an unrequested season must
+                // not complete the whole request. Keep reporting progress instead
+                // of finalizing prematurely.
+                $status = 'downloading';
             }
         }
 
@@ -514,6 +532,64 @@ class ContentRequestService
         $this->transitionRequest($request, 'approved', [
             'status' => 'completed',
         ], 'Request Completed', 'success');
+    }
+
+    /**
+     * For a series request scoped to specific seasons, only treat it as
+     * fulfilled once every monitored season actually has episode files in
+     * the provider's library. A Download/imported webhook event only
+     * carries the series-level external ID, so without this check an
+     * import from any season of the same series - including one that
+     * wasn't requested - would complete the whole request.
+     *
+     * Requests without a recorded season scope (movies, episode-level
+     * requests, or series requests made before this field existed) are
+     * unaffected and always considered available.
+     */
+    private function requestedSeasonsAreAvailable(MediaRequest $mediaRequest, ArrIntegration $integration): bool
+    {
+        if ($mediaRequest->request_type !== 'series') {
+            return true;
+        }
+
+        $monitoredSeasons = collect($mediaRequest->payload['seasons'] ?? [])
+            ->filter(fn (array $season): bool => (bool) ($season['monitored'] ?? false))
+            ->pluck('seasonNumber')
+            ->map(fn (mixed $season): int => (int) $season)
+            ->values();
+
+        if ($monitoredSeasons->isEmpty() || $mediaRequest->external_id === null) {
+            return true;
+        }
+
+        try {
+            $service = ArrService::make($integration);
+
+            if (! $service instanceof SonarrService || ! $service->supportsEpisodes()) {
+                return true;
+            }
+
+            $exists = $service->checkExists((int) $mediaRequest->external_id);
+            if (! ($exists['exists'] ?? false)) {
+                return false;
+            }
+
+            $episodeStatus = $service->fetchEpisodeData((int) $exists['id'])['status'];
+
+            return $monitoredSeasons->every(function (int $season) use ($episodeStatus): bool {
+                $episodes = $episodeStatus[$season] ?? [];
+
+                return $episodes !== [] && in_array(true, $episodes, true);
+            });
+        } catch (Throwable $throwable) {
+            Log::warning('Content request season availability check failed', [
+                'integration_id' => $integration->id,
+                'error' => $throwable->getMessage(),
+            ]);
+
+            // Can't verify availability - don't mark the request complete prematurely.
+            return false;
+        }
     }
 
     /**

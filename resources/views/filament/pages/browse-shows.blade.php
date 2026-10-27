@@ -11,7 +11,7 @@
                     <p class="mt-1 text-amber-700 dark:text-amber-300">
                         {{ __('Air times are shown in UTC. To see times in your local timezone,') }}
                         <a
-                            href="{{ \App\Filament\Pages\Preferences::getUrl() }}"
+                            href="{{ \App\Filament\Clusters\Settings\Pages\ManageGeneralSettings::getUrl() }}"
                             class="font-medium underline hover:text-amber-900 dark:hover:text-amber-100"
                         >
                             {{ __('set your timezone in Preferences') }} </a
@@ -63,7 +63,7 @@
                         $pageFrom = ($currentPage - 1) * 20 + 1;
                         $pageTo = min($currentPage * 20, $totalShows);
                     @endphp
-                    {{ __(':from–:to of :total shows', ['from' => $pageFrom, 'to' => $pageTo, 'total' => $totalShows]) }}
+                    {{ __(':from-:to of :total shows', ['from' => $pageFrom, 'to' => $pageTo, 'total' => $totalShows]) }}
                 </p>
 
                 @if ($this->totalPages > 1)
@@ -130,21 +130,43 @@
                             @endif
 
                             @if ($show['has_series_rule'])
-                                <div class="absolute top-2 right-2">
-                                    <x-filament::badge color="success">{{ __('Series') }}</x-filament::badge>
+                                <div class="absolute top-2 right-2 inline-flex items-center rounded-md bg-gray-900/70 ring-1 ring-white/10 backdrop-blur-sm">
+                                    <x-filament::badge
+                                        color="success"
+                                        icon="heroicon-s-queue-list"
+                                        size="sm"
+                                        class="!bg-emerald-600 !text-white"
+                                    >
+                                        {{ __('Series') }}
+                                    </x-filament::badge>
                                 </div>
                             @elseif ($show['has_once_rule'])
-                                <div class="absolute top-2 right-2">
-                                    <x-filament::badge color="info">{{ __('Scheduled') }}</x-filament::badge>
+                                <div class="absolute top-2 right-2 inline-flex items-center rounded-md bg-gray-900/70 ring-1 ring-white/10 backdrop-blur-sm">
+                                    <x-filament::badge color="info" icon="heroicon-s-clock" size="sm">
+                                        {{ __('Scheduled') }}
+                                    </x-filament::badge>
                                 </div>
                             @endif
 
-                            <div class="absolute top-2 left-2 flex flex-col gap-1">
+                            <div class="absolute top-2 left-2 flex flex-col items-start gap-1">
                                 @if ($show['flags']['is_new'])
-                                    <x-filament::badge color="success">{{ __('New') }}</x-filament::badge>
+                                    <div class="inline-flex items-center rounded-md bg-gray-900/70 ring-1 ring-white/10 backdrop-blur-sm">
+                                        <x-filament::badge
+                                            color="success"
+                                            icon="heroicon-s-sparkles"
+                                            size="sm"
+                                            class="!bg-emerald-600 !text-white"
+                                        >
+                                            {{ __('New') }}
+                                        </x-filament::badge>
+                                    </div>
                                 @endif
                                 @if ($show['flags']['premiere'])
-                                    <x-filament::badge color="warning">{{ __('Premiere') }}</x-filament::badge>
+                                    <div class="inline-flex items-center rounded-md bg-gray-900/70 ring-1 ring-white/10 backdrop-blur-sm">
+                                        <x-filament::badge color="warning" icon="heroicon-s-star" size="sm">
+                                            {{ __('Premiere') }}
+                                        </x-filament::badge>
+                                    </div>
                                 @endif
                             </div>
                         </button>
@@ -160,7 +182,7 @@
                                 </p>
                                 <p class="mt-0.5 text-xs text-gray-500 dark:text-gray-400">
                                     <span class="font-semibold text-gray-600 dark:text-gray-300">{{ __('Airing Next:') }}</span>
-                                    {{ $show['next_air_date_human'] ?? '—' }}
+                                    {{ $show['next_air_date_human'] ?? '-' }}
                                 </p>
                             </button>
 

@@ -3,6 +3,7 @@
 namespace App\Models;
 
 use App\Enums\PlaylistChannelId;
+use App\Traits\HasDefaultAuth;
 use App\Traits\ShortUrlTrait;
 use Illuminate\Database\Eloquent\Builder as EloquentBuilder;
 use Illuminate\Database\Eloquent\Casts\Attribute;
@@ -23,6 +24,7 @@ use Spatie\Tags\Tag;
 
 class CustomPlaylist extends Model
 {
+    use HasDefaultAuth;
     use HasFactory;
     use HasTags;
     use ShortUrlTrait;
@@ -36,6 +38,7 @@ class CustomPlaylist extends Model
         'id' => 'integer',
         'user_id' => 'integer',
         'dummy_epg' => 'boolean',
+        'dummy_epg_days' => 'integer',
         'dummy_epg_fallback_order' => 'array',
         'output_tvg_type' => 'boolean',
         'short_urls' => 'array',
@@ -44,6 +47,7 @@ class CustomPlaylist extends Model
         'include_series_in_m3u' => 'boolean',
         'include_networks_in_m3u' => 'boolean',
         'include_vod_in_m3u' => 'boolean',
+        'sort_by_channel_number' => 'boolean',
         'custom_headers' => 'array',
         'strict_live_ts' => 'boolean',
         'use_sticky_session' => 'boolean',
@@ -51,6 +55,10 @@ class CustomPlaylist extends Model
         'disable_m3u_xtream_format' => 'boolean',
         'processing_config' => 'array',
         'aiostreams_integration_id' => 'integer',
+        'hdhr_enabled' => 'boolean',
+        'm3u_enabled' => 'boolean',
+        'xapi_enabled' => 'boolean',
+        'xmltv_enabled' => 'boolean',
     ];
 
     public function enabledProcessingRules(): SupportCollection
@@ -101,7 +109,7 @@ class CustomPlaylist extends Model
     public function channels(): BelongsToMany
     {
         return $this->belongsToMany(Channel::class, 'channel_custom_playlist')
-            ->withPivot(['channel_number', 'sort']);
+            ->withPivot(['channel_number', 'channel_minor', 'sort']);
     }
 
     public function enabled_channels(): BelongsToMany
@@ -149,6 +157,11 @@ class CustomPlaylist extends Model
     public function customChannels(): HasMany
     {
         return $this->hasMany(Channel::class);
+    }
+
+    public function bouquets(): HasMany
+    {
+        return $this->hasMany(Bouquet::class);
     }
 
     public function groups(): MorphToMany

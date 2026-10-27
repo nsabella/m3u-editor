@@ -3,12 +3,11 @@
 namespace App\Console\Commands;
 
 use App\Jobs\CreateBackup;
+use App\Jobs\PruneOldBackups;
 use App\Settings\GeneralSettings;
 use Cron\CronExpression;
 use Illuminate\Console\Command;
-use ShuvroRoy\FilamentSpatieLaravelBackup\FilamentSpatieLaravelBackup;
-use Spatie\Backup\BackupDestination\Backup;
-use Spatie\Backup\BackupDestination\BackupDestination as SpatieBackupDestination;
+use Illuminate\Support\Facades\Bus;
 
 class RunScheduledBackups extends Command
 {
@@ -37,32 +36,17 @@ class RunScheduledBackups extends Command
             if ($isDue) {
                 $this->info('Running scheduled backups...');
 
-                // Check if we'll be over the max backups after execution
                 $max = $settings->auto_backup_database_max_backups;
-                if ($max && $max > 0) {
-                    $data = [];
-                    foreach (FilamentSpatieLaravelBackup::getDisks() as $disk) {
-                        $data = array_merge($data, FilamentSpatieLaravelBackup::getBackupDestinationData($disk));
-                    }
+                $deleteAfterDays = $settings->auto_backup_database_delete_after_days;
 
-                    // Order by backup date
-                    $data = collect($data)->sortByDesc('date');
-                    if ($data->count() >= $max) {
-                        $toDelete = $data->slice($max - 1);
-                        foreach ($toDelete as $record) {
-                            $this->info("Deleting old backup: {$record['path']}");
-                            SpatieBackupDestination::create($record['disk'], config('backup.backup.name'))
-                                ->backups()
-                                ->first(function (Backup $backup) use ($record) {
-                                    return $backup->path() === $record['path'];
-                                })
-                                ->delete();
-                        }
-                    }
-                }
-
-                // Run the backup
-                app('Illuminate\Contracts\Bus\Dispatcher')->dispatch(new CreateBackup);
+                // Create the replacement backup first, then prune to the configured
+                // max/age limits. Pruning before the replacement exists (the previous
+                // behavior) could leave zero backups available if the replacement
+                // job was delayed or failed.
+                Bus::chain([
+                    new CreateBackup,
+                    new PruneOldBackups($max, $deleteAfterDays),
+                ])->dispatch();
             }
         }
     }

@@ -2,6 +2,7 @@
 
 namespace App\Jobs;
 
+use App\Models\Bouquet;
 use App\Models\Playlist;
 use Exception;
 use Filament\Notifications\Notification;
@@ -64,6 +65,24 @@ class DuplicatePlaylist implements ShouldQueue
                 $newSource->save();
             }
 
+            // Copy the "source" categories - the resolver rows a bouquet/alias category
+            // filter matches series against (see PlaylistAlias::series(), which looks up
+            // SourceCategory by playlist_id + name to resolve the raw provider category id
+            // it then filters series.source_category_id by). Without these, a copied
+            // bouquet's selected categories resolve to no ids on the new playlist, and an
+            // alias built on the copy with that bouquet lists no series even though the
+            // copied series themselves are present and enabled.
+            foreach ($playlist->sourceCategories()->get() as $sourceCategory) {
+                $newSourceCategory = $sourceCategory->replicate(except: [
+                    'id',
+                    'playlist_id',
+                ]);
+                $newSourceCategory->playlist_id = $newPlaylist->id;
+                $newSourceCategory->created_at = $now;
+                $newSourceCategory->updated_at = $now;
+                $newSourceCategory->save();
+            }
+
             // Copy the groups
             foreach ($playlist->groups()->get() as $group) {
                 $newGroup = $group->replicate(except: [
@@ -103,6 +122,19 @@ class DuplicatePlaylist implements ShouldQueue
                     }
                 }
             }
+
+            // Copy the playlist's bouquets (groups replicate with identical names,
+            // so the name-based selections stay valid). No alias attachments.
+            Bouquet::where('playlist_id', $playlist->id)
+                ->cursor()
+                ->each(function (Bouquet $bouquet) use ($newPlaylist): void {
+                    $copy = $bouquet->replicate(except: ['id']);
+                    $copy->playlist_id = $newPlaylist->id;
+                    // saveQuietly() bypasses the Bouquet::saving ownership guard by design - the
+                    // copy keeps the source bouquet's user_id, and $newPlaylist replicated the
+                    // same user_id, so the invariant already holds.
+                    $copy->saveQuietly();
+                });
 
             // Copy the categories
             foreach ($playlist->categories()->get() as $category) {

@@ -1,5 +1,6 @@
 <?php
 
+use App\Models\AedProfile;
 use App\Models\Channel;
 use App\Models\Epg;
 use App\Models\EpgChannel;
@@ -8,7 +9,12 @@ use App\Models\Playlist;
 use App\Models\PlaylistAuth;
 use App\Models\User;
 use Carbon\Carbon;
+use Illuminate\Cookie\Middleware\EncryptCookies;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Routing\Router;
+use Illuminate\Session\Middleware\StartSession;
+use Illuminate\Support\Facades\Route;
+use Illuminate\Support\Facades\Storage;
 
 uses(RefreshDatabase::class);
 
@@ -146,6 +152,36 @@ it('does not generate dummy epg when disabled', function () {
 
     // Programmes should be empty or not include the channel without EPG
     $this->assertEmpty($data['programmes'][$channelId] ?? []);
+});
+
+it('generates aed dummy epg for a channel with an assigned aed profile even when playlist dummy epg is disabled', function () {
+    $this->playlist->update(['dummy_epg' => false]);
+
+    $aedProfile = new AedProfile;
+    $aedProfile->forceFill([
+        'user_id' => $this->user->id,
+        'name' => 'Independent AED',
+        'event_duration_minutes' => 120,
+    ])->save();
+
+    $channel = Channel::factory()->create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'enabled' => true,
+        'is_vod' => false,
+        'channel' => 995,
+        'aed_profile_id' => $aedProfile->id,
+    ]);
+
+    $response = $this->getJson("/api/epg/playlist/{$this->playlist->uuid}/data");
+
+    $response->assertSuccessful();
+
+    $data = $response->json();
+    $channel->refresh();
+    $channelId = $channel->id;
+
+    $this->assertNotEmpty($data['programmes'][$channelId] ?? [], 'AED-assigned channel should get dummy programmes even with playlist dummy_epg disabled');
 });
 
 it('can disable dummy epg category', function () {
@@ -394,4 +430,76 @@ it('gets playable urls for unauthenticated request with matching playlist auth',
     $this->assertTrue($channelEntry['playable']);
     $this->assertNotEmpty($channelEntry['url']);
     $this->assertStringContainsString((string) $playlistAuth->username, $channelEntry['url']);
+});
+
+/*
+ * The in-app EPG viewer authenticates via the panel session cookie when
+ * fetching playable stream URLs, so `api.epg.playlist.data` must load the
+ * session. It lives in routes/api.php, whose `api` group is stateless -
+ * without EncryptCookies + StartSession, `Auth::check()` is always false
+ * and every channel comes back with a null `url`, which hides the play
+ * button in the playlist EPG view. `api.epg.data` and `api.epg.playlist.groups`
+ * never call `Auth::`, so they intentionally do not carry this middleware.
+ *
+ * This cannot be covered by a request test: `actingAs()` sets the guard's user
+ * directly and passes regardless of which middleware the route declares.
+ */
+it('loads the panel session on the epg playlist data route', function () {
+    $route = Route::getRoutes()->getByName('api.epg.playlist.data');
+
+    expect($route)->not->toBeNull();
+
+    $middleware = app(Router::class)->gatherRouteMiddleware($route);
+
+    expect($middleware)
+        ->toContain(EncryptCookies::class)
+        ->toContain(StartSession::class);
+});
+
+it('does not load the panel session on the other epg routes', function (string $routeName) {
+    $route = Route::getRoutes()->getByName($routeName);
+
+    expect($route)->not->toBeNull();
+
+    $middleware = app(Router::class)->gatherRouteMiddleware($route);
+
+    expect($middleware)
+        ->not->toContain(EncryptCookies::class)
+        ->not->toContain(StartSession::class);
+})->with([
+    'api.epg.data',
+    'api.epg.playlist.groups',
+]);
+
+it('applies the channel tvg_shift to mapped epg programmes', function () {
+    $epg = Epg::factory()->create(['user_id' => $this->user->id, 'is_cached' => true]);
+    $epgChannel = EpgChannel::factory()->create([
+        'epg_id' => $epg->id,
+        'user_id' => $this->user->id,
+        'channel_id' => 'abc.us',
+    ]);
+    $channel = Channel::factory()->create([
+        'playlist_id' => $this->playlist->id,
+        'user_id' => $this->user->id,
+        'epg_channel_id' => $epgChannel->id,
+        'enabled' => true,
+        'is_vod' => false,
+        'tvg_shift' => '2',
+    ]);
+
+    Storage::fake('local');
+    $start = now()->startOfDay()->addHours(20);
+    seedEpgProgrammeCache($epg, [
+        ['abc.us', [
+            'start' => $start->toISOString(),
+            'stop' => $start->copy()->addHour()->toISOString(),
+            'title' => 'Show',
+        ]],
+    ]);
+
+    $response = $this->getJson("/api/epg/playlist/{$this->playlist->uuid}/data");
+
+    $response->assertSuccessful();
+    $programme = $response->json("programmes.{$channel->id}.0");
+    expect(Carbon::parse($programme['start'])->equalTo($start->copy()->addHours(2)))->toBeTrue();
 });

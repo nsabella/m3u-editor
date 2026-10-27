@@ -545,6 +545,7 @@ class NetworkResource extends Resource implements CopilotResource
                         ->description('')
                         ->schema([
                             TextInput::make('epg_url')
+                                ->extraInputAttributes(['class' => 'privacy-sensitive'])
                                 ->label(__('EPG URL'))
                                 ->disabled()
                                 ->dehydrated(false)
@@ -590,6 +591,7 @@ class NetworkResource extends Resource implements CopilotResource
                         ->description('')
                         ->schema([
                             TextInput::make('stream_url')
+                                ->extraInputAttributes(['class' => 'privacy-sensitive'])
                                 ->label(__('Stream URL'))
                                 ->disabled()
                                 ->dehydrated(false)
@@ -608,6 +610,7 @@ class NetworkResource extends Resource implements CopilotResource
                                 ->hint(fn ($record) => $record?->stream_url ? view('components.copy-to-clipboard', ['text' => $record->stream_url, 'position' => 'left']) : null),
 
                             TextInput::make('m3u_url')
+                                ->extraInputAttributes(['class' => 'privacy-sensitive'])
                                 ->label(__('M3U Playlist URL'))
                                 ->disabled()
                                 ->dehydrated(false)
@@ -881,6 +884,7 @@ class NetworkResource extends Resource implements CopilotResource
                                         ->formatStateUsing(fn ($record) => $record?->broadcast_started_at?->format('M j, Y H:i:s') ?? '-'),
 
                                     TextInput::make('hls_url')
+                                        ->extraInputAttributes(['class' => 'privacy-sensitive'])
                                         ->label(__('HLS Playlist URL'))
                                         ->disabled()
                                         ->dehydrated(false)
@@ -921,7 +925,7 @@ class NetworkResource extends Resource implements CopilotResource
                     ->checkFileExistence(false)
                     ->size('inherit', 'inherit')
                     ->extraImgAttributes(fn (): array => [
-                        'style' => 'height:2.5rem; width:auto; border-radius:4px;',
+                        'style' => 'height:2.5rem !important; width:auto !important; border-radius:4px;',
                     ])
                     ->defaultImageUrl(url('/placeholder.png'))
                     ->toggleable(),
@@ -1332,7 +1336,7 @@ class NetworkResource extends Resource implements CopilotResource
                     'reset' => __('Fresh start'),
                 ])
                 ->descriptions([
-                    'continue' => __("Keeps the currently-airing programme. Regenerates the next {$windowDays} days from where the schedule left off. The content order stays the same — good for topping up an expiring schedule without disrupting viewers."),
+                    'continue' => __("Keeps the currently-airing programme. Regenerates the next {$windowDays} days from where the schedule left off. The content order stays the same - good for topping up an expiring schedule without disrupting viewers."),
                     'reset' => __("Deletes all existing programmes and builds a completely new {$windowDays}-day schedule from scratch.{$shuffleNote} Use this after reordering content, setting pins, or when you want a fresh lineup."),
                 ])
                 ->default('continue')

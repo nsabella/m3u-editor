@@ -6,6 +6,8 @@ use App\Facades\PlaylistFacade;
 use App\Http\Controllers\Controller;
 use App\Models\PlaylistAlias;
 use App\Models\PushDeviceToken;
+use App\Models\TvDevice;
+use App\Models\TvDeviceLog;
 use App\Models\TvNotification;
 use App\Services\M3uProxyService;
 use App\Settings\GeneralSettings;
@@ -14,6 +16,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
 
 class TvApiController extends Controller
 {
@@ -66,12 +69,15 @@ class TvApiController extends Controller
             ->filter(fn (array $c) => $c['name'] !== '')
             ->values();
 
+        $deviceRevoked = $this->touchDeviceRegistry($request, $auth, $playlist);
+
         return response()->json([
             'notifiable_id' => $playlist->id,
             'notifiable_type' => $playlist->getMorphClass(),
             'is_admin' => $auth['isAdmin'],
             'notifications' => $query->get(),
             'available_channels' => $configuredChannels,
+            'device_revoked' => $deviceRevoked,
             'reverb' => [
                 'host' => $request->getHost(),
                 'port' => (int) $request->getPort(),
@@ -80,6 +86,87 @@ class TvApiController extends Controller
                 'channel' => $auth['channel'],
             ],
         ]);
+    }
+
+    /**
+     * Upserts this device's row in the unified `tv_devices` registry from the
+     * identity params the app tacks onto its boot/resume notifications call.
+     * No-op for older app builds that don't send `device_id`. Writes are
+     * debounced to once per 5 minutes so client poll cadence can't amplify
+     * them. Returns true when the row has been tombstoned by an admin Revoke,
+     * so the caller can tell the app to log out.
+     *
+     * @param  array{playlist: Model, isAdmin: bool, playlistAuthId: ?int, channel: string}  $auth
+     */
+    private function touchDeviceRegistry(Request $request, array $auth, Model $playlist): bool
+    {
+        $deviceId = (string) $request->query('device_id', '');
+
+        if ($deviceId === '' || mb_strlen($deviceId) > 128) {
+            return false;
+        }
+
+        $device = TvDevice::firstOrNew(['device_id' => $deviceId]);
+
+        if ($device->exists && $device->isRevoked()) {
+            return true;
+        }
+
+        $attributes = [
+            'notifiable_type' => $playlist->getMorphClass(),
+            'notifiable_id' => $playlist->id,
+            'playlist_auth_id' => $auth['playlistAuthId'],
+            'device_name' => Str::limit((string) $request->query('device_name', ''), 250, '') ?: null,
+            'platform' => Str::limit((string) $request->query('platform', ''), 30, '') ?: null,
+            'app_version' => Str::limit((string) $request->query('app_version', ''), 30, '') ?: null,
+            'last_ip' => $request->ip(),
+        ];
+
+        $lastSeenIsStale = $device->last_seen_at === null
+            || $device->last_seen_at->lt(now()->subMinutes(5));
+
+        // Cheap path for a device that pinged again within the debounce window
+        // and whose identity hasn't changed: skip the write entirely.
+        if (! $lastSeenIsStale && $this->deviceAttributesUnchanged($device, $attributes)) {
+            return false;
+        }
+
+        $now = now();
+
+        // Atomic INSERT ... ON CONFLICT (device_id) DO UPDATE. Race-safe against
+        // a concurrent first-touch for the same device, and avoids the "a failed
+        // INSERT aborts the whole transaction" behaviour Postgres has with a
+        // catch-then-update fallback.
+        TvDevice::query()->upsert(
+            [array_merge($attributes, [
+                'device_id' => $deviceId,
+                'last_seen_at' => $now,
+                'created_at' => $now,
+                'updated_at' => $now,
+            ])],
+            ['device_id'],
+            [...array_keys($attributes), 'last_seen_at', 'updated_at'],
+        );
+
+        return false;
+    }
+
+    /**
+     * @param  array<string, mixed>  $attributes
+     */
+    private function deviceAttributesUnchanged(TvDevice $device, array $attributes): bool
+    {
+        foreach ($attributes as $key => $value) {
+            if ($key === 'last_ip') {
+                continue;
+            }
+
+            if ((string) $device->getAttribute($key) !== (string) $value) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /**
@@ -162,12 +249,21 @@ class TvApiController extends Controller
         $data = $request->validate([
             'token' => ['required', 'string', 'max:4096'],
             'platform' => ['required', 'string', 'in:ios,android'],
+            'device_id' => ['nullable', 'string', 'max:128'],
+            'device_name' => ['nullable', 'string', 'max:250'],
         ]);
 
         DB::transaction(function () use ($auth, $data, $playlist): void {
             $device = PushDeviceToken::where('token', $data['token'])
                 ->lockForUpdate()
                 ->first();
+
+            // Only overwrite identity columns when the client actually sent them,
+            // so an older build re-registering doesn't wipe a name set earlier.
+            $identity = array_filter([
+                'device_id' => $data['device_id'] ?? null,
+                'device_name' => $data['device_name'] ?? null,
+            ], fn ($value) => $value !== null);
 
             if ($device === null) {
                 PushDeviceToken::create([
@@ -177,6 +273,7 @@ class TvApiController extends Controller
                     'platform' => $data['platform'],
                     'last_seen_at' => now(),
                     'playlist_auth_id' => $auth['playlistAuthId'],
+                    ...$identity,
                 ]);
 
                 return;
@@ -188,6 +285,7 @@ class TvApiController extends Controller
                 'platform' => $data['platform'],
                 'last_seen_at' => now(),
                 'playlist_auth_id' => $auth['playlistAuthId'],
+                ...$identity,
             ]);
         });
 
@@ -234,8 +332,10 @@ class TvApiController extends Controller
             'client_id' => ['required', 'string', 'max:128', 'regex:/^[\w-]+$/'],
         ]);
 
+        // Match on the ID the TV asked for. The stream may be for another item: a media-server
+        // copy, a catchup failover, or a live failover the proxy fell back to.
         $isSeries = $data['type'] === 'series';
-        $field = $isSeries ? 'episode_id' : 'channel_id';
+        $field = $isSeries ? 'requested_episode_id' : 'requested_channel_id';
         $id = $isSeries ? $data['episode_id'] : $data['stream_id'];
 
         $belongsToPlaylist = $isSeries
@@ -274,6 +374,42 @@ class TvApiController extends Controller
                 });
             }
         });
+    }
+
+    /**
+     * POST /api/tv/{username}/{password}/logs
+     *
+     * Stores a diagnostic log snapshot from the app's Logs & Diagnostics
+     * screen against this device's registry row, for an admin to read from
+     * Registered Devices. The app sends the same identity query params as its
+     * notifications call, so the row is upserted here too. Only the newest
+     * TvDeviceLog::KEEP_PER_DEVICE uploads are kept per device.
+     */
+    public function uploadLogs(Request $request): JsonResponse
+    {
+        $auth = $this->resolveAuth($request);
+
+        $data = $request->validate([
+            'log' => ['required', 'string', 'max:'.TvDeviceLog::MAX_BYTES],
+        ]);
+
+        abort_if($this->touchDeviceRegistry($request, $auth, $auth['playlist']), 403, 'Device access revoked.');
+
+        $device = TvDevice::where('device_id', (string) $request->query('device_id', ''))->first();
+        abort_if($device === null, 422, 'Missing or unknown device_id.');
+
+        $log = $device->logs()->create([
+            'app_version' => $device->app_version,
+            'size_bytes' => strlen($data['log']),
+            'content' => $data['log'],
+        ]);
+
+        $staleIds = $device->logs()->pluck('id')->slice(TvDeviceLog::KEEP_PER_DEVICE);
+        if ($staleIds->isNotEmpty()) {
+            TvDeviceLog::whereIn('id', $staleIds)->delete();
+        }
+
+        return response()->json(['ok' => true, 'id' => $log->id]);
     }
 
     /**

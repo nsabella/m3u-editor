@@ -894,3 +894,243 @@ it('returns cast with TMDB personId for click-through to filmography', function 
             'actor' => 'Brad Pitt',
         ]);
 });
+
+it('returns a rich cast_list from getMovieDetails for downstream persistence', function () {
+    Cache::flush();
+    Http::fake([
+        'https://api.themoviedb.org/3/movie/27205*' => Http::response([
+            'id' => 27205,
+            'title' => 'Inception',
+            'credits' => [
+                'cast' => [
+                    ['id' => 6193, 'name' => 'Leonardo DiCaprio', 'character' => 'Cobb', 'profile_path' => '/leo.jpg'],
+                    ['id' => 24045, 'name' => 'Joseph Gordon-Levitt', 'character' => 'Arthur', 'profile_path' => null],
+                ],
+                'crew' => [],
+            ],
+            'videos' => ['results' => []],
+            'external_ids' => [],
+        ], 200),
+    ]);
+
+    $details = (new TmdbService($this->settings))->getMovieDetails(27205);
+
+    expect($details['cast_list'])->toBe([
+        ['id' => 6193, 'name' => 'Leonardo DiCaprio', 'character' => 'Cobb', 'photo' => 'https://image.tmdb.org/t/p/w185/leo.jpg'],
+        ['id' => 24045, 'name' => 'Joseph Gordon-Levitt', 'character' => 'Arthur', 'photo' => null],
+    ]);
+});
+
+it('returns a rich cast_list from getTvSeriesDetails for downstream persistence', function () {
+    Cache::flush();
+    Http::fake([
+        'https://api.themoviedb.org/3/tv/1396*' => Http::response([
+            'id' => 1396,
+            'name' => 'Breaking Bad',
+            'genres' => [],
+            'external_ids' => [],
+            'credits' => [
+                'cast' => [
+                    ['id' => 17419, 'name' => 'Bryan Cranston', 'character' => 'Walter White', 'profile_path' => '/bc.jpg'],
+                    ['id' => 84433, 'name' => 'Aaron Paul', 'character' => 'Jesse Pinkman', 'profile_path' => null],
+                ],
+                'crew' => [],
+            ],
+            'videos' => ['results' => []],
+        ], 200),
+    ]);
+
+    $details = (new TmdbService($this->settings))->getTvSeriesDetails(1396);
+
+    expect($details['cast_list'])->toBe([
+        ['id' => 17419, 'name' => 'Bryan Cranston', 'character' => 'Walter White', 'photo' => 'https://image.tmdb.org/t/p/w185/bc.jpg'],
+        ['id' => 84433, 'name' => 'Aaron Paul', 'character' => 'Jesse Pinkman', 'photo' => null],
+    ]);
+});
+
+it('picks the language-ranked clearlogo from getMovieDetails', function () {
+    Cache::flush();
+    Http::fake([
+        'https://api.themoviedb.org/3/movie/27205*' => Http::response([
+            'id' => 27205,
+            'title' => 'Inception',
+            'credits' => ['cast' => [], 'crew' => []],
+            'videos' => ['results' => []],
+            'external_ids' => [],
+            'images' => [
+                'logos' => [
+                    ['file_path' => '/de-low.png', 'iso_639_1' => 'de', 'vote_average' => 9.0],
+                    ['file_path' => '/en-low.png', 'iso_639_1' => 'en', 'vote_average' => 1.0],
+                    ['file_path' => '/en-high.png', 'iso_639_1' => 'en', 'vote_average' => 8.0],
+                    ['file_path' => '/neutral.png', 'iso_639_1' => null, 'vote_average' => 10.0],
+                ],
+            ],
+        ], 200),
+    ]);
+
+    $details = (new TmdbService($this->settings))->getMovieDetails(27205);
+
+    // en-US configured -> prefer 'en', highest vote within that language.
+    expect($details['logo_url'])->toBe('https://image.tmdb.org/t/p/w500/en-high.png');
+});
+
+it('returns a null clearlogo when TMDB carries no logos', function () {
+    Cache::flush();
+    Http::fake([
+        'https://api.themoviedb.org/3/tv/1396*' => Http::response([
+            'id' => 1396,
+            'name' => 'Breaking Bad',
+            'genres' => [],
+            'external_ids' => [],
+            'credits' => ['cast' => [], 'crew' => []],
+            'videos' => ['results' => []],
+            'images' => ['logos' => []],
+        ], 200),
+    ]);
+
+    $details = (new TmdbService($this->settings))->getTvSeriesDetails(1396);
+
+    expect($details['logo_url'])->toBeNull();
+});
+
+it('returns empties when API key is not configured for now playing', function () {
+    $settings = new GeneralSettings;
+    $settings->tmdb_api_key = null;
+
+    $service = new TmdbService($settings);
+
+    expect($service->getNowPlayingMovies())->toBe([]);
+});
+
+it('fetches and normalizes now-playing movies from TMDB', function () {
+    Http::fake([
+        'https://api.themoviedb.org/3/movie/now_playing*' => Http::response([
+            'results' => [
+                [
+                    'id' => 700,
+                    'title' => 'In Theatres Now',
+                    'release_date' => '2024-05-01',
+                    'overview' => 'A new film.',
+                    'poster_path' => '/abc.jpg',
+                    'vote_average' => 8.1,
+                    'vote_count' => 1500,
+                    'genre_ids' => [28, 12],
+                ],
+            ],
+        ], 200),
+    ]);
+
+    $service = new TmdbService($this->settings);
+    $results = $service->getNowPlayingMovies();
+
+    expect($results)->toHaveCount(1)
+        ->and($results[0])->toMatchArray([
+            'tmdb_id' => 700,
+            'title' => 'In Theatres Now',
+            'media_type' => 'movie',
+            'year' => '2024',
+            'vote_average' => 8.1,
+            'genre_ids' => [28, 12],
+        ])
+        ->and($results[0]['poster_url'])->toBe('https://image.tmdb.org/t/p/w500/abc.jpg');
+});
+
+it('picks the US certification from movie release dates', function (array $releaseDates, ?string $expected) {
+    Http::fake([
+        'https://api.themoviedb.org/3/movie/603*' => Http::response([
+            'id' => 603,
+            'title' => 'The Matrix',
+            'release_dates' => ['results' => $releaseDates],
+        ], 200),
+    ]);
+
+    $details = (new TmdbService($this->settings))->getMovieDetails(603);
+
+    expect($details['certification'])->toBe($expected);
+
+    Http::assertSent(fn ($request) => str_contains($request['append_to_response'] ?? '', 'release_dates'));
+})->with([
+    'US over other countries' => [[
+        ['iso_3166_1' => 'GB', 'release_dates' => [['certification' => '15', 'type' => 3]]],
+        ['iso_3166_1' => 'US', 'release_dates' => [['certification' => 'R', 'type' => 3]]],
+    ], 'R'],
+    'skips blank certifications' => [[
+        ['iso_3166_1' => 'US', 'release_dates' => [
+            ['certification' => '', 'type' => 3],
+            ['certification' => ' ', 'type' => 1],
+            ['certification' => 'PG-13', 'type' => 4],
+        ]],
+    ], 'PG-13'],
+    'prefers theatrical over other release types' => [[
+        ['iso_3166_1' => 'US', 'release_dates' => [
+            ['certification' => 'NR', 'type' => 1],
+            ['certification' => 'Unrated', 'type' => 4],
+            ['certification' => 'R', 'type' => 3],
+        ]],
+    ], 'R'],
+    'no US release' => [[
+        ['iso_3166_1' => 'DE', 'release_dates' => [['certification' => '16', 'type' => 3]]],
+    ], null],
+    'no release dates' => [[], null],
+]);
+
+it('picks the US content rating and reshapes networks from series details', function (array $payload, ?string $expectedRating, array $expectedNetworks) {
+    Http::fake([
+        'https://api.themoviedb.org/3/tv/1396*' => Http::response(['id' => 1396, 'name' => 'Breaking Bad'] + $payload, 200),
+    ]);
+
+    $details = (new TmdbService($this->settings))->getTvSeriesDetails(1396);
+
+    expect($details['certification'])->toBe($expectedRating)
+        ->and($details['networks'])->toBe($expectedNetworks);
+
+    Http::assertSent(fn ($request) => str_contains($request['append_to_response'] ?? '', 'content_ratings'));
+})->with([
+    'US rating and networks' => [[
+        'content_ratings' => ['results' => [
+            ['iso_3166_1' => 'GB', 'rating' => '15'],
+            ['iso_3166_1' => 'US', 'rating' => 'TV-MA'],
+        ]],
+        'networks' => [
+            ['id' => 174, 'name' => 'AMC', 'logo_path' => '/amc.png', 'origin_country' => 'US'],
+            ['id' => 213, 'name' => 'Netflix', 'logo_path' => null, 'origin_country' => ''],
+        ],
+    ], 'TV-MA', [
+        ['id' => 174, 'name' => 'AMC', 'logo' => 'https://image.tmdb.org/t/p/w300/amc.png'],
+        ['id' => 213, 'name' => 'Netflix', 'logo' => null],
+    ]],
+    'blank US rating' => [[
+        'content_ratings' => ['results' => [['iso_3166_1' => 'US', 'rating' => ' ']]],
+    ], null, []],
+    'no US rating' => [[
+        'content_ratings' => ['results' => [['iso_3166_1' => 'DE', 'rating' => '16']]],
+    ], null, []],
+    'no content ratings or networks' => [[], null, []],
+]);
+
+it('reshapes movie production companies into studios', function (array $companies, array $expected) {
+    Http::fake([
+        'https://api.themoviedb.org/3/movie/603*' => Http::response([
+            'id' => 603,
+            'title' => 'The Matrix',
+            'production_companies' => $companies,
+        ], 200),
+    ]);
+
+    $details = (new TmdbService($this->settings))->getMovieDetails(603);
+
+    expect($details['studios'])->toBe($expected);
+})->with([
+    'companies with and without logos' => [[
+        ['id' => 79, 'name' => 'Village Roadshow Pictures', 'logo_path' => '/vr.png', 'origin_country' => 'US'],
+        ['id' => 372, 'name' => 'Groucho II Film Partnership', 'logo_path' => null, 'origin_country' => ''],
+    ], [
+        ['id' => 79, 'name' => 'Village Roadshow Pictures', 'logo' => 'https://image.tmdb.org/t/p/w300/vr.png'],
+        ['id' => 372, 'name' => 'Groucho II Film Partnership', 'logo' => null],
+    ]],
+    'skips entries without an id or name' => [[
+        ['id' => 0, 'name' => 'No Id'],
+        ['id' => 5, 'name' => ''],
+    ], []],
+    'no production companies' => [[], []],
+]);

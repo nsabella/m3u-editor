@@ -5,6 +5,7 @@ namespace App\Console\Commands;
 use App\Enums\Status;
 use App\Jobs\ProcessEpgImport;
 use App\Models\Epg;
+use App\Settings\GeneralSettings;
 use Cron\CronExpression;
 use Illuminate\Console\Command;
 
@@ -80,10 +81,26 @@ class RefreshEpg extends Command
             }
 
             $count = 0;
-            $failedRetryCooldown = (int) config('dev.failed_retry_cooldown_minutes', 30);
+            $failedRetryCooldown = app(GeneralSettings::class)->failedRetryCooldownMinutes();
             $epgs->get()->each(function (Epg $epg) use (&$count, $failedRetryCooldown) {
                 $interval = $epg->sync_interval === '24hr' ? '0 0 * * *' : $epg->sync_interval;
                 $cronExpression = new CronExpression($interval);
+
+                // Skip Schedules Direct EPGs that are in a provider login-limit
+                // (4009/4010) cooldown or server-error backoff: dispatching would
+                // just re-trigger a /token request and keep the account
+                // rate-limited. It resumes on its own once the cooldown clears.
+                if ($epg->isInSchedulesDirectLoginCooldown()) {
+                    return;
+                }
+
+                // Skip Schedules Direct EPGs whose login was permanently rejected
+                // (expired, invalid user, disabled or inactive account). Retrying
+                // cannot succeed; they resume once the user updates the
+                // credentials or uses "Retry SchedulesDirect Login".
+                if ($epg->isSchedulesDirectAuthBlocked()) {
+                    return;
+                }
 
                 // Gate failed retries behind a cooldown to prevent CPU runaway
                 $isFailed = $epg->status === Status::Failed;

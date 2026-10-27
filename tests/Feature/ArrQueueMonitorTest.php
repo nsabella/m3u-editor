@@ -148,7 +148,7 @@ it('only shows integrations belonging to the authenticated user', function () {
 });
 
 it('formats bytes correctly', function () {
-    expect(ArrQueueMonitor::formatBytes(0))->toBe('–');
+    expect(ArrQueueMonitor::formatBytes(0))->toBe('-');
     expect(ArrQueueMonitor::formatBytes(1_024))->toBe('1.00 KB');
     expect(ArrQueueMonitor::formatBytes(1_048_576))->toBe('1.00 MB');
     expect(ArrQueueMonitor::formatBytes(1_073_741_824))->toBe('1.00 GB');
@@ -262,4 +262,18 @@ it('counts total items across all queues', function () {
     $component = Livewire::test(ArrQueueMonitor::class);
 
     expect($component->get('totalCount'))->toBe(4);
+});
+
+it('interpolates the rejected request title in the Simplified Chinese notification (issue #1725)', function () {
+    $previousLocale = app()->getLocale();
+    app()->setLocale('zh_CN');
+
+    try {
+        $body = __('":title" request has been rejected.', ['title' => 'Breaking Bad']);
+    } finally {
+        app()->setLocale($previousLocale);
+    }
+
+    expect($body)->toContain('Breaking Bad')
+        ->and($body)->not->toContain('：title');
 });
