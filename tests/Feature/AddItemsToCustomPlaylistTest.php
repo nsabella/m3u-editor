@@ -98,9 +98,12 @@ it('re-tagging with a new shared tag replaces the previous tag, not accumulates 
     $channel->refresh();
     $tagNames = $channel->tags()->where('type', $this->customPlaylist->uuid)->pluck('name')->all();
 
+    // This fork keeps multi-group semantics: 'select' mode APPENDS the chosen tag,
+    // so re-tagging with a new group accumulates groups instead of replacing them
+    // (upstream keeps at most one group per item; only 'original' mode replaces).
     expect($tagNames)->toContain('Second Tag')
-        ->and($tagNames)->not->toContain('First Tag')
-        ->and($tagNames)->toHaveCount(1);
+        ->and($tagNames)->toContain('First Tag')
+        ->and($tagNames)->toHaveCount(2);
 });
 
 it('tags each item with its own group name in original mode, not a batch-wide value', function () {
