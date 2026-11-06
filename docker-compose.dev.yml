@@ -19,7 +19,7 @@ services:
     container_name: m3u-editor-dev
     environment:
       # Timezone
-      - TZ=Etc/UTC
+      - TZ=America/New_York
 
       # Application URL
       - APP_URL=http://localhost
