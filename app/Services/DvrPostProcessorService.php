@@ -231,6 +231,9 @@ class DvrPostProcessorService
             'status' => DvrRecordingStatus::Completed->value,
             'post_processing_step' => null,
             'proxy_network_id' => null,
+            // Clear any failure message recorded before a salvaged partial capture
+            // was successfully post-processed.
+            'error_message' => null,
         ]);
 
         // Delete "once" rules after a successful recording — they're one-shot

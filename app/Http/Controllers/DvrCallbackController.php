@@ -129,18 +129,33 @@ class DvrCallbackController extends Controller
             return response()->json(['status' => 'ignored', 'reason' => 'already in terminal state']);
         }
 
+        // The proxy sends a primary failure callback (exit code) plus a supplementary
+        // detail event (error_type=input_error). Salvage must only run once.
+        if (in_array($recording->status, [DvrRecordingStatus::PostProcessing, DvrRecordingStatus::Failed])) {
+            return response()->json([
+                'status' => 'ignored',
+                'reason' => "failure already handled (status: {$recording->status->value})",
+            ]);
+        }
+
         $errorMessage = $data['error'] ?? 'Proxy broadcast failed';
 
-        $recording->update([
-            'status' => DvrRecordingStatus::Failed->value,
-            'actual_end' => now(),
-            'proxy_network_id' => null,
-            'error_message' => $errorMessage,
-        ]);
+        // Salvage partial capture: keep proxy_network_id and hand the recording to
+        // post-processing, whose Step 0 downloads whatever HLS segments the proxy
+        // captured before the failure (over HTTP) before the proxy's GC removes
+        // them. If nothing was captured, post-processing marks the recording failed
+        // with the download error and notifies the user.
+        DB::transaction(function () use ($recording, $errorMessage): void {
+            $recording->update([
+                'status' => DvrRecordingStatus::PostProcessing->value,
+                'actual_end' => now(),
+                'error_message' => $errorMessage,
+            ]);
 
-        $recording->notifyTv(__('Recording Failed'), 'danger');
+            PostProcessDvrRecording::dispatch($recording->id)->onQueue('dvr-post');
+        });
 
-        Log::error('DVR callback: broadcast failed', [
+        Log::error('DVR callback: broadcast failed — attempting to salvage partial capture via post-processing', [
             'recording_id' => $recording->id,
             'error' => $errorMessage,
         ]);
