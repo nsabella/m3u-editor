@@ -71,6 +71,11 @@ services:
 
       # Optional ClamAV signature cache for real plugin scan testing
       - clamavdata_dev:/var/lib/clamav
+
+      # DVR recordings library (survives container rebuilds — storage/ is not
+      # baked into the image, only this subtree holds user data). Bind mount
+      # so recordings are directly accessible from the Windows host.
+      - C:/Users/Server/dvr-library:/var/www/html/storage/app/private/dvr
     restart: unless-stopped
     ports:
       - "36450:36450"  # App (offset from production 36400)
