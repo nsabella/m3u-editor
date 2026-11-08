@@ -19,7 +19,7 @@ services:
     container_name: m3u-editor-dev
     environment:
       # Timezone
-      - TZ=Etc/UTC
+      - TZ=America/New_York
 
       # Application URL
       - APP_URL=http://localhost
@@ -71,6 +71,11 @@ services:
 
       # Optional ClamAV signature cache for real plugin scan testing
       - clamavdata_dev:/var/lib/clamav
+
+      # DVR recordings library (survives container rebuilds — storage/ is not
+      # baked into the image, only this subtree holds user data). Bind mount
+      # so recordings are directly accessible from the Windows host.
+      - dvrdata_dev:/var/www/html/storage/app/private/dvr
     restart: unless-stopped
     ports:
       - "36450:36450"  # App (offset from production 36400)
@@ -124,4 +129,9 @@ volumes:
   configdata_dev:
     driver: local
   clamavdata_dev:
+    driver: local
+  # DVR recordings on native VM filesystem — Windows bind mounts (9p) fail
+  # segment-write bursts with errno=12 (ENOMEM) under this VM's tight RAM
+  # budget; the volume's ext4 page cache is elastic.
+  dvrdata_dev:
     driver: local
