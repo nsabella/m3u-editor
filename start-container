@@ -151,6 +151,13 @@ export HLS_BROADCAST_DIR="${HLS_BROADCAST_DIR:-${HLS_TEMP_DIR}}"
 # Cleans orphaned .ts segments left behind during programme transitions
 export BROADCAST_GC_ENABLED="${BROADCAST_GC_ENABLED:-true}"
 
+# DVR capture resilience (m3u-proxy BroadcastManager). The restart window is how
+# long the proxy keeps restarting FFmpeg after the upstream feed drops before
+# giving up and reporting broadcast_failed. 60s (proxy default) is shorter than
+# observed provider outages (~4 min), losing otherwise-recordable airings.
+export DVR_RESTART_WINDOW_SECONDS="${DVR_RESTART_WINDOW_SECONDS:-300}"
+export DVR_STALL_TIMEOUT_SECONDS="${DVR_STALL_TIMEOUT_SECONDS:-30}"
+
 if [ "${M3U_PROXY_INTEGRATION_ENABLED}" = "true" ] && [ "${M3U_PROXY_ENABLED}" = "true" ]; then
     # Only output configure HLS storage for embedded proxy mode
     # For external proxy, HLS storage is handled by the proxy container
