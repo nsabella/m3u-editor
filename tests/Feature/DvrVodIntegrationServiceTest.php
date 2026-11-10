@@ -22,8 +22,10 @@ use App\Enums\DvrRecordingStatus;
 use App\Events\DvrRecordingStatusEvent;
 use App\Jobs\EnrichDvrMetadata;
 use App\Jobs\IntegrateDvrRecordingToVod;
+use App\Models\Category;
 use App\Models\Channel;
 use App\Models\CustomPlaylist;
+use App\Models\Group;
 use App\Models\DvrRecording;
 use App\Models\DvrRecordingRule;
 use App\Models\DvrSetting;
@@ -107,7 +109,7 @@ it('creates a VOD channel for a recording with TMDB movie metadata', function ()
 
     expect($channel)->not->toBeNull()
         ->and($channel->is_vod)->toBeTrue()
-        ->and($channel->name)->toBe('Inception')
+        ->and($channel->name)->toBe('DVR - Inception')
         ->and($channel->playlist_id)->toBe($recording->dvrSetting->playlist_id)
         ->and($channel->user_id)->toBe($recording->user_id)
         ->and($channel->container_extension)->toBe('ts')
@@ -163,7 +165,7 @@ it('creates a VOD channel when there is no TMDB metadata and no season is set', 
 
     expect($channel)->not->toBeNull()
         ->and($channel->is_vod)->toBeTrue()
-        ->and($channel->name)->toBe('Unknown Show — Jun 15, 2025')
+        ->and($channel->name)->toBe('DVR - Unknown Show — Jun 15, 2025')
         ->and($channel->info)->toBeArray()
         ->and($channel->info['plot'])->toBe('Recorded event description')
         ->and($channel->info['tmdb_id'])->toBeNull();
@@ -234,7 +236,7 @@ it('creates Series, Season, and Episode for a recording with TMDB tv metadata', 
 
     $series = Series::find($episode->series_id);
     expect($series)->not->toBeNull()
-        ->and($series->name)->toBe('Breaking Bad')
+        ->and($series->name)->toBe('DVR - Breaking Bad')
         ->and($series->tmdb_id)->toBe(1396)
         ->and($series->source_series_id)->toBeNull();
 });
@@ -321,7 +323,7 @@ it('uses tvmaze metadata as fallback for series name and cover when tmdb is abse
     $this->service->integrateRecording($recording);
 
     $series = Series::whereNull('source_series_id')
-        ->where('name', 'Some TV Show')
+        ->where('name', 'DVR - Some TV Show')
         ->first();
 
     expect($series)->not->toBeNull()
@@ -353,7 +355,7 @@ it('reuses the same Series and Season for two episodes of the same show', functi
     $this->service->integrateRecording($ep1);
     $this->service->integrateRecording($ep2);
 
-    expect(Series::where('name', 'Shared Show')->where('playlist_id', $playlist->id)->count())->toBe(1);
+    expect(Series::where('name', 'DVR - Shared Show')->where('playlist_id', $playlist->id)->count())->toBe(1);
     expect(Season::where('season_number', 1)->count())->toBe(1);
     expect(Episode::whereIn('dvr_recording_id', [$ep1->id, $ep2->id])->count())->toBe(2);
 });
@@ -502,7 +504,7 @@ it('uses scheduled_start as date fallback when programme_start is null', functio
 
     $channel = Channel::where('dvr_recording_id', $recording->id)->firstOrFail();
 
-    expect($channel->name)->toBe('Late Night Show — Nov 8, 2025');
+    expect($channel->name)->toBe('DVR - Late Night Show — Nov 8, 2025');
 });
 
 // ── Fix #3: date-based episode numbers when episode is null ───────────────────
@@ -606,7 +608,7 @@ it('reuses the same Series when a recording title differs only in case from an e
 
     // The TMDB backfill should have upgraded the name and set tmdb_id
     $series = Series::where('playlist_id', $playlist->id)->whereNull('source_series_id')->first();
-    expect($series->name)->toBe('Breaking Bad')
+    expect($series->name)->toBe('DVR - Breaking Bad')
         ->and($series->tmdb_id)->toBe(1396);
 });
 
@@ -831,7 +833,7 @@ it('upgrades a stripped-title series to the TVMaze canonical name when TVMaze da
     $this->service->integrateRecording($first);
 
     $seriesAfterFirst = Series::whereNull('source_series_id')->firstOrFail();
-    expect($seriesAfterFirst->name)->toBe('breaking bad')
+    expect($seriesAfterFirst->name)->toBe('DVR - breaking bad')
         ->and($seriesAfterFirst->tmdb_id)->toBeNull()
         ->and($seriesAfterFirst->metadata)->toBeNull();
 
@@ -859,7 +861,7 @@ it('upgrades a stripped-title series to the TVMaze canonical name when TVMaze da
     expect($allSeries)->toHaveCount(1);
 
     $series = $allSeries->first();
-    expect($series->name)->toBe('Breaking Bad')
+    expect($series->name)->toBe('DVR - Breaking Bad')
         ->and($series->cover)->toBe('https://tvmaze.test/bb-poster.jpg')
         ->and($series->plot)->toBe('A high school chemistry teacher.')
         ->and($series->release_date)->toBe('2008-01-20')
@@ -933,7 +935,7 @@ it('does not clobber a TMDB-derived series name with a later TVMaze name', funct
 
     $seriesAfterFirst = Series::whereNull('source_series_id')->firstOrFail();
     expect((string) $seriesAfterFirst->tmdb_id)->toBe('1396')
-        ->and($seriesAfterFirst->name)->toBe('Breaking Bad');
+        ->and($seriesAfterFirst->name)->toBe('DVR - Breaking Bad');
 
     // Second recording: only TVMaze enrichment, with a *different* name
     // (simulating a TVMaze locale mismatch).  Existing tmdb_id should keep
@@ -966,7 +968,7 @@ it('does not clobber a TMDB-derived series name with a later TVMaze name', funct
 
     expect(Series::whereNull('source_series_id')->count())->toBe(1);
     $series = Series::whereNull('source_series_id')->first();
-    expect($series->name)->toBe('Breaking Bad')
+    expect($series->name)->toBe('DVR - Breaking Bad')
         ->and((string) $series->tmdb_id)->toBe('1396');
 });
 
@@ -991,7 +993,7 @@ it('classifies recording with category="series" as TV when no S/E numbers', func
         ->and(Channel::where('dvr_recording_id', $recording->id)->exists())->toBeFalse();
 
     $series = Series::first();
-    expect($series->name)->toBe('The Late Show');
+    expect($series->name)->toBe('DVR - The Late Show');
 });
 
 it('classifies recording with category="movie" as movie even when subtitle present', function () {
@@ -1029,7 +1031,7 @@ it('classifies recording with non-movie category and subtitle as TV', function (
 
     expect(Series::count())->toBe(1);
     $series = Series::first();
-    expect($series->name)->toBe('Premier League');
+    expect($series->name)->toBe('DVR - Premier League');
 });
 
 it('classifies a bare film-genre category with a subtitle as a movie', function (string $category) {
@@ -1437,4 +1439,105 @@ it('completes handle() without error on the no-resolvable-playlist skip path —
     // both; only an uncaught throw would leave it set.
     $recording->refresh();
     expect($recording->post_processing_step)->toBeNull();
+});
+
+// ── DVR container placement + "DVR - " title prefix ─────────────────────────
+
+it('pins the DVR VOD group and series category to the top of their lists', function () {
+    $recording = makeCompletedRecording([
+        'title' => 'Inception',
+        'season' => null,
+        'episode' => null,
+        'metadata' => ['tmdb' => ['id' => 27205, 'type' => 'movie', 'name' => 'Inception']],
+    ]);
+
+    $this->service->integrateRecording($recording);
+
+    $group = Group::where('name_internal', 'DVR Recordings')->where('type', 'vod')->firstOrFail();
+    expect((float) $group->sort_order)->toBe(-1.0);
+
+    $seriesRecording = makeCompletedRecording([
+        'title' => 'Breaking Bad',
+        'season' => 1,
+        'episode' => 1,
+        'metadata' => ['tmdb' => ['id' => 1396, 'type' => 'tv', 'name' => 'Breaking Bad']],
+    ], $recording->dvrSetting);
+
+    $this->service->integrateRecording($seriesRecording);
+
+    $category = Category::where('name_internal', 'DVR Recordings')->firstOrFail();
+    expect((float) $category->sort_order)->toBe(-1.0);
+});
+
+it('does not double-prefix a movie channel title when integration re-runs', function () {
+    $recording = makeCompletedRecording([
+        'title' => 'Inception',
+        'season' => null,
+        'episode' => null,
+        'metadata' => ['tmdb' => ['id' => 27205, 'type' => 'movie', 'name' => 'Inception']],
+    ]);
+
+    $this->service->integrateRecording($recording);
+    $this->service->integrateRecording($recording);
+
+    $channel = Channel::where('dvr_recording_id', $recording->id)->firstOrFail();
+    expect($channel->name)->toBe('DVR - Inception')
+        ->and($channel->title)->toBe('DVR - Inception');
+});
+
+it('prefixes the series display name but not episode titles', function () {
+    $recording = makeCompletedRecording([
+        'title' => 'Breaking Bad',
+        'season' => 1,
+        'episode' => 2,
+        'subtitle' => 'Cat\'s in the Bag...',
+        'metadata' => ['tmdb' => ['id' => 1396, 'type' => 'tv', 'name' => 'Breaking Bad']],
+    ]);
+
+    $this->service->integrateRecording($recording);
+
+    $series = Series::whereNull('source_series_id')->firstOrFail();
+    expect($series->name)->toBe('DVR - Breaking Bad');
+
+    $episode = Episode::where('dvr_recording_id', $recording->id)->firstOrFail();
+    expect($episode->title)->toBe("S01E02 - Cat's in the Bag...");
+});
+
+it('keeps the DVR prefix and does not duplicate the series on a metadata upgrade', function () {
+    // First integration has no metadata (name = recording title fallback).
+    $recording = makeCompletedRecording([
+        'title' => 'Breaking Bad',
+        'season' => 1,
+        'episode' => 1,
+        'metadata' => null,
+    ]);
+
+    $this->service->integrateRecording($recording);
+
+    // Second integration arrives with TMDB metadata (name upgrade path).
+    $recording->metadata = ['tmdb' => ['id' => 1396, 'type' => 'tv', 'name' => 'Breaking Bad']];
+    $recording->save();
+
+    $this->service->integrateRecording($recording);
+
+    expect(Series::whereNull('source_series_id')->count())->toBe(1);
+
+    $series = Series::whereNull('source_series_id')->firstOrFail();
+    expect($series->name)->toBe('DVR - Breaking Bad')
+        ->and($series->tmdb_id)->toBe(1396);
+});
+
+it('gives DVR series a concrete sort value instead of null', function () {
+    $recording = makeCompletedRecording([
+        'title' => 'Breaking Bad',
+        'season' => 1,
+        'episode' => 1,
+        'metadata' => ['tmdb' => ['id' => 1396, 'type' => 'tv', 'name' => 'Breaking Bad']],
+    ]);
+
+    $this->service->integrateRecording($recording);
+
+    $series = Series::whereNull('source_series_id')->firstOrFail();
+    expect($series->sort)->not->toBeNull()
+        ->and((float) $series->sort)->toBe(0.0);
 });

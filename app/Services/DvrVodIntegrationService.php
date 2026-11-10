@@ -30,6 +30,12 @@ class DvrVodIntegrationService
 {
     private const DVR_CATEGORY_NAME = 'DVR Recordings';
 
+    // Prepended to DVR movie channel titles and series display names so
+    // recordings are visually grouped in clients. Applied at write time in
+    // this service (not at API emission) so it shows in the Filament UI too.
+    // Episode titles are NOT prefixed — they carry the SxxExx identifier.
+    private const DVR_TITLE_PREFIX = 'DVR - ';
+
     public function __construct(
         private readonly TmdbService $tmdbService,
     ) {}
@@ -162,7 +168,9 @@ class DvrVodIntegrationService
 
         // When no metadata is available use the clean title + recording date so
         // repeated recordings of the same show are individually identifiable.
-        $name = $tmdb['name'] ?? $tvmaze['name'] ?? ($cleanTitle.' — '.$this->formatRecordingDate($recording));
+        $name = $this->applyDvrPrefix(
+            $tmdb['name'] ?? $tvmaze['name'] ?? ($cleanTitle.' — '.$this->formatRecordingDate($recording))
+        );
 
         $sourceLogo = $this->resolveSourceChannelLogo($recording);
 
@@ -270,8 +278,6 @@ class DvrVodIntegrationService
             $episode->playlist_id = $playlistId;
             $episode->series_id = $series->id;
             $episode->season_id = $season->id;
-            $episode->season = $seasonNumber;
-            $episode->episode_num = $episodeNumber;
             $episode->container_extension = $containerExt;
             $episode->enabled = true;
             $episode->source_episode_id = null;
@@ -279,9 +285,12 @@ class DvrVodIntegrationService
             $episode->dvr_recording_id = $recording->id;
         }
 
-        // Always update title, URL, and info (URL may have been created with wrong base).
-        // Prefer episode-level art/plot from TMDB/TVMaze when available, falling back to
-        // show-level poster and the recording's own description.
+        // Always update number, title, URL, and info. The number moves here
+        // (out of the create block) so a re-labeled recording — e.g. after the
+        // enricher resolves the true episode — updates the existing row instead
+        // of leaving a stale episode_num beside a rebuilt SxxExx title.
+        $episode->season = $seasonNumber;
+        $episode->episode_num = $episodeNumber;
         $episode->title = $this->buildEpisodeTitle($recording);
         $episode->url = $streamUrl;
         $episode->info = [
@@ -456,6 +465,7 @@ class DvrVodIntegrationService
                 'enabled' => true,
                 'custom' => true,
                 'import_batch_no' => 'dvr',
+                'sort_order' => -1,
             ]
         );
     }
@@ -474,8 +484,21 @@ class DvrVodIntegrationService
                 'name' => self::DVR_CATEGORY_NAME,
                 'user_id' => $userId,
                 'enabled' => true,
+                'sort_order' => -1,
             ]
         );
+    }
+
+    /**
+     * Prepend the "DVR - " prefix to a display name, idempotently.
+     */
+    private function applyDvrPrefix(string $name): string
+    {
+        if (str_starts_with($name, self::DVR_TITLE_PREFIX)) {
+            return $name;
+        }
+
+        return self::DVR_TITLE_PREFIX.$name;
     }
 
     /**
@@ -493,6 +516,11 @@ class DvrVodIntegrationService
             'enabled' => true,
             'source_series_id' => null,
             'import_batch_no' => 'dvr',
+            // Concrete sort value is required: the unfiltered get_series listing
+            // keyset-paginates on (sort, id), and NULL-sort rows are silently
+            // dropped by Postgres row-comparison cursor predicates. 0 also pins
+            // DVR series to the top of the listing.
+            'sort' => 0,
         ];
 
         if ($tmdb) {
@@ -545,15 +573,22 @@ class DvrVodIntegrationService
         }
 
         if (! $series) {
+            // Display names are stored with the "DVR - " prefix (see
+            // applyDvrPrefix), so the name fallback matches both the bare and
+            // prefixed forms — otherwise the second recording of a show would
+            // miss the first one's row and create a duplicate series.
             $series = Series::where('playlist_id', $playlistId)
                 ->whereNull('source_series_id')
-                ->whereRaw('LOWER(TRIM(name)) = ?', [$normalizedName])
+                ->whereRaw('LOWER(TRIM(name)) = ? OR LOWER(TRIM(name)) = ?', [
+                    $normalizedName,
+                    mb_strtolower(trim($this->applyDvrPrefix($name))),
+                ])
                 ->first();
         }
 
         if (! $series) {
             $series = Series::create(array_merge(
-                ['playlist_id' => $playlistId, 'source_series_id' => null, 'name' => $name],
+                ['playlist_id' => $playlistId, 'source_series_id' => null, 'name' => $this->applyDvrPrefix($name)],
                 $defaults
             ));
         }
@@ -566,7 +601,7 @@ class DvrVodIntegrationService
                 $series->release_date = $tmdb['first_air_date'] ?? $tmdb['release_date'] ?? $series->release_date;
                 $series->metadata = $tmdb;
                 // Upgrade the display name to the canonical TMDB name
-                $series->name = $name;
+                $series->name = $this->applyDvrPrefix($name);
 
                 if (! empty($tmdb['id'])) {
                     $series->tmdb_id = $tmdb['id'];
@@ -598,7 +633,7 @@ class DvrVodIntegrationService
                 // TVMaze's name — if they differ and the row has no tmdb_id,
                 // we presume the existing name is the un-enriched fallback.
                 if (! empty($tvmaze['name']) && $series->name !== $tvmaze['name']) {
-                    $series->name = $tvmaze['name'];
+                    $series->name = $this->applyDvrPrefix($tvmaze['name']);
                     $changed = true;
                 }
 

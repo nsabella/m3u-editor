@@ -64,6 +64,19 @@ class DvrMetadataEnricherService
 
     private const CACHE_MISS_TTL_SECONDS = 3600; // 1 hour — confirmed misses (no match found)
 
+    // ── Description/overview similarity thresholds (pass 2.5) ─────────────────
+    // Minimum description-coverage score to accept a TMDB episode as the
+    // recording's source episode. Calibrated against real EPG data: multi-
+    // segment EPG descriptions dilute coverage (a 3-segment block describing
+    // its exact episode scores ~0.33), while unrelated episodes score ~0.1.
+    private const DESC_SIM_ACCEPT = 0.30;
+
+    // The top scorer must beat the runner-up by at least this much (ambiguity guard).
+    private const DESC_SIM_MARGIN = 0.05;
+
+    // Descriptions with fewer content tokens than this carry too little signal.
+    private const DESC_SIM_MIN_TOKENS = 5;
+
     public function __construct(private readonly GeneralSettings $generalSettings) {}
 
     /**
@@ -772,12 +785,18 @@ class DvrMetadataEnricherService
 
     /**
      * Last-resort numeric resolver for TV recordings whose EPG omits episode-num
-     * entirely. Walks TMDB seasons looking for an episode whose air_date matches
-     * the recording's programme_start (date component, in app timezone).
+     * entirely. Fetches the show's TMDB episodes once, then resolves
+     * season/episode in two stages:
      *
-     * Only accepts a result if exactly one episode across all seasons matches —
-     * zero matches or ambiguous matches fall through to MMDD synthesis at
-     * integration time.
+     *   1. Air-date match (programme_start date vs episode air_date), accepted
+     *      only when corroborated by description/overview similarity — a bare
+     *      date match can point at a completely different episode that merely
+     *      premiered that day (rerun-heavy channels air old episodes).
+     *   2. Full description/overview similarity scan across every TMDB episode,
+     *      which resolves reruns by what the recording is actually about.
+     *
+     * Ambiguity or weak signal at either stage falls through to MMDD synthesis
+     * at integration time — mislabeling is worse than a date-based number.
      *
      * Caching: show details and individual season lists are cached with the
      * standard positive/negative TTLs, so subsequent recordings of the same
@@ -797,8 +816,6 @@ class DvrMetadataEnricherService
             return;
         }
 
-        $airDate = Carbon::parse($recording->programme_start)->toDateString();
-
         try {
             $seasonNumbers = $this->fetchTmdbShowSeasonNumbers((int) $tmdbId, $tmdbKey);
         } catch (\Throwable $e) {
@@ -811,7 +828,7 @@ class DvrMetadataEnricherService
             return;
         }
 
-        $matches = [];
+        $episodesBySeason = [];
 
         foreach ($seasonNumbers as $seasonNumber) {
             try {
@@ -822,41 +839,219 @@ class DvrMetadataEnricherService
                 continue;
             }
 
-            if (! is_array($episodes)) {
-                continue;
+            if (is_array($episodes)) {
+                $episodesBySeason[$seasonNumber] = $episodes;
             }
+        }
 
+        $resolved = $this->resolveViaAirDate($recording, $episodesBySeason)
+            ?? $this->resolveViaDescriptionSimilarity($recording, $episodesBySeason);
+
+        if ($resolved === null) {
+            Log::debug("DVR metadata: no confident season/episode match for recording {$recording->id} — falling through to MMDD", [
+                'recording_id' => $recording->id,
+                'tmdb_id' => $tmdbId,
+                'programme_start' => $recording->programme_start->toDateString(),
+            ]);
+
+            return;
+        }
+
+        $updates = [
+            'season' => $resolved['season'],
+            'episode' => $resolved['episode'],
+        ];
+
+        // Promote the episode name to subtitle so integration titles read
+        // "S05E02 - Spy Buddies" (mirrors backfillFromDescription's promotion).
+        if (empty($recording->subtitle) && ! empty($resolved['name'])) {
+            $updates['subtitle'] = $resolved['name'];
+        }
+
+        $recording->update($updates);
+
+        Log::info("DVR metadata: resolved season/episode for recording {$recording->id}", [
+            'recording_id' => $recording->id,
+            'tmdb_id' => $tmdbId,
+            'method' => $resolved['method'],
+            'score' => $resolved['score'],
+            'season' => $resolved['season'],
+            'episode' => $resolved['episode'],
+        ]);
+    }
+
+    /**
+     * Stage 1 — air-date matching, corroborated by description similarity.
+     *
+     * A single date match is only accepted when its overview actually
+     * resembles the recording's description (a bare date match can point at
+     * an unrelated premiere — the recording may be a rerun). Multiple date
+     * matches are disambiguated by similarity; a tie falls through.
+     *
+     * @param  array<int, array<int, array<string, mixed>>>  $episodesBySeason
+     * @return array{season: int, episode: int, name: ?string, score: float, method: string}|null
+     */
+    private function resolveViaAirDate(DvrRecording $recording, array $episodesBySeason): ?array
+    {
+        $airDate = Carbon::parse($recording->programme_start)->toDateString();
+
+        $matches = [];
+
+        foreach ($episodesBySeason as $seasonNumber => $episodes) {
             foreach ($episodes as $ep) {
                 if (($ep['air_date'] ?? null) === $airDate) {
                     $matches[] = [
-                        'season' => $seasonNumber,
+                        'season' => (int) $seasonNumber,
                         'episode' => (int) $ep['episode_number'],
+                        'name' => $ep['name'] ?? null,
+                        'overview' => $ep['overview'] ?? null,
                     ];
                 }
             }
         }
 
-        if (count($matches) !== 1) {
-            if (count($matches) > 1) {
-                Log::debug("DVR metadata: air-date matched multiple episodes for recording {$recording->id} — falling through to MMDD", [
-                    'tmdb_id' => $tmdbId,
-                    'air_date' => $airDate,
-                    'match_count' => count($matches),
-                ]);
-            }
-
-            return;
+        if (empty($matches)) {
+            return null;
         }
 
-        $recording->update($matches[0]);
+        if (count($matches) === 1) {
+            $score = $this->descriptionCoverage($recording->description, $matches[0]['overview']);
 
-        Log::info("DVR metadata: resolved season/episode via air-date match for recording {$recording->id}", [
-            'recording_id' => $recording->id,
-            'tmdb_id' => $tmdbId,
-            'air_date' => $airDate,
-            'season' => $matches[0]['season'],
-            'episode' => $matches[0]['episode'],
-        ]);
+            if ($score !== null && $score >= self::DESC_SIM_ACCEPT) {
+                return $matches[0] + ['score' => $score, 'method' => 'air_date'];
+            }
+
+            return null;
+        }
+
+        return $this->pickDistinctTopScorer($recording->description, $matches, 'air_date');
+    }
+
+    /**
+     * Stage 2 — full description/overview similarity scan across every TMDB
+     * episode of the show, ignoring air dates. This is what resolves reruns.
+     *
+     * @param  array<int, array<int, array<string, mixed>>>  $episodesBySeason
+     * @return array{season: int, episode: int, name: ?string, score: float, method: string}|null
+     */
+    private function resolveViaDescriptionSimilarity(DvrRecording $recording, array $episodesBySeason): ?array
+    {
+        $best = null;
+        $secondBest = null;
+
+        foreach ($episodesBySeason as $seasonNumber => $episodes) {
+            foreach ($episodes as $ep) {
+                $score = $this->descriptionCoverage($recording->description, $ep['overview'] ?? null);
+
+                if ($score === null) {
+                    continue;
+                }
+
+                if ($best === null || $score > $best['score']) {
+                    $secondBest = $best;
+                    $best = [
+                        'season' => (int) $seasonNumber,
+                        'episode' => (int) $ep['episode_number'],
+                        'name' => $ep['name'] ?? null,
+                        'score' => $score,
+                    ];
+                } elseif ($secondBest === null || $score > $secondBest['score']) {
+                    $secondBest = ['score' => $score];
+                }
+            }
+        }
+
+        if ($best === null || $best['score'] < self::DESC_SIM_ACCEPT) {
+            return null;
+        }
+
+        if ($secondBest !== null && ($best['score'] - $secondBest['score']) < self::DESC_SIM_MARGIN) {
+            return null;
+        }
+
+        return $best + ['method' => 'description_similarity'];
+    }
+
+    /**
+     * Score an array of episode candidates by description/overview similarity
+     * and return the top one — but only if it clears the acceptance threshold
+     * and beats the runner-up by the margin.
+     *
+     * @param  array<int, array<string, mixed>>  $candidates
+     * @return array{season: int, episode: int, name: ?string, score: float, method: string}|null
+     */
+    private function pickDistinctTopScorer(?string $description, array $candidates, string $method): ?array
+    {
+        $scored = [];
+
+        foreach ($candidates as $candidate) {
+            $score = $this->descriptionCoverage($description, $candidate['overview'] ?? null);
+
+            if ($score !== null) {
+                $scored[] = ['candidate' => $candidate, 'score' => $score];
+            }
+        }
+
+        if (empty($scored)) {
+            return null;
+        }
+
+        usort($scored, fn ($a, $b) => $b['score'] <=> $a['score']);
+
+        if ($scored[0]['score'] < self::DESC_SIM_ACCEPT) {
+            return null;
+        }
+
+        if (count($scored) > 1 && ($scored[0]['score'] - $scored[1]['score']) < self::DESC_SIM_MARGIN) {
+            return null;
+        }
+
+        return $scored[0]['candidate'] + ['score' => $scored[0]['score'], 'method' => $method];
+    }
+
+    /**
+     * Fraction of the description's content tokens that also appear in the
+     * TMDB overview (coverage, not Jaccard — EPG descriptions typically carry
+     * extra synopsis material absent from the shorter overview).
+     *
+     * Returns null when either side carries too little signal to score:
+     * the description has fewer than DESC_SIM_MIN_TOKENS content tokens, or
+     * the overview is empty.
+     */
+    private function descriptionCoverage(?string $description, ?string $overview): ?float
+    {
+        $descriptionTokens = $this->contentTokens($description);
+
+        if (count($descriptionTokens) < self::DESC_SIM_MIN_TOKENS) {
+            return null;
+        }
+
+        $overviewTokens = $this->contentTokens($overview);
+
+        if (empty($overviewTokens)) {
+            return null;
+        }
+
+        return count(array_intersect($descriptionTokens, $overviewTokens)) / count($descriptionTokens);
+    }
+
+    /**
+     * Lowercase, strip punctuation, split on whitespace, drop tokens shorter
+     * than 4 characters, and dedupe.
+     *
+     * @return string[]
+     */
+    private function contentTokens(?string $text): array
+    {
+        $normalized = mb_strtolower((string) $text);
+        $normalized = preg_replace("/[^a-z0-9\s]/u", ' ', $normalized) ?? '';
+
+        $tokens = preg_split('/\s+/', $normalized, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+
+        return array_values(array_unique(array_filter(
+            $tokens,
+            fn (string $token): bool => mb_strlen($token) >= 4,
+        )));
     }
 
     /**

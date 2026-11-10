@@ -728,7 +728,7 @@ it('resolves season/episode via TMDB air-date when EPG omits episode_num', funct
                 ],
                 [
                     'episode_number' => 6, 'name' => 'Landfall',
-                    'air_date' => '2014-07-06', 'overview' => 'Tensions rise.',
+                    'air_date' => '2014-07-06', 'overview' => 'Cameron and Gordon clash after a breakthrough.',
                 ],
             ],
         ]),
@@ -820,4 +820,186 @@ it('does not run air-date resolution when season is already set', function () {
     // Season/episode unchanged — air-date pass was skipped.
     expect($recording->season)->toBe(1)
         ->and($recording->episode)->toBe(3);
+});
+
+it('rejects an air-date match when the description does not match the matched overview', function () {
+    $tmdbShowId = 200;
+
+    Http::fake([
+        '*/search/tv*' => Http::response([
+            'results' => [['id' => $tmdbShowId, 'name' => 'Date Trap', 'popularity' => 10]],
+        ]),
+        '*/search/movie*' => Http::response(['results' => []]),
+        "*/tv/{$tmdbShowId}?*" => Http::response([
+            'seasons' => [
+                ['season_number' => 1, 'episode_count' => 10],
+            ],
+        ]),
+        "*/tv/{$tmdbShowId}/season/1?*" => Http::response([
+            'episodes' => [
+                [
+                    'episode_number' => 4, 'name' => 'Galaxy Walk',
+                    'air_date' => '2025-06-01', 'overview' => 'The crew explores a distant galaxy.',
+                ],
+            ],
+        ]),
+    ]);
+
+    // The only episode airing on 2025-06-01 has an overview about a galaxy —
+    // the description is about something else entirely, so the bare date
+    // match must be rejected rather than trusted.
+    $recording = makeEnricherRecording([
+        'title' => 'Date Trap',
+        'season' => null,
+        'episode' => null,
+        'programme_start' => Carbon::parse('2025-06-01 20:00:00'),
+        'description' => 'Mr. Krabs sends SpongeBob and Patrick to spy on Plankton tonight.',
+    ]);
+
+    $this->enricher->enrich($recording);
+    $recording->refresh();
+
+    expect($recording->season)->toBeNull()
+        ->and($recording->episode)->toBeNull();
+});
+
+it('resolves a rerun episode via description-overview similarity ignoring the air date', function () {
+    $tmdbShowId = 387;
+
+    Http::fake([
+        '*/search/tv*' => Http::response([
+            'results' => [['id' => $tmdbShowId, 'name' => 'SpongeBob SquarePants', 'popularity' => 50]],
+        ]),
+        '*/search/movie*' => Http::response(['results' => []]),
+        "*/tv/{$tmdbShowId}?*" => Http::response([
+            'seasons' => [
+                ['season_number' => 5, 'episode_count' => 25],
+                ['season_number' => 17, 'episode_count' => 25],
+            ],
+        ]),
+        "*/tv/{$tmdbShowId}/season/5?*" => Http::response([
+            'episodes' => [
+                [
+                    'episode_number' => 2, 'name' => 'Spy Buddies',
+                    'air_date' => '2007-07-23',
+                    'overview' => 'Mr. Krabs enlists SpongeBob and Patrick to spy on Plankton.',
+                ],
+            ],
+        ]),
+        "*/tv/{$tmdbShowId}/season/17?*" => Http::response([
+            'episodes' => [
+                [
+                    'episode_number' => 21, 'name' => 'Backyard Bickering',
+                    'air_date' => '2026-11-06', 'overview' => "Sandy's brother starts a backyard wrestling ring.",
+                ],
+                [
+                    'episode_number' => 22, 'name' => 'A Hair Grows on Patrick',
+                    'air_date' => '2026-11-06', 'overview' => 'A hair sprouts on his head.',
+                ],
+            ],
+        ]),
+    ]);
+
+    // A rerun of the S5E2 episode airing the same day two S17 episodes premiere.
+    // Date matching alone would pick one of the S17 premieres — description
+    // similarity must resolve the true episode instead.
+    $recording = makeEnricherRecording([
+        'title' => 'SpongeBob SquarePants',
+        'season' => null,
+        'episode' => null,
+        'subtitle' => null,
+        'programme_start' => Carbon::parse('2026-11-06 10:46:00'),
+        'description' => 'Mr. Krabs sends SpongeBob and Patrick to spy on Plankton.',
+    ]);
+
+    $this->enricher->enrich($recording);
+    $recording->refresh();
+
+    expect($recording->season)->toBe(5)
+        ->and($recording->episode)->toBe(2)
+        ->and($recording->subtitle)->toBe('Spy Buddies');
+});
+
+it('resolves via description similarity when multiple air-date matches exist and only one overview matches', function () {
+    $tmdbShowId = 300;
+
+    Http::fake([
+        '*/search/tv*' => Http::response([
+            'results' => [['id' => $tmdbShowId, 'name' => 'Split Show', 'popularity' => 10]],
+        ]),
+        '*/search/movie*' => Http::response(['results' => []]),
+        "*/tv/{$tmdbShowId}?*" => Http::response([
+            'seasons' => [
+                ['season_number' => 1, 'episode_count' => 10],
+            ],
+        ]),
+        "*/tv/{$tmdbShowId}/season/1?*" => Http::response([
+            'episodes' => [
+                [
+                    'episode_number' => 5, 'name' => 'Heist Night',
+                    'air_date' => '2025-06-01', 'overview' => 'The gang plans a daring bank heist at midnight.',
+                ],
+                [
+                    'episode_number' => 6, 'name' => 'Beach Day',
+                    'air_date' => '2025-06-01', 'overview' => 'Everyone relaxes at the beach.',
+                ],
+            ],
+        ]),
+    ]);
+
+    $recording = makeEnricherRecording([
+        'title' => 'Split Show',
+        'season' => null,
+        'episode' => null,
+        'subtitle' => null,
+        'programme_start' => Carbon::parse('2025-06-01 20:00:00'),
+        'description' => 'The gang pulls off a daring bank heist at midnight tonight.',
+    ]);
+
+    $this->enricher->enrich($recording);
+    $recording->refresh();
+
+    expect($recording->season)->toBe(1)
+        ->and($recording->episode)->toBe(5)
+        ->and($recording->subtitle)->toBe('Heist Night');
+});
+
+it('does not resolve via description when the description is too short', function () {
+    $tmdbShowId = 400;
+
+    Http::fake([
+        '*/search/tv*' => Http::response([
+            'results' => [['id' => $tmdbShowId, 'name' => 'Short Desc Show', 'popularity' => 10]],
+        ]),
+        '*/search/movie*' => Http::response(['results' => []]),
+        "*/tv/{$tmdbShowId}?*" => Http::response([
+            'seasons' => [
+                ['season_number' => 1, 'episode_count' => 10],
+            ],
+        ]),
+        "*/tv/{$tmdbShowId}/season/1?*" => Http::response([
+            'episodes' => [
+                [
+                    'episode_number' => 1, 'name' => 'Pilot',
+                    'air_date' => '2020-01-01', 'overview' => 'A very long and detailed overview about many things.',
+                ],
+            ],
+        ]),
+    ]);
+
+    // Fewer than 5 content tokens — too little signal to score; must fall
+    // through to MMDD rather than trust a weak match.
+    $recording = makeEnricherRecording([
+        'title' => 'Short Desc Show',
+        'season' => null,
+        'episode' => null,
+        'programme_start' => Carbon::parse('2020-01-01 20:00:00'),
+        'description' => 'Watch it.',
+    ]);
+
+    $this->enricher->enrich($recording);
+    $recording->refresh();
+
+    expect($recording->season)->toBeNull()
+        ->and($recording->episode)->toBeNull();
 });
