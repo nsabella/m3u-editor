@@ -1541,3 +1541,33 @@ it('gives DVR series a concrete sort value instead of null', function () {
     expect($series->sort)->not->toBeNull()
         ->and((float) $series->sort)->toBe(0.0);
 });
+
+it('re-parents the episode to the correct season on re-label and prunes the emptied season', function () {
+    $recording = makeCompletedRecording([
+        'title' => 'Breaking Bad',
+        'season' => 1,
+        'episode' => 1,
+        'metadata' => ['tmdb' => ['id' => 1396, 'type' => 'tv', 'name' => 'Breaking Bad']],
+    ]);
+
+    $this->service->integrateRecording($recording);
+
+    $episode = Episode::where('dvr_recording_id', $recording->id)->firstOrFail();
+    expect($episode->season)->toBe(1);
+    $seasonOneId = $episode->season_id;
+
+    // Simulate a relabel (e.g. enricher resolves the true season later).
+    $recording->update(['season' => 5]);
+
+    $this->service->integrateRecording($recording);
+
+    $episode->refresh();
+    expect($episode->season)->toBe(5)
+        ->and($episode->episode_num)->toBe(1);
+
+    $seasonFive = Season::where('series_id', $episode->series_id)->where('season_number', 5)->firstOrFail();
+    expect($episode->season_id)->toBe($seasonFive->id)
+        ->and($seasonFive->episode_count)->toBe(1)
+        // The now-empty Season 1 row is pruned so clients don't show a ghost season.
+        ->and(Season::find($seasonOneId))->toBeNull();
+});

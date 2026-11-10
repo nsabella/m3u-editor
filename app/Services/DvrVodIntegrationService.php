@@ -276,8 +276,6 @@ class DvrVodIntegrationService
             $episode = new Episode;
             $episode->user_id = $userId;
             $episode->playlist_id = $playlistId;
-            $episode->series_id = $series->id;
-            $episode->season_id = $season->id;
             $episode->container_extension = $containerExt;
             $episode->enabled = true;
             $episode->source_episode_id = null;
@@ -285,10 +283,13 @@ class DvrVodIntegrationService
             $episode->dvr_recording_id = $recording->id;
         }
 
-        // Always update number, title, URL, and info. The number moves here
-        // (out of the create block) so a re-labeled recording — e.g. after the
-        // enricher resolves the true episode — updates the existing row instead
-        // of leaving a stale episode_num beside a rebuilt SxxExx title.
+        // Always update series/season links, number, title, URL, and info.
+        // These move here (out of the create block) so a re-labeled recording —
+        // e.g. after the enricher resolves the true episode — re-parents the
+        // episode to the correct Season row instead of leaving it nested under
+        // the default Season 1 (clients group episodes by season_id).
+        $episode->series_id = $series->id;
+        $episode->season_id = $season->id;
         $episode->season = $seasonNumber;
         $episode->episode_num = $episodeNumber;
         $episode->title = $this->buildEpisodeTitle($recording);
@@ -310,6 +311,17 @@ class DvrVodIntegrationService
         // Keep episode_count accurate so players show the season correctly.
         $season->episode_count = $season->episodes()->count();
         $season->save();
+
+        // A re-labeled recording can re-parent its episode to a different
+        // season, leaving the old one empty — clients still display an empty
+        // season, so prune DVR-created seasons of this series that no longer
+        // hold any episode.
+        Season::where('series_id', $series->id)
+            ->where('import_batch_no', 'dvr')
+            ->where('id', '!=', $season->id)
+            ->whereDoesntHave('episodes')
+            ->get()
+            ->each(fn (Season $orphan) => $orphan->delete());
 
         Log::info('DvrVodIntegration: '.($isNew ? 'created' : 'updated')." episode {$episode->id} for recording {$recording->id}", [
             'series' => $seriesName,
