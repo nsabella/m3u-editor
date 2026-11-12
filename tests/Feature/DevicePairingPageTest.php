@@ -36,7 +36,7 @@ it('approves a pending code and assigns the chosen credential', function () {
     Livewire::test(PairDevice::class)
         ->fillForm([
             'user_code' => $deviceAuth->user_code,
-            'playlist_auth_id' => $playlistAuth->id,
+            'playlist_auth_ids' => [$playlistAuth->id],
         ], 'content')
         ->call('approve');
 
@@ -58,7 +58,7 @@ it('approves a code typed lowercase and without the dash', function () {
     Livewire::test(PairDevice::class)
         ->fillForm([
             'user_code' => 'xkqp9f3t',
-            'playlist_auth_id' => $playlistAuth->id,
+            'playlist_auth_ids' => [$playlistAuth->id],
         ], 'content')
         ->call('approve');
 
@@ -79,7 +79,7 @@ it('approves a code typed with extra whitespace around the dash', function () {
     Livewire::test(PairDevice::class)
         ->fillForm([
             'user_code' => ' xkqp 9f3t ',
-            'playlist_auth_id' => $playlistAuth->id,
+            'playlist_auth_ids' => [$playlistAuth->id],
         ], 'content')
         ->call('approve');
 
@@ -99,7 +99,7 @@ it('shows a generic error for an unknown or expired code', function () {
     Livewire::test(PairDevice::class)
         ->fillForm([
             'user_code' => 'ZZZZ-ZZZZ',
-            'playlist_auth_id' => $playlistAuth->id,
+            'playlist_auth_ids' => [$playlistAuth->id],
         ], 'content')
         ->call('approve')
         ->assertNotified();
@@ -169,17 +169,59 @@ it('keeps the pairing page available when only push relay is disabled', function
         ->and(DevicesCluster::canAccess())->toBeTrue();
 });
 
-it('denies cluster access and hides the nav item when both push relay and device pairing are disabled', function () {
+it('denies cluster access and hides the nav item when push relay, device pairing and enhanced output are all disabled', function () {
     $this->actingAs(User::factory()->admin()->create());
 
+    // Enhanced output on would keep the cluster up for Settings Profiles.
     $settings = Mockery::mock(GeneralSettings::class);
     $settings->push_relay_enabled = false;
     $settings->device_pairing_enabled = false;
-    $settings->app_output_enabled = true;
+    $settings->app_output_enabled = false;
     app()->instance(GeneralSettings::class, $settings);
 
     expect(DevicesCluster::canAccess())->toBeFalse()
         ->and(DevicesCluster::shouldRegisterNavigation())->toBeFalse()
         ->and(TvDeviceResource::canAccess())->toBeFalse()
         ->and(PairDevice::canAccess())->toBeFalse();
+});
+
+it('approves several credentials in the chosen order, first as primary', function () {
+    $admin = User::factory()->admin()->create();
+    $this->actingAs($admin);
+
+    $living = PlaylistAuth::factory()->for($admin)->create();
+    $kids = PlaylistAuth::factory()->for($admin)->create();
+    $sports = PlaylistAuth::factory()->for($admin)->create();
+    $deviceAuth = DeviceAuthorization::factory()->create();
+
+    Livewire::test(PairDevice::class)
+        ->fillForm([
+            'user_code' => $deviceAuth->user_code,
+            'playlist_auth_ids' => [$kids->id, $living->id, $sports->id],
+        ], 'content')
+        ->call('approve');
+
+    $deviceAuth->refresh();
+    expect($deviceAuth->status)->toBe('approved')
+        ->and($deviceAuth->playlist_auth_id)->toBe($kids->id)
+        ->and($deviceAuth->playlist_auth_ids)->toBe([$kids->id, $living->id, $sports->id]);
+});
+
+it('refuses a pairing that includes another user\'s credential', function () {
+    $admin = User::factory()->admin()->create();
+    $this->actingAs($admin);
+
+    $own = PlaylistAuth::factory()->for($admin)->create();
+    $other = PlaylistAuth::factory()->for(User::factory()->create())->create();
+    $deviceAuth = DeviceAuthorization::factory()->create();
+
+    Livewire::test(PairDevice::class)
+        ->fillForm([
+            'user_code' => $deviceAuth->user_code,
+            'playlist_auth_ids' => [$own->id, $other->id],
+        ], 'content')
+        ->call('approve')
+        ->assertNotified();
+
+    expect($deviceAuth->refresh()->status)->toBe('pending');
 });
