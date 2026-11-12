@@ -52,13 +52,28 @@ $ids = array_map('intval', explode(',', trim($idsArg, '"')));
 
 $http = Http::timeout(45)->withOptions(['allow_redirects' => true]);
 $fetch = function (string $url) use ($http): string {
-    try {
-        $res = $http->get($url);
-    } catch (Throwable) {
-        return '';
+    // Provider throttles bursts (even single non-throttled runs got blanked
+    // moments after a batch) — retry once after a pause, 3 attempts total.
+    $lastStatus = 0;
+    for ($attempt = 1; $attempt <= 3; $attempt++) {
+        try {
+            $res = $http->get($url);
+            $lastStatus = $res->status();
+            if ($res->successful() && $res->body() !== '') {
+                return $res->body();
+            }
+        } catch (Throwable) {
+            $lastStatus = 0;
+        }
+        if ($lastStatus >= 400 && $lastStatus < 500) {
+            break; // 4xx is definitive — retrying just burns session quota
+        }
+        if ($attempt < 3) {
+            usleep(5000000); // 5s backoff before retry
+        }
     }
 
-    return $res->successful() ? $res->body() : '';
+    return "HTTP_".$lastStatus;
 };
 $parse = function (string $body): array {
     $seq = preg_match('~#EXT-X-MEDIA-SEQUENCE:(\d+)~', $body, $m) ? (int) $m[1] : null;
@@ -110,12 +125,12 @@ foreach ($ids as $id) {
         continue;
     }
     $url = $ch->url_custom ?: $ch->url;
-    if (! $url || ! preg_match('~/live/([^/]+)/([^/]+)/(\d+)(?:\.(m3u8))?~', $url, $m)) {
+    if (! $url || ! preg_match('~/live/([^/]+)/([^/]+)/(\d+)(\.[a-z0-9]+)?~', $url, $m)) {
         printf("NO-XTREAM-URL  [%s] #%d %s\n", $ch->name, $id, (string) $url);
         continue;
     }
     $base = parse_url($url, PHP_URL_SCHEME).'://'.parse_url($url, PHP_URL_HOST);
-    $ext = $m[4] ?? '.m3u8';
+    $ext = $m[4] ?? ''; // group includes the dot (".m3u8"); bare-id URLs get none
 
     // Live-edge reference.
     [$liveBody] = $resolveVariant($url, $fetch($url));
@@ -129,8 +144,16 @@ foreach ($ids as $id) {
     foreach (['local' => date('Y-m-d:H-i', $hourAgo), 'UTC' => gmdate('Y-m-d:H-i', $hourAgo)] as $tz => $stamp) {
         $tsUrl = "{$base}/timeshift/{$m[1]}/{$m[2]}/60/{$stamp}/{$m[3]}{$ext}";
         $body = $fetch($tsUrl);
+        if ($body === 'HTTP_0') {
+            $detail .= " ts/{$tz}:network-err";
+            continue;
+        }
+        if (str_starts_with($body, 'HTTP_')) {
+            $detail .= " ts/{$tz}:".substr($body, 5);
+            continue;
+        }
         if ($body === '') {
-            $detail .= " ts/{$tz}:empty";
+            $detail .= " ts/{$tz}:empty-200";
             continue;
         }
         [$vBody, $vUrl] = $resolveVariant($tsUrl, $body);
@@ -169,7 +192,7 @@ foreach ($ids as $id) {
         echo "  frames: /tmp/catchup-frames/{$id}-catchup.jpg + {$id}-live.jpg\n";
     }
 
-    usleep(700000);
+    usleep(2000000); // 2s pacing between channels (provider throttles bursts)
 }
 
 echo "DONE\n";
