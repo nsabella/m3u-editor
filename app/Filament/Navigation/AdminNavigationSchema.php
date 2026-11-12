@@ -43,10 +43,13 @@ use App\Filament\Resources\Series\SeriesResource;
 use App\Filament\Resources\SeriesDynamicGroups\SeriesDynamicGroupResource;
 use App\Filament\Resources\StreamFileSettings\StreamFileSettingResource;
 use App\Filament\Resources\StreamProfiles\StreamProfileResource;
+use App\Filament\Resources\StreamWatchSessions\StreamWatchSessionResource;
+use App\Filament\Resources\TvClientProfiles\TvClientProfileResource;
 use App\Filament\Resources\Users\UserResource;
 use App\Filament\Resources\VodDynamicGroups\VodDynamicGroupResource;
 use App\Filament\Resources\VodGroups\VodGroupResource;
 use App\Filament\Resources\Vods\VodResource;
+use App\Filament\Resources\WatchHistoryIntegrations\WatchHistoryIntegrationResource;
 use Filament\Navigation\NavigationItem;
 
 /**
@@ -95,7 +98,9 @@ final class AdminNavigationSchema
                         'resolve' => fn () => UserResource::getNavigationItems(),
                     ],
                     'devices' => [
-                        'available' => fn () => $settings['push_relay_enabled'] || $settings['device_pairing_enabled'],
+                        'available' => fn () => $settings['push_relay_enabled']
+                            || $settings['device_pairing_enabled']
+                            || TvClientProfileResource::isEnabled(),
                         'resolve' => fn () => DevicesCluster::getNavigationItems(),
                     ],
                     'settings' => [
@@ -139,6 +144,7 @@ final class AdminNavigationSchema
                 'available' => fn () => true,
                 'items' => [
                     'media_server_integrations' => self::entry(MediaServersCluster::class),
+                    'watch_history_integrations' => self::entry(WatchHistoryIntegrationResource::class),
                     'networks' => [
                         'available' => fn () => config('proxy.proxy_integration_enabled', true),
                         'resolve' => fn () => NetworkResource::getNavigationItems(),
@@ -193,6 +199,7 @@ final class AdminNavigationSchema
                 'items' => [
                     'stream_profiles' => self::entry(StreamProfileResource::class),
                     'stream_monitor' => self::entry(M3uProxyStreamMonitor::class),
+                    'watch_history' => self::entry(StreamWatchSessionResource::class),
                 ],
             ],
             'plugins' => [
