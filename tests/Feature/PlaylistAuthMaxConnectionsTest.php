@@ -21,6 +21,7 @@ use App\Models\User;
 use App\Services\M3uProxyService;
 use App\Settings\GeneralSettings;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Queue;
 use Symfony\Component\HttpKernel\Exception\HttpException;
@@ -148,6 +149,144 @@ test('stop_oldest_on_limit per-auth setting evicts oldest stream when limit is r
 
     expect($deleteCallCount)->toBeGreaterThanOrEqual(1)
         ->and($url)->toBeString()->not->toBeEmpty();
+});
+
+test('catchup request at limit evicts the auth oldest other timeshift stream (same channel) instead of blocking', function () {
+    $playlist = Playlist::factory()->for($this->user)->create([
+        'enable_proxy' => true,
+        'available_streams' => 0,
+    ]);
+    $auth = PlaylistAuth::factory()->for($this->user)->create([
+        'max_connections' => 2,
+        'stop_oldest_on_limit' => true,
+    ]);
+    $auth->assignTo($playlist);
+
+    $channel = Channel::factory()->for($playlist)->create(['url' => 'http://example.com/stream', 'enabled' => true]);
+
+    $deletedStreamIds = [];
+    $genericEvictionCalled = false;
+
+    Http::fake(function ($request) use (&$deletedStreamIds, &$genericEvictionCalled) {
+        $url = $request->url();
+
+        if (str_contains($url, '/streams/by-metadata')) {
+            // Before eviction: live stream + zombie timeshift stream of the SAME channel
+            // are both active (at the limit). After eviction only the live one remains.
+            $evicted = count($deletedStreamIds) > 0;
+            $active = $evicted ? 1 : 2;
+
+            return Http::response([
+                'matching_streams' => $evicted ? [
+                    [
+                        'stream_id' => 'live-stream',
+                        'url' => 'http://provider.example/live/u/p/459609.m3u8',
+                        'last_access' => '2026-11-12T00:15:00.000000+00:00',
+                        'metadata' => ['playlist_auth_id' => '2'],
+                    ],
+                ] : [
+                    [
+                        'stream_id' => 'ts-old-stream',
+                        'url' => 'http://provider.example/timeshift/u/p/459609/1700000000/7200.ts',
+                        'last_access' => '2026-11-12T00:10:00.000000+00:00',
+                        'metadata' => ['playlist_auth_id' => '2'],
+                    ],
+                    [
+                        'stream_id' => 'live-stream',
+                        'url' => 'http://provider.example/live/u/p/459609.m3u8',
+                        'last_access' => '2026-11-12T00:15:00.000000+00:00',
+                        'metadata' => ['playlist_auth_id' => '2'],
+                    ],
+                ],
+                'total_matching' => $active,
+                'total_clients' => $active,
+            ]);
+        }
+
+        if ($request->method() === 'DELETE' && str_contains($url, '/streams/oldest-by-metadata')) {
+            $genericEvictionCalled = true;
+
+            return Http::response(['deleted_count' => 0]);
+        }
+
+        if ($request->method() === 'DELETE' && preg_match('#/streams/[^/]+$#', $url)) {
+            $deletedStreamIds[] = basename($url);
+
+            return Http::response([], 200);
+        }
+
+        if ($request->method() === 'POST' && str_contains($url, '/streams')) {
+            return Http::response(['stream_id' => 'new-catchup-stream']);
+        }
+
+        return Http::response([], 200);
+    });
+
+    $timeshiftRequest = Request::create('/streaming/timeshift.php', 'GET', [
+        'utc' => '1700000000',
+        'lutc' => (string) time(),
+    ]);
+    $timeshiftRequest->server->set('REMOTE_ADDR', '127.0.0.1');
+    $timeshiftRequest->headers->set('User-Agent', 'TiviMate/4');
+
+    $url = app(M3uProxyService::class)->getChannelUrl(
+        $playlist, $channel, $timeshiftRequest, null, $auth->username, $auth->id,
+    );
+
+    expect($deletedStreamIds)->toBe(['ts-old-stream'])
+        ->and($genericEvictionCalled)->toBeFalse()
+        ->and($url)->toBeString()->not->toBeEmpty();
+});
+
+test('catchup session is reused across repeated requests despite different lutc values', function () {
+    $playlist = Playlist::factory()->for($this->user)->create([
+        'enable_proxy' => true,
+        'available_streams' => 0,
+    ]);
+    $auth = PlaylistAuth::factory()->for($this->user)->create();
+    $auth->assignTo($playlist);
+
+    $channel = Channel::factory()->for($playlist)->create(['url' => 'http://example.com/stream', 'enabled' => true]);
+
+    $postCalls = 0;
+
+    Http::fake(function ($request) use (&$postCalls) {
+        $url = $request->url();
+
+        if (str_contains($url, '/streams/by-metadata')) {
+            return Http::response(['matching_streams' => [], 'total_matching' => 0, 'total_clients' => 0]);
+        }
+
+        // streamExists() probes the running catchup stream before reuse
+        if (str_contains($url, '/streams/ts-session-stream')) {
+            return Http::response(['stream_id' => 'ts-session-stream']);
+        }
+
+        if ($request->method() === 'POST' && str_contains($url, '/streams')) {
+            $postCalls++;
+
+            return Http::response(['stream_id' => 'ts-session-stream']);
+        }
+
+        return Http::response([], 200);
+    });
+
+    $makeRequest = fn (string $lutc) => tap(Request::create('/streaming/timeshift.php', 'GET', [
+        'utc' => '1700000000',
+        'lutc' => $lutc,
+    ]), function (Request $request) {
+        $request->server->set('REMOTE_ADDR', '127.0.0.1');
+        $request->headers->set('User-Agent', 'TiviMate/4');
+    });
+
+    $service = app(M3uProxyService::class);
+
+    $firstUrl = $service->getChannelUrl($playlist, $channel, $makeRequest('1700000100'), null, $auth->username, $auth->id);
+    $secondUrl = $service->getChannelUrl($playlist, $channel, $makeRequest('1700000200'), null, $auth->username, $auth->id);
+
+    expect($postCalls)->toBe(1)
+        ->and($secondUrl)->toBe($firstUrl)
+        ->and($secondUrl)->toBeString()->not->toBeEmpty();
 });
 
 test('global stop_oldest_on_limit is used when per-auth setting is null', function () {

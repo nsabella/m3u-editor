@@ -962,6 +962,77 @@ class M3uProxyService
     }
 
     /**
+     * Delete the oldest active timeshift (catchup) stream belonging to a PlaylistAuth.
+     *
+     * Timeshift upstream URLs are recognizable by their `/timeshift/` path, so this needs
+     * no proxy-side support. Used by checkAndEnforceAuthStreamLimit() to implement
+     * latest-wins for catchup: a new catchup window supersedes the previous one instead
+     * of being blocked by it.
+     *
+     * @return int Number of streams deleted (0 or 1)
+     */
+    public static function stopOldestTimeshiftStreamForAuth(int $playlistAuthId): int
+    {
+        $service = new self;
+
+        if (empty($service->apiBaseUrl)) {
+            return 0;
+        }
+
+        try {
+            $response = Http::timeout(5)->acceptJson()
+                ->withHeaders($service->apiToken ? ['X-API-Token' => $service->apiToken] : [])
+                ->get($service->apiBaseUrl.'/streams/by-metadata', [
+                    'field' => 'playlist_auth_id',
+                    'value' => (string) $playlistAuthId,
+                    'active_only' => 'false', // include idle streams with no attached client
+                ]);
+
+            if (! $response->successful()) {
+                return 0;
+            }
+
+            // Items carry `url` (not original_url/current_url) and `last_access` (no created_at).
+            $candidates = collect($response->json('matching_streams') ?? [])
+                ->filter(fn (array $stream): bool => str_contains(
+                    mb_strtolower((string) ($stream['url'] ?? $stream['original_url'] ?? '')),
+                    '/timeshift/',
+                ))
+                ->sortBy(fn (array $stream) => $stream['last_access'] ?? $stream['created_at'] ?? '');
+
+            $oldest = $candidates->first();
+
+            if (! $oldest || empty($oldest['stream_id'])) {
+                return 0;
+            }
+
+            $deleted = (new self)->stopStream($oldest['stream_id']);
+
+            if ($deleted) {
+                self::invalidateMetadataCache('playlist_auth_id', (string) $playlistAuthId);
+
+                Log::debug('Stopped oldest timeshift stream to free per-auth capacity for new catchup window', [
+                    'playlist_auth_id' => $playlistAuthId,
+                    'stream_id' => $oldest['stream_id'],
+                    'stream_created_at' => $oldest['created_at'] ?? null,
+                ]);
+
+                return 1;
+            }
+
+            return 0;
+        } catch (Exception $e) {
+            Log::warning('Failed to stop oldest timeshift stream for auth', [
+                'playlist_auth_id' => $playlistAuthId,
+                'exception_class' => $e::class,
+                'exception_code' => $e->getCode(),
+            ]);
+
+            return 0;
+        }
+    }
+
+    /**
      * Enforce the per-profile connection limit for resolver backends (Streamlink / yt-dlp).
      *
      * When a stream profile has max_connections set, the total number of active proxy
@@ -1032,9 +1103,15 @@ class M3uProxyService
      * precedence over the global setting, with null meaning "use global"), the oldest
      * stream belonging to this auth is evicted to make room for the new one.
      *
+     * For catchup (timeshift) requests the eviction first targets the auth's oldest
+     * other timeshift stream instead of skipping the requested channel entirely:
+     * the normal "exclude requested channel" protection makes stop-oldest useless for
+     * catchup, because the superseded catchup stream usually belongs to the very channel
+     * being requested again (a new window), and it then holds a slot until idle cleanup.
+     *
      * Returns true if the new stream is allowed, false if it should be blocked.
      */
-    private function checkAndEnforceAuthStreamLimit(int $playlistAuthId, ?int $excludeChannelId = null): bool
+    private function checkAndEnforceAuthStreamLimit(int $playlistAuthId, ?int $excludeChannelId = null, bool $isTimeshiftRequest = false): bool
     {
         $auth = PlaylistAuth::find($playlistAuthId);
 
@@ -1054,9 +1131,26 @@ class M3uProxyService
             : $this->stopOldestOnLimit;
 
         if ($stopOldest) {
-            $result = self::stopOldestStreamByMetadata('playlist_auth_id', (string) $playlistAuthId, $excludeChannelId);
+            $deleted = 0;
 
-            if ($result['deleted_count'] > 0) {
+            if ($isTimeshiftRequest) {
+                // Latest-wins for catchup: retire the auth's oldest other timeshift stream
+                // (usually the previous programme window on this same channel) before
+                // touching anything else.
+                $deleted = self::stopOldestTimeshiftStreamForAuth($playlistAuthId);
+
+                if ($deleted > 0) {
+                    usleep(100000); // 100ms — allow proxy to clean up before re-counting
+                    $activeCount = self::getActiveStreamsCountByMetadata('playlist_auth_id', (string) $playlistAuthId);
+                }
+            }
+
+            if ($deleted === 0) {
+                $result = self::stopOldestStreamByMetadata('playlist_auth_id', (string) $playlistAuthId, $excludeChannelId);
+                $deleted = $result['deleted_count'];
+            }
+
+            if ($deleted > 0) {
                 Log::debug('Stopped oldest stream to free per-auth capacity', [
                     'playlist_auth_id' => $playlistAuthId,
                     'max_connections' => $auth->max_connections,
@@ -1484,7 +1578,7 @@ class M3uProxyService
         }
 
         // Per-PlaylistAuth stream limit check (only applies when proxy is in use)
-        if ($playlistAuthId && ! $this->checkAndEnforceAuthStreamLimit($playlistAuthId, $id)) {
+        if ($playlistAuthId && ! $this->checkAndEnforceAuthStreamLimit($playlistAuthId, $id, $isTimeshiftRequest)) {
             abort(503, 'You have reached your maximum allowed concurrent streams.');
         }
 
@@ -1790,6 +1884,11 @@ class M3uProxyService
      * Cache key for one client's catchup session: the same client (client_id when the player
      * sends one, otherwise its user agent) on the same IP and account, watching the same
      * programme window of the same channel with the same transcoding profile.
+     *
+     * `lutc` (the client's "now" epoch) is deliberately NOT part of the key: players stamp it
+     * fresh on every request, so including it would make the key change every second and the
+     * session would never be reused across a player's Range probes / reconnects. The catchup
+     * window is fully identified by utc/timeshift_date + duration.
      */
     private static function timeshiftSessionKey(Request $request, int $originalChannelId, string $originalPlaylistUuid, ?StreamProfile $profile, ?string $username): string
     {
@@ -1803,7 +1902,6 @@ class M3uProxyService
             $request->input('timeshift_duration'),
             $request->input('timeshift_date'),
             $request->input('utc'),
-            $request->input('lutc'),
         ]));
     }
 
