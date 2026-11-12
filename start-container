@@ -158,6 +158,16 @@ export BROADCAST_GC_ENABLED="${BROADCAST_GC_ENABLED:-true}"
 export DVR_RESTART_WINDOW_SECONDS="${DVR_RESTART_WINDOW_SECONDS:-300}"
 export DVR_STALL_TIMEOUT_SECONDS="${DVR_STALL_TIMEOUT_SECONDS:-30}"
 
+# m3u-proxy idle-cleanup timeouts. Defaults (CLIENT_TIMEOUT=10, STREAM_TIMEOUT=15)
+# are shorter than the DVR capture's natural HLS polling cadence (~13-20s between
+# playlist fetches, driven by the upstream target duration), so the janitor sweep
+# routinely misjudges the recording's own FFmpeg client as idle and destroys the
+# input stream mid-recording — verified 2026-11-11: capture evicted at 11 min,
+# then 61 futile restarts against the now-404 input until give-up. 60s sits above
+# the observed worst-case healthy gap (~20s) with ~3x headroom.
+export CLIENT_TIMEOUT="${CLIENT_TIMEOUT:-60}"
+export STREAM_TIMEOUT="${STREAM_TIMEOUT:-60}"
+
 if [ "${M3U_PROXY_INTEGRATION_ENABLED}" = "true" ] && [ "${M3U_PROXY_ENABLED}" = "true" ]; then
     # Only output configure HLS storage for embedded proxy mode
     # For external proxy, HLS storage is handled by the proxy container
